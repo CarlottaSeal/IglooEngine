@@ -35,11 +35,7 @@ public:
     ~Scene();
 
     void InitializeRoughly();
-    
-    void RegisterObjectSDF(uint32_t objectID, const Mat44& worldTransform);
-    float QuerySDF(const Vec3& worldPos);
-	RaycastResult3D RaycastWithSDF(const Vec3& origin, const Vec3& direction, float maxDistance);
-
+    void InitializeBoundsAndMeshSDF();
     void Update(float deltaTime);
     void CheckMemoryPressure();
 
@@ -51,6 +47,7 @@ public:
                          float innerDotThreshold = 0.f, float outerDotThreshold = 0.f);
     //CreateEntity(SceneObjectType type, const std::string& name);
 
+    void UpdateCardMetadata();
     void DestroyObject(uint32_t entityID);
     SceneObject* GetSceneObject(uint32_t entityID);
     const SceneObject* GetSceneObject(uint32_t entityID) const;
@@ -94,6 +91,7 @@ public:
     std::vector<MeshObject*> GetVisibleObjects() const;
     const std::vector<RenderItem>& GetOpaqueRenderItems() const { return m_opaqueRenderItems; }
     const std::vector<RenderItem>& GetTransparentRenderItems() const { return m_transparentRenderItems; }
+
     
 #ifdef ENGINE_DX12_RENDERER
     DX12Renderer* GetRenderer() { return m_config.m_renderer->GetSubRenderer(); }
@@ -101,7 +99,6 @@ public:
     GISystem* GetGISystem() { return m_config.m_giSystem; }
     
 private:
-    // 内部管理
     void AddObjectToLists(SceneObject* object);
     void RemoveObjectFromLists(SceneObject* object);
     //void CullEntities(const Frustum& frustum);
@@ -114,33 +111,10 @@ private:
     void EvictCards(const std::vector<SurfaceCard*>& cards);
     void EvictLowPriorityCards_Advanced(uint32_t targetTilesToFree);
     void EvictLowPriorityCards_Tiered();
-    // // 方式1：简单驱逐（驱逐10%低优先级cards）
-    // void Scene::CheckMemoryPressure()
-    // {
-    //     float atlasUsage = m_config.m_giSystem->GetAtlasUsage();
-    //
-    //     if (atlasUsage > 0.9f)  // 超过90%
-    //     {
-    //         DebuggerPrintf("[Scene] Atlas usage high (%.1f%%), evicting cards...\n", 
-    //                       atlasUsage * 100.0f);
-    //         EvictLowPriorityCards();
-    //     }
-    // }
-    //
-    // // 方式2：精确驱逐（释放指定数量的tiles）
-    // void Scene::EnsureAtlasSpace(uint32_t requiredTiles)
-    // {
-    //     // 检查当前空闲空间
-    //     uint32_t freeTiles = m_config.m_giSystem->GetFreeTileCount();
-    //
-    //     if (freeTiles < requiredTiles)
-    //     {
-    //         uint32_t needToFree = requiredTiles - freeTiles + 10;  // +10 buffer
-    //         DebuggerPrintf("[Scene] Need to free %u tiles\n", needToFree);
-    //     
-    //         EvictLowPriorityCards_Advanced(needToFree);
-    //     }
-    // }
+
+    void UpdateSceneBounds();
+    void CalculateSceneBounds();
+    void BuildMeshSDFInfos();
     
 public:
     SceneConfig m_config;
@@ -151,12 +125,10 @@ public:
     
     std::vector<MeshObject*> m_meshObjects;
     std::vector<LightObject*> m_lightObjects;
-    std::vector<SceneObject*> m_allObjects; 
-    
-    // TODO: Octree / BVH
-    //std::unique_ptr<Octree> m_octree;
-    std::unordered_map<uint32_t, SDFInstance> m_sdfInstances;
-    bool m_enableCPUSDFQueries = false;  
+    std::vector<SceneObject*> m_allObjects;
+    AABB3 m_sceneBounds;
+    bool m_needsRebuildGlobalLighting;
+    std::vector<MeshSDFInfoGPU> m_meshInfos;
     
     uint32_t m_nextCardID = 0;
     std::unordered_map<uint32_t, GIObjectEntry> m_giRegistry;

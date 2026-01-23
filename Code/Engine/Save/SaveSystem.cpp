@@ -21,7 +21,64 @@ SaveSystem::~SaveSystem()
 {
 }
 
-bool SaveSystem::Save(const std::string& filename, const ISerializable* object, SaveFormat format)
+bool SaveSystem::EnsureDirectory(const std::string& path)
+{
+    try
+    {
+        if (std::filesystem::exists(path))
+        {
+            if (std::filesystem::is_directory(path))
+            {
+                return true;  
+            }
+            else
+            {
+                return false;  
+            }
+        }
+        
+        // 创建目录（包括所有父目录）
+        bool created = std::filesystem::create_directories(path);
+        // if (created)
+        // {
+        //     DebuggerPrintf("[SaveSystem] Created directory: %s\n", path.c_str());
+        // }
+        return created;
+    }
+    catch (const std::exception& e)
+    {
+        DebuggerPrintf("[SaveSystem] Failed to create directory '%s': %s\n", 
+                       path.c_str(), e.what());
+        return false;
+    }
+}
+
+bool SaveSystem::EnsureDirectoryForFile(const std::string& filepath)
+{
+    std::filesystem::path p(filepath);
+    if (!p.has_parent_path())
+    {
+        return true;
+    }
+    
+    return EnsureDirectory(p.parent_path().string());
+}
+
+bool SaveSystem::DirectoryExists(const std::string& path)
+{
+    try
+    {
+        return std::filesystem::exists(path) && std::filesystem::is_directory(path);
+    }
+    catch (const std::exception& e)
+    {
+        DebuggerPrintf("[SaveSystem] Error checking directory '%s': %s\n", 
+                       path.c_str(), e.what());
+        return false;
+    }
+}
+
+bool SaveSystem::Save(const std::string& filename, const ISerializable* object, SaveFormat format, bool createIfNeeded)
 {
     if (!object)
         return false;
@@ -32,7 +89,7 @@ bool SaveSystem::Save(const std::string& filename, const ISerializable* object, 
         {
             std::vector<uint8_t> buffer;
             object->SaveToBinary(buffer);
-            return SaveBinary(filename, buffer);
+            return SaveBinary(filename, buffer, createIfNeeded);
         }
     case SaveFormat::XML:
         return SaveObjectToXML(filename, object);
@@ -92,10 +149,25 @@ bool SaveSystem::Load(const std::string& filename, ISerializable* object, SaveFo
     }
 }
 
-bool SaveSystem::SaveBinary(const std::string& filename, const std::vector<uint8_t>& data)
+bool SaveSystem::SaveBinary(const std::string& filename, const std::vector<uint8_t>& data, bool createDirectoryIfNeeded)
 {
     std::string fullPath = GetFullPath(filename);
-    
+    if (createDirectoryIfNeeded)
+    {
+        try
+        {
+            std::filesystem::path p(fullPath);
+            if (p.has_parent_path())
+            {
+                std::filesystem::create_directories(p.parent_path());
+            }
+        }
+        catch (const std::exception& e)
+        {
+            DebuggerPrintf("[SaveSystem] Failed to create directory for '%s': %s\n", 
+                           fullPath.c_str(), e.what());
+        }
+    }
     std::ofstream file(fullPath, std::ios::binary);
     if (!file.is_open())
     {
@@ -443,11 +515,20 @@ SaveFormat SaveSystem::DetectFormatFromFile(const std::string& filename)
 
 void SaveSystem::SetSaveDirectory(const std::string& directory)
 {
+    if (directory.empty())
+    {
+        DebuggerPrintf("SetSaveDirectory: Ignoring empty directory\n");
+        return;  // 直接返回，不修改 m_saveDirectory
+    }
     m_saveDirectory = directory;
-    
-    if (!m_saveDirectory.empty())
+    try
     {
         std::filesystem::create_directories(m_saveDirectory);
+    }
+    catch (const std::exception& e)
+    {
+        ERROR_RECOVERABLE(Stringf("Failed to create directory '%s': %s", 
+            m_saveDirectory.c_str(), e.what()));
     }
 }
 
@@ -558,3 +639,33 @@ std::string SaveSystem::GetExtensionForFormat(SaveFormat format) const
     }
 }
 
+void SaveSystem::PushSaveContext(const std::string& subdirectory)
+{
+    if (subdirectory.empty())
+    {
+        ERROR_RECOVERABLE("PushSaveContext: Empty string! Not pushing.");
+        return; 
+    }
+    
+    m_directoryStack.push_back(m_saveDirectory);
+    SetSaveDirectory(subdirectory);
+}
+
+void SaveSystem::PopSaveContext()
+{
+    if (!m_directoryStack.empty())
+    {
+        std::string previousDir = m_directoryStack.back();
+        m_directoryStack.pop_back();
+        SetSaveDirectory(previousDir);
+    }
+}
+
+std::string SaveSystem::GetCurrentSaveDirectory() const
+{
+    return m_saveDirectory;
+}
+
+void SaveSystem::DumpContextStack() const
+{
+}

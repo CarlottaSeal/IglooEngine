@@ -9,7 +9,26 @@
 #include "Engine/Renderer/VertexBuffer.hpp"
 #include "Engine/Renderer/DX12Renderer.hpp"
 #include "Engine/Core/Image.hpp"
+#include "Engine/Renderer/SDFTexture3D.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
+
+StaticMesh::StaticMesh()
+	: m_filePath("")
+	, m_normalTexture(nullptr)
+	, m_diffuseTexture(nullptr)
+	, m_specularTexture(nullptr)
+	, m_shader(nullptr)
+	, m_vertexBuffer(nullptr)
+	, m_indexBuffer(nullptr)
+	, m_unitsPerMeter(1.0f)
+	, m_modelRelativeScale(1.0f)
+	, m_hasCardTemplates(false)
+	, m_bvhBuilt(false)
+	, m_x("")
+	, m_y("")
+	, m_z("")
+{
+}
 
 StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtensions, bool enableCardTemplates)
     //:m_renderer(renderer)
@@ -43,6 +62,49 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
     std::string diffuseTexture = ParseXmlAttribute(*meshElement, "diffuseMap", "");
     std::string specularTexture = ParseXmlAttribute(*meshElement, "specGlossEmitMap", "");
     std::string shader = ParseXmlAttribute(*meshElement, "shader", "");
+	if (diffuseTexture.empty() && !mtlPath.empty())
+	{
+		std::map<std::string, MtlInfo> materials;
+		if (LoadOBJMaterial(mtlPath, materials))
+		{
+			std::string materialName = ParseXmlAttribute(*meshElement, "material", "");
+            
+			MtlInfo* mtlInfo = nullptr;
+			if (!materialName.empty())
+			{
+				auto it = materials.find(materialName);
+				if (it != materials.end())
+				{
+					mtlInfo = &it->second;
+				}
+				else
+				{
+					DebuggerPrintf("Warning: Material '%s' not found, using first material\n", materialName.c_str());
+					if (!materials.empty())
+						mtlInfo = &materials.begin()->second;
+				}
+			}
+			else if (!materials.empty())
+			{
+				mtlInfo = &materials.begin()->second;
+			}
+            
+			if (mtlInfo)
+			{
+				if (diffuseTexture.empty() && !mtlInfo->m_diffuseMap.empty())
+					diffuseTexture = mtlInfo->m_diffuseMap;
+				if (normalTexture.empty() && !mtlInfo->m_normalMap.empty())
+					normalTexture = mtlInfo->m_normalMap;
+				if (specularTexture.empty() && !mtlInfo->m_specularMap.empty())
+					specularTexture = mtlInfo->m_specularMap;
+                    
+				//m_materialShininess = mtlInfo->shininess;
+				//m_materialTransparency = mtlInfo->transparency;
+				//m_diffuseColor = mtlInfo->diffuseColor;
+				//m_specularColor = mtlInfo->specularColor;
+			}
+		}
+	}
     if (!normalTexture.empty())
         m_normalTexture = renderer->CreateTextureFromFile(normalTexture.c_str());
     if (!diffuseTexture.empty())
@@ -66,7 +128,7 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
         Image* normalI = LoadImageDueToGLTFData(LoadGLTFDataFromFile(m_filePath), GLBChannel::Normal, m_filePath);
         if (normalI)
         {
-            diffuseI->SetName(xmlPathNoExtensions + "_normal");
+            normalI->SetName(xmlPathNoExtensions + "_normal");
             m_normalTexture = renderer->CreateTextureFromImage(*normalI);
 #ifdef ENGINE_DX12_RENDERER
 			renderer->GetSubRenderer()->PushBackNewTextureManually(m_normalTexture);
@@ -75,7 +137,7 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
         Image* specI = LoadImageDueToGLTFData(LoadGLTFDataFromFile(m_filePath), GLBChannel::AO, m_filePath);
         if (specI)
         {
-            diffuseI->SetName(xmlPathNoExtensions + "_ao");
+            specI->SetName(xmlPathNoExtensions + "_ao");
             m_specularTexture = renderer->CreateTextureFromImage(*specI);
 #ifdef ENGINE_DX12_RENDERER
 			renderer->GetSubRenderer()->PushBackNewTextureManually(m_specularTexture);
@@ -353,6 +415,69 @@ float StaticMesh::QuantizeScale(float scale)
 	return std::round(scale * 10.0f) / 10.0f;
 }
 
+SDFTexture3D* StaticMesh::GenerateSDFInternal(Renderer* renderer, float scale, int meshID)
+{
+#ifdef ENGINE_DX12_RENDERER
+	float quantized = QuantizeScale(scale);
+    
+	DebuggerPrintf("[StaticMesh] Generating SDF for %s at scale=%.1f\n", 
+				   m_filePath.c_str(), quantized);
+    
+	if (!HasBVH(quantized))
+	{
+		DebuggerPrintf("[StaticMesh] Building BVH for scale=%.1f\n", quantized);
+		BuildBVH(quantized);
+	}
+    
+	const BVH* bvh = GetBVH(quantized);
+	if (!bvh)
+	{
+		DebuggerPrintf("[StaticMesh] ERROR: Failed to get BVH\n");
+		return nullptr;
+	}
+    
+	// 生成scaled vertices和bounds
+	std::vector<Vertex_PCUTBN> scaledVerts = GetScaledAndTransformedVertices(scale);
+	AABB3 scaledBounds = GetScaledBounds(scale);
+    
+	DebuggerPrintf("[StaticMesh] Bounds for SDF: min(%.2f, %.2f, %.2f) max(%.2f, %.2f, %.2f)\n",
+				   scaledBounds.m_mins.x, scaledBounds.m_mins.y, scaledBounds.m_mins.z,
+				   scaledBounds.m_maxs.x, scaledBounds.m_maxs.y, scaledBounds.m_maxs.z);
+    
+	DX12Renderer* dx12Renderer = renderer->GetSubRenderer();
+	SDFTexture3D* sdfTex = dx12Renderer->CreateSDFTextureFromData(
+		scaledVerts,
+		m_indices,
+		*bvh,
+		scaledBounds,
+		64  // TODO: 可以根据mesh大小动态调整分辨率
+	);
+    
+	if (!sdfTex)
+	{
+		DebuggerPrintf("[StaticMesh] ERROR: Failed to generate SDF\n");
+		return nullptr;
+	}
+
+	SetSDF(quantized, sdfTex, meshID);
+    
+	DebuggerPrintf("[StaticMesh] SDF generated successfully (SRV index=%u)\n",
+				   sdfTex->GetSRVDescriptorIndex());
+    
+	return sdfTex;
+#endif
+#ifdef ENGINE_DX11_RENDERER
+	UNUSED(renderer);
+	UNUSED(scale);
+	UNUSED(meshID);
+	return nullptr;
+#endif
+	UNUSED(renderer);
+	UNUSED(scale);
+	UNUSED(meshID);
+	return nullptr;
+}
+
 AABB3 StaticMesh::GetScaledBounds(float scale) const //Transformed 版本
 {
 	AABB3 bounds = GetTransformedAABB3Bounds();
@@ -395,6 +520,20 @@ AABB3 StaticMesh::GetTransformedAABB3BoundsWithoutAxisTransform() const
 	}
 
 	return box;
+}
+
+SDFTexture3D* StaticMesh::GenerateOrGetSDF(Renderer* renderer, float scale, int meshIndex)
+{
+	float quantized = QuantizeScale(scale);
+    
+	SDFTexture3D* existingSDF = GetSDF(quantized);
+	if (existingSDF && existingSDF->GetSRVDescriptorIndex() != UINT32_MAX)
+	{
+		DebuggerPrintf("[StaticMesh] Reusing existing SDF for scale=%.1f\n", quantized);
+		return existingSDF;
+	}
+    
+	return GenerateSDFInternal(renderer, quantized, meshIndex);
 }
 
 void StaticMesh::BuildBVH(float scale)
@@ -456,8 +595,22 @@ SDFTexture3D* StaticMesh::GetSDF(float scale) const
 	return nullptr;
 }
 
-void StaticMesh::SetSDF(float scale, SDFTexture3D* sdf)
+// MeshSDFData StaticMesh::GetMeshSDFData(float scale) const
+// {
+// 	float quantized = QuantizeScale(scale);
+//     
+// 	auto it = m_sdfsByScale.find(quantized);
+// 	if (it != m_sdfsByScale.end())
+// 	{
+// 		return *it->second;
+// 	}
+//     
+// 	return MeshSDFData();
+// }
+
+void StaticMesh::SetSDF(float scale, SDFTexture3D* sdf, int meshID)
 {
+	UNUSED(meshID)
 	float quantized = QuantizeScale(scale);
 	m_sdfsByScale[quantized] = sdf;
     
@@ -485,7 +638,7 @@ std::vector<Vertex_PCUTBN> StaticMesh::GetScaledAndTransformedVertices(float sca
 	return transformed;
 }
 
-std::vector<Vertex_PCUTBN> StaticMesh::GetTransformedVertices() const
+std::vector<Vertex_PCUTBN> StaticMesh::GetTransformedVertices() const //这个是没有它本身的缩变的
 {
 	std::vector<Vertex_PCUTBN> transformed = m_verts;
 
@@ -496,13 +649,13 @@ std::vector<Vertex_PCUTBN> StaticMesh::GetTransformedVertices() const
 
 		// 法线只应用旋转（不受scale和translation影响）
 		vert.m_normal = m_transform.TransformVectorQuantity3D(vert.m_normal);
-		vert.m_normal.GetNormalized();
+		vert.m_normal = vert.m_normal.GetNormalized();
 
 		vert.m_tangent = m_transform.TransformVectorQuantity3D(vert.m_tangent);
-		vert.m_tangent.GetNormalized();
+		vert.m_tangent = vert.m_tangent.GetNormalized();
 
 		vert.m_bitangent = m_transform.TransformVectorQuantity3D(vert.m_bitangent);
-		vert.m_bitangent.GetNormalized();
+		vert.m_bitangent = vert.m_bitangent.GetNormalized();
 	}
 
 	return transformed;
@@ -519,13 +672,13 @@ std::vector<Vertex_PCUTBN> StaticMesh::GetTransformedVerticesWithoutAxisTransfor
 
 		// 法线只应用旋转（不受scale和translation影响）
 		vert.m_normal = m_transformWithoutAxisTransform.TransformVectorQuantity3D(vert.m_normal);
-		vert.m_normal.GetNormalized();
+		vert.m_normal = vert.m_normal.GetNormalized();
 
 		vert.m_tangent = m_transformWithoutAxisTransform.TransformVectorQuantity3D(vert.m_tangent);
-		vert.m_tangent.GetNormalized();
+		vert.m_tangent = vert.m_tangent.GetNormalized();
 
 		vert.m_bitangent = m_transformWithoutAxisTransform.TransformVectorQuantity3D(vert.m_bitangent);
-		vert.m_bitangent.GetNormalized();
+		vert.m_bitangent = vert.m_bitangent.GetNormalized();
 	}
 
 	return transformed;

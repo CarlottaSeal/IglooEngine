@@ -202,6 +202,28 @@ Mat44 const Mat44::MakePerspectiveProjection(float fovYDegrees, float aspect, fl
 	return perspectMat;
 }
 
+Mat44 const Mat44::CreateLookAt(Vec3 const& eye, Vec3 const& target, Vec3 const& worldUp)
+{
+	// 1) Forward (I basis) - 从眼睛指向目标
+	Vec3 i = (target - eye).GetNormalized();
+	// 2) 选择一个不与 forward 共线的 up
+	Vec3 up = worldUp;
+	if (fabsf(DotProduct3D(i, up)) > 0.999f)
+	{
+		// 根据 forward 选择备用 up
+		up = (fabsf(i.y) < 0.9f) ? Vec3(0.f, 1.f, 0.f) : Vec3(1.f, 0.f, 0.f);
+	}
+	// 3) Left (J basis) = up × forward
+	Vec3 j = CrossProduct3D(up, i).GetNormalized();
+	// 4) 重新计算 Up (K basis) = forward × left，确保完全正交
+	Vec3 k = CrossProduct3D(i, j); // 已经是单位向量，不需要再 normalize
+	// 5) 构建 camera-to-world 矩阵，然后取逆
+	Mat44 camToWorld;
+	camToWorld.SetIJKT3D(i, j, k, eye);
+    
+	return camToWorld.GetOrthonormalInverse();
+}
+
 Vec2 const Mat44::TransformVectorQuantity2D(Vec2 const& vectorQuantityXY) const
 {
     //assumes z=0, w=0
@@ -736,5 +758,12 @@ void Mat44::AppendScaleNonUniform3D(Vec3 const& nonUniformScaleXYZ)
 	m_values[Ky] *= nonUniformScaleXYZ.z;
 	m_values[Kz] *= nonUniformScaleXYZ.z;
 	m_values[Kw] *= nonUniformScaleXYZ.z;
+}
+
+Mat44 Mat44::operator*(const Mat44& rhs) const
+{
+	Mat44 result = rhs;
+	result.Append(*this);  // this * rhs = Append this to rhs TODO:到底有没有问题啊
+	return result;
 }
 

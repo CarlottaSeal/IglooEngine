@@ -32,6 +32,12 @@ void AddVertsForQuad3D(std::vector<Vertex_PCU>& verts, const Vec3& bottomLeft, c
 	const Rgba8& color = Rgba8::WHITE, const AABB2& UVs = AABB2::ZERO_TO_ONE);
 void AddVertsForQuad3DUV(std::vector<Vertex_PCU>& verts, const Vec3& bottomLeft, const Vec3& bottomRight, const Vec3& topRight, const Vec3& topLeft,
 	const Rgba8& color = Rgba8::WHITE, Vec2 uv0 = Vec2::ZERO, Vec2 uv1 = Vec2::ZERO, Vec2 uv2 = Vec2::ONE, Vec2 uv3 = Vec2::ONE);
+void RotateQuadAroundCenterCW90(Vec3& p0, Vec3& p1, Vec3& p2, Vec3& p3, int times);
+
+void AddVertsForQuad3D(std::vector<Vertex_PCUTBN>& verts, const Vec3& bottomLeft, const Vec3& bottomRight, 
+					   const Vec3& topRight, const Vec3& topLeft,const Rgba8& color = Rgba8::WHITE, 
+					   const AABB2& UVs = AABB2::ZERO_TO_ONE,const Vec3& normal = Vec3(0, 0, 1));
+
 void AddVertsForAABB3D(std::vector<Vertex_PCU>& verts, const AABB3& bounds, const Rgba8& color = Rgba8::WHITE,
 	const AABB2& UVs = AABB2::ZERO_TO_ONE);
 void AddVertsForAABBZWireframe3D(std::vector<Vertex_PCU>& verts, AABB3 const& bounds, float lineThickness, Rgba8 const& tint = Rgba8::WHITE);

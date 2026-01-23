@@ -6,6 +6,7 @@
 #include "Engine/Math/Sphere.h"
 #include "Engine/Renderer/Texture.hpp"
 #include "Engine/Scene/BVH.h"
+#include "Engine/Scene/SDF/SDFCommon.h"
 
 struct SurfaceCardTemplate;
 class SDFTexture3D;
@@ -27,9 +28,31 @@ enum class GLBChannel
     Count
 };
 
+struct MtlInfo
+{
+	Rgba8 m_ambientColor = Rgba8(255, 255, 255, 255);   // Ka
+	Rgba8 m_diffuseColor = Rgba8(255, 255, 255, 255);   // Kd
+	Rgba8 m_specularColor = Rgba8(255, 255, 255, 255);  // Ks
+	Rgba8 m_emissiveColor = Rgba8(0, 0, 0, 255);        // Ke
+    
+	float m_shininess = 32.0f;      // Ns - 高光指数
+	float m_transparency = 1.0f;     // d 或 Tr - 透明度
+	float m_refractiveIndex = 1.0f; // Ni - 折射率
+	int m_illumModel = 2;           // illum - 光照模型
+    
+	std::string m_diffuseMap;       
+	std::string m_normalMap;        
+	std::string m_specularMap;      
+	std::string m_roughnessMap;     
+	std::string m_ambientMap;       
+	std::string m_emissiveMap;      
+	std::string m_opacityMap;       
+};
+
 class StaticMesh
 {
 public:
+	StaticMesh();
     StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtensions, bool enableCardTemplates = false);
     ~StaticMesh();
 
@@ -44,12 +67,15 @@ public:
     AABB3 GetTransformedAABB3Bounds() const;
     AABB3 GetTransformedAABB3BoundsWithoutAxisTransform() const;
 
+	SDFTexture3D* GenerateOrGetSDF(Renderer* renderer, float scale, int meshIndex);
+
 	void BuildBVH(float scale = 1.0f);
 	bool HasBVH(float scale = 1.0f) const;
 	const BVH* GetBVH(float scale = 1.0f) const;
 
 	SDFTexture3D* GetSDF(float scale) const;
-	void SetSDF(float scale, SDFTexture3D* sdf);
+	//MeshSDFData GetMeshSDFData(float scale) const;
+	void SetSDF(float scale, SDFTexture3D* sdf, int meshID);
 	bool HasSDF(float scale) const;
 
     std::vector<Vertex_PCUTBN> GetScaledAndTransformedVertices(float scale) const;
@@ -59,6 +85,8 @@ public:
 private:
     void ApplyTransformToVertices();
     static float QuantizeScale(float scale);
+
+	SDFTexture3D* GenerateSDFInternal(Renderer* renderer, float scale, int meshID);
 
 public:
     std::string m_filePath;
@@ -86,7 +114,7 @@ public:
 
     std::unordered_map<float, BVH> m_bvhsByScale;
 	bool m_bvhBuilt = false;
-
 	// scale → sdfResourceID 
     std::map<float, SDFTexture3D*> m_sdfsByScale;
+    //std::map<float, MeshSDFData*> m_sdfsByScale;
 };

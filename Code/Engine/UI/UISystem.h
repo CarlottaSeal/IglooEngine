@@ -2,6 +2,7 @@
 #include "Engine/Renderer/Renderer.hpp"
 #include "Engine/Window/Window.hpp"
 
+class UIManager;
 class UIElement;
 
 struct UIConfig
@@ -47,6 +48,9 @@ public:
     InputSystem* GetInputSystem();
     BitmapFont* GetBitmapFont();
     Camera GetCamera();
+
+public:
+    UIManager* m_theUIManager;
 
 private:
     UIConfig m_config;

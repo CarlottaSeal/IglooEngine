@@ -2,15 +2,12 @@
 
 #include "Canvas.hpp"
 
-UIScreen::UIScreen(UISystem* uiSystem, UIScreenType type, bool blocksInput)
+UIScreen::UIScreen(UISystem* uiSystem, UIScreenType type,Camera& camera, bool blocksInput)
     : m_uiSystem(uiSystem)
     , m_type(type)
     , m_blocksInput(blocksInput)
+    , m_camera(&camera)
 {
-    // 创建专属的 Camera
-    m_camera = new Camera();
-    m_camera->SetOrthographicView(Vec2(0, 0), Vec2(1600, 900));  // TODO: 灵活调整
-    
     m_canvas = new Canvas(m_uiSystem, m_camera);
 }
 
@@ -22,12 +19,11 @@ UIScreen::~UIScreen()
         delete m_canvas;
         m_canvas = nullptr;
     }
-    
-    if (m_camera)
-    {
-        delete m_camera;
-        m_camera = nullptr;
-    }
+    // if (m_camera)
+    // {
+    //     delete m_camera;
+    //     m_camera = nullptr;
+    // }
 }
 
 void UIScreen::OnEnter()
@@ -53,7 +49,8 @@ void UIScreen::OnPause()
     // 默认：暂停时禁用输入但继续渲染
     if (m_canvas)
     {
-        for (auto* element : m_canvas->m_uiElementsList)
+        //for (auto* element : m_canvas->m_uiElementsList)
+        for (auto* element : m_canvas->m_children)
         {
             if (element)
             {
@@ -65,7 +62,6 @@ void UIScreen::OnPause()
 
 void UIScreen::OnResume()
 {
-    // 默认：恢复时重新启用
     m_isActive = true;
 }
 
@@ -85,6 +81,7 @@ void UIScreen::Update(float deltaSeconds)
 
 void UIScreen::Render() const
 {
+    if (!IsActive()) return;  
     if (m_canvas)
     {
         m_canvas->Render();

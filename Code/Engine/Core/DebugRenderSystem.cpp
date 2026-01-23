@@ -580,6 +580,19 @@ void DebugAddWorldWireSphere(const Vec3& center, float radius, float duration, c
     wireSphere->m_timer->Start();
 }
 
+void DebugAddWorldWireAABB(const AABB3& box, float duration, const Rgba8& startColor, const Rgba8& endColor,
+	DebugRenderMode mode)
+{
+	DebugObject* wireBox = new DebugObject(duration, startColor, endColor, mode);
+	AddVertsForAABB3D(wireBox->m_verts, box);
+	wireBox->m_isWireFrame = true;
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_theDebugRenderTool->m_mutex);
+		g_theDebugRenderTool->m_worldObjects.push_back(wireBox);
+	}
+	wireBox->m_timer->Start();
+}
+
 void DebugAddWorldArrow(const Vec3& start, const Vec3& end, float radius, float duration, const Rgba8& startColor, const Rgba8& endColor, DebugRenderMode mode)
 {
     DebugObject* arrow = new DebugObject(duration, startColor, endColor, mode);
@@ -593,26 +606,50 @@ void DebugAddWorldArrow(const Vec3& start, const Vec3& end, float radius, float 
 
 void DebugAddWorldText(const std::string& text, const Mat44& transform, float textHeight, const Vec2& alignment, float duration, const Rgba8& startColor, const Rgba8& endColor, DebugRenderMode mode)
 {
+	if (!g_theDebugRenderTool || !g_theDebugRenderTool->m_debugRenderConfig.m_renderer)
+	{
+		return;
+	}
+
 	DebugObject* textToWrite = new DebugObject(duration, startColor, endColor, mode);
     textToWrite->m_isText = true;
 	textToWrite->m_textFont = g_theDebugRenderTool->m_debugRenderConfig.m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + g_theDebugRenderTool->m_debugRenderConfig.m_fontName).c_str());
+
+	if (!textToWrite->m_textFont)
+	{
+		delete textToWrite;
+		return;
+	}
+
 	textToWrite->m_textFont->AddVertsForText3DAtOriginXForward(textToWrite->m_verts, textHeight, text, startColor, 1.f, alignment);
-	
+
 	TransformVertexArray3D(textToWrite->m_verts, transform);
 	{
 		std::lock_guard<std::recursive_mutex> lock(g_theDebugRenderTool->m_mutex);
 		g_theDebugRenderTool->m_worldObjects.push_back(textToWrite);
 	}
-	textToWrite->m_timer->Start();        
+	textToWrite->m_timer->Start();
 }
 
 void DebugAddWorldBillboardText(const std::string& text, const Vec3& origin, float textHeight, const Vec2& alignment, float duration, const Rgba8& startColor, DebugRenderMode mode)
 {
+	if (!g_theDebugRenderTool || !g_theDebugRenderTool->m_debugRenderConfig.m_renderer)
+	{
+		return;
+	}
+
 	DebugObject* textToWrite = new DebugObject(duration, startColor, startColor, mode);
     textToWrite->m_isText = true;
     textToWrite->m_isBillboard = true;
 
 	textToWrite->m_textFont = g_theDebugRenderTool->m_debugRenderConfig.m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + g_theDebugRenderTool->m_debugRenderConfig.m_fontName).c_str());
+
+	if (!textToWrite->m_textFont)
+	{
+		delete textToWrite;
+		return;
+	}
+
 	textToWrite->m_textFont->AddVertsForText3DAtOriginXForward(textToWrite->m_verts, textHeight, text, startColor, 1.f, alignment);
     
     textToWrite->m_position = origin;
@@ -644,9 +681,22 @@ void DebugAddScreenText(const std::string& text, const Vec2& position, float siz
 {
     UNUSED(alignment);
 	UNUSED(endColor);
+
+	if (!g_theDebugRenderTool || !g_theDebugRenderTool->m_debugRenderConfig.m_renderer)
+	{
+		return;
+	}
+
     DebugObject* textToWrite = new DebugObject(duration);
     textToWrite->m_isText = true;
     textToWrite->m_textFont = g_theDebugRenderTool->m_debugRenderConfig.m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + g_theDebugRenderTool->m_debugRenderConfig.m_fontName).c_str());
+
+	if (!textToWrite->m_textFont)
+	{
+		delete textToWrite;
+		return;
+	}
+
 	/*textToWrite->m_textFont->AddVertsForText3DAtOriginXForward(textToWrite->m_verts, size, text, startColor, 1.f, alignment);
 	Mat44 mat;
 	mat.SetTranslation3D(Vec3(position.x, position.y, 0.f));
@@ -662,8 +712,21 @@ void DebugAddScreenText(const std::string& text, const Vec2& position, float siz
 
 void DebugAddMessage(const std::string& text, float duration, Camera camera, const Rgba8& startColor, const Rgba8& endColor)
 {
+	if (!g_theDebugRenderTool || !g_theDebugRenderTool->m_debugRenderConfig.m_renderer)
+	{
+		return;
+	}
+
     DebugObject* message = new DebugObject(duration, startColor, endColor, DebugRenderMode::ALWAYS);
     message->m_isMessage = true;
+
+    message->m_textFont = g_theDebugRenderTool->m_debugRenderConfig.m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + g_theDebugRenderTool->m_debugRenderConfig.m_fontName).c_str());
+
+	if (!message->m_textFont)
+	{
+		delete message;
+		return;
+	}
 
     if (duration == 0.f)
     {
@@ -674,7 +737,6 @@ void DebugAddMessage(const std::string& text, float duration, Camera camera, con
         g_theDebugRenderTool->m_messageObjects.push_back(message);
     }
 
-    message->m_textFont = g_theDebugRenderTool->m_debugRenderConfig.m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + g_theDebugRenderTool->m_debugRenderConfig.m_fontName).c_str());
     message->m_message = text;
     message->m_startColor = startColor;
     message->m_endColor = endColor;
@@ -684,7 +746,7 @@ void DebugAddMessage(const std::string& text, float duration, Camera camera, con
     float lineHeight = windowHeight/maxLines;
     g_theDebugRenderTool->m_messageLineHeight = lineHeight;
 	g_theDebugRenderTool->m_messageStartX = camera.GetOrthographicBottomLeft().x;
-    g_theDebugRenderTool->m_windowHeight = camera.GetOrthographicTopRight().y;  
+    g_theDebugRenderTool->m_windowHeight = camera.GetOrthographicTopRight().y;
 	//float cellHeight = lineHeight * 0.7f;
 
 	//if (duration == 0.f)

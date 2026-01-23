@@ -29,6 +29,7 @@ LightObject::LightObject(uint32_t id, const std::string& name, LightObjectType l
     if (lightType == LIGHT_SPOT)
     {
         m_ambience = ambience;
+        m_lightColor = lightColor;  // 修复：LIGHT_SPOT 也需要设置 lightColor
         m_spotForward = spotForward;
         m_innerRadius = innerRadius;
         m_outerRadius = outerRadius;

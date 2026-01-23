@@ -4,6 +4,7 @@
 
 #include "Engine/Core/EngineCommon.hpp"
 #include "Engine/Renderer/DX11Renderer.hpp"
+#include "Engine/Renderer/VulkanRenderer.h"
 #include "Engine/Renderer/Cache/CardBVH.h"
 #include "Engine/Renderer/Cache/RadianceCacheManager.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
@@ -210,89 +211,6 @@ Vec3 GISystem::ReconstructWorldPosCPU(Vec2 screenPos, float depth, float screenW
 	return Vec3(worldPos.x / worldPos.w, worldPos.y / worldPos.w, worldPos.z / worldPos.w);
 }
 
-SurfaceCacheConstants GISystem::PrepareBasicCacheConstants(SurfaceCacheType type, size_t batchStart)
-{
-#ifdef ENGINE_DX11_RENDERER
-	UNUSED(type)
-	UNUSED(batchStart)
-	SurfaceCacheConstants constants = {};
-	return constants;
-#endif
-#ifdef ENGINE_DX12_RENDERER
-	SurfaceCacheConstants constants = {};
-
-	switch (type)
-	{
-	case SURFACE_CACHE_TYPE_PRIMARY:
-		constants.AtlasWidth = (float)m_config.m_primaryAtlasSize;
-		constants.AtlasHeight = (float)m_config.m_primaryAtlasSize;
-		constants.TileSize = m_config.m_primaryTileSize;
-		break;
-
-	case SURFACE_CACHE_TYPE_GI:
-		constants.AtlasWidth = (float)m_config.m_giAtlasSize;
-		constants.AtlasHeight = (float)m_config.m_giAtlasSize;
-		constants.TileSize = m_config.m_giTileSize;
-		break;
-	}
-
-	constants.ScreenWidth = (float)m_config.m_window->GetClientDimensions().x;
-	constants.ScreenHeight = (float)m_config.m_window->GetClientDimensions().y;
-
-	Mat44 worldToCamera = m_config.m_renderer->GetSubRenderer()->m_currentCam.WorldToCameraTransform;
-	Mat44 cameraToRender = m_config.m_renderer->GetSubRenderer()->m_currentCam.CameraToRenderTransform;
-	Mat44 renderToClip = m_config.m_renderer->GetSubRenderer()->m_currentCam.RenderToClipTransform;
-
-	Mat44 viewProj = renderToClip;
-	viewProj.Append(cameraToRender);   
-	viewProj.Append(worldToCamera);    
-	constants.ViewProjInverse = viewProj.GetInverse();
-
-	//viewProj.Append(constants.ViewProjInverse);
-	Vec3 test = ReconstructWorldPosCPU(Vec2(1152.f, 676.f), 0.99f, 2304.f, 1152.f, viewProj.GetInverse());
-
-	Mat44 prevWorldToCamera = m_config.m_renderer->GetSubRenderer()->m_previousCam.WorldToCameraTransform;
-	Mat44 prevCameraToRender = m_config.m_renderer->GetSubRenderer()->m_previousCam.CameraToRenderTransform;
-	Mat44 prevRenderToClip = m_config.m_renderer->GetSubRenderer()->m_previousCam.RenderToClipTransform;
-
-	Mat44 prevViewProj = prevWorldToCamera;
-	prevViewProj.Append(prevCameraToRender);
-	prevViewProj.Append(prevRenderToClip);
-	constants.PrevViewProj = prevViewProj;
-
-	constants.TilesPerRow = (uint32_t)(constants.AtlasWidth / constants.TileSize);
-	constants.CurrentFrame = m_frameIndex;
-	constants.CameraPosition = m_config.m_renderer->GetSubRenderer()->m_currentCam.CameraWorldPosition;
-
-	constants.TemporalBlend = m_config.m_enableTemporal ? 0.9f : 0.0f;
-
-	float cameraMovement = GetDistanceSquared3D(m_config.m_renderer->GetSubRenderer()->m_currentCam.CameraWorldPosition, m_config.m_renderer->GetSubRenderer()->m_previousCam.CameraWorldPosition);
-	if (cameraMovement > 1.0f)  
-	{
-		constants.TemporalBlend = 0.5f;
-	}
-	else
-	{
-		constants.TemporalBlend = 0.9f; 
-	}
-
-	size_t batchEnd = min(batchStart + s_maxCardsPerBatch, m_dirtyCards.size());
-	constants.ActiveCardCount = (uint32_t)(batchEnd - batchStart);
-    
-	/*for (size_t i = 0; i < constants.ActiveCardCount; ++i)
-	{
-		constants.DirtyCardIndices[i] = m_dirtyCards[batchStart + i];
-	}
-
-	for (size_t i = constants.ActiveCardCount; i < s_maxCardsPerBatch; ++i)
-	{
-		constants.DirtyCardIndices[i] = 0;
-	}*/
-    
-	return constants;
-#endif
-}
-
 void GISystem::UpdateCardMetadata()
 {
 	for (auto& [objectID, entry] : m_scene->m_giRegistry)
@@ -303,12 +221,12 @@ void GISystem::UpdateCardMetadata()
         
         for (uint32_t cardID : entry.m_cardIDs)
         {
-            // ✅ 关键：从Scene获取SurfaceCard
+            // 关键：从Scene获取SurfaceCard
             SurfaceCard* card = m_scene->GetSurfaceCardByID(cardID);
             if (!card || !card->m_resident)
                 continue;
             
-            // ✅ 获取对应的CardInstance
+            // 获取对应的CardInstance
             CardInstanceData* instance = obj->GetCardInstance(card->m_templateIndex);
             if (!instance)
                 continue;
@@ -344,15 +262,13 @@ void GISystem::UpdateCardMetadata()
             
             memcpy(meta.m_lightMask, instance->m_lightMask, sizeof(meta.m_lightMask));
             
-            //meta.m_meshID = card->m_meshObjectID; <-可能有用！！TODO
+            meta.m_objectID = card->m_meshObjectID; 
             meta.m_direction = obj->GetMesh()->m_cardTemplates[card->m_templateIndex].m_direction;
-            
+            meta.m_globalCardID = cardID;
             m_cardMetadataCPU.push_back(meta);
         }
     }
     
-    DebuggerPrintf("[GISystem] Updated %zu card metadata entries\n",
-                   m_cardMetadataCPU.size());
 }
 
 const std::vector<SurfaceCardMetadata>& GISystem::GetCurrentSurfaceCardMetadataCPU()
@@ -370,7 +286,6 @@ void GISystem::UpdateStatistics()
 	}
 	m_globalStats.m_averageHitRate = hitRate;
 
-	// 计算内存使用
 	float memoryMB = 0.0f;
 	memoryMB += (m_config.m_primaryAtlasSize * m_config.m_primaryAtlasSize * 16) / (1024.0f * 1024.0f);
 	if (m_config.m_enableMultipleTypes)
@@ -487,6 +402,11 @@ Vec2 GISystem::WorldToScreen(const Vec3& worldPos)
 	screenPos.y = (1.0f - ndcY) * 0.5f * static_cast<float>(win.y); // 顶点坐标系：左上为(0,0)
 
 	return screenPos;
+#endif
+
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(worldPos)
+	return Vec2();
 #endif
 }
 

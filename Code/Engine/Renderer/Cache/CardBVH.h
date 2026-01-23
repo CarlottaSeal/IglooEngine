@@ -2,7 +2,7 @@
 
 #include "Engine/Math/Vec3.hpp"
 #include "Engine/Math/AABB3.hpp"
-#include "Engine/Renderer/Cache/SurfaceCacheCommon.h"
+#include "Engine/Renderer/Cache/CacheCommon.h"
 #include <vector>
 #include <memory>
 #include <cstdint>

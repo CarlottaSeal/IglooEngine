@@ -5,14 +5,14 @@
 
 Panel::Panel(Canvas* canvas, AABB2 const& bounds, 
              Rgba8 backgroundColor, Texture* texture,
-             bool hasBorder, Rgba8 borderColor)
+             bool hasBorder, Rgba8 borderColor, AABB2 const& uv)
     : m_canvas(canvas)
     , m_backgroundColor(backgroundColor)
     , m_texture(texture)
     , m_hasBorder(hasBorder)
     , m_borderColor(borderColor)
+    , m_uv(uv)
 {
-    
     m_bound = bounds;
     m_type = PANEL;
     m_originalColor = backgroundColor;
@@ -24,6 +24,32 @@ Panel::Panel(Canvas* canvas, AABB2 const& bounds,
     }
     
     StartUp();
+}
+
+void Panel::InitializeVerts()
+{
+    m_backgroundVerts.clear();
+    AddVertsForAABB2D(m_backgroundVerts, m_bound, m_backgroundColor, m_uv);
+    
+    if (m_hasBorder)
+    {
+        m_borderVerts.clear();
+        
+        float borderWidth = 2.0f;
+        
+        AABB2 top(m_bound.m_mins.x, m_bound.m_maxs.y - borderWidth,
+                  m_bound.m_maxs.x, m_bound.m_maxs.y);
+        AABB2 bottom(m_bound.m_mins.x, m_bound.m_mins.y,
+                     m_bound.m_maxs.x, m_bound.m_mins.y + borderWidth);
+        AABB2 left(m_bound.m_mins.x, m_bound.m_mins.y,
+                   m_bound.m_mins.x + borderWidth, m_bound.m_maxs.y);
+        AABB2 right(m_bound.m_maxs.x - borderWidth, m_bound.m_mins.y,
+                    m_bound.m_maxs.x, m_bound.m_maxs.y);
+        AddVertsForAABB2D(m_borderVerts, top, m_borderColor);
+        AddVertsForAABB2D(m_borderVerts, bottom, m_borderColor);
+        AddVertsForAABB2D(m_borderVerts, left, m_borderColor);
+        AddVertsForAABB2D(m_borderVerts, right, m_borderColor);
+    }
 }
 
 Panel::~Panel()
@@ -38,7 +64,6 @@ void Panel::StartUp()
 
 void Panel::ShutDown()
 {
-    // 清理子元素
     for (auto* child : m_children)
     {
         if (child)
@@ -56,8 +81,6 @@ void Panel::Update()
     {
         return;
     }
-    
-    // 更新子元素
     for (auto* child : m_children)
     {
         if (child)
@@ -73,12 +96,10 @@ void Panel::Render() const
     {
         return;
     }
-    
     if (!m_canvas)
     {
         return;
     }
-    
     Renderer* renderer = m_canvas->GetSystemRenderer();
     Camera* camera = m_canvas->GetCamera();
     
@@ -88,14 +109,14 @@ void Panel::Render() const
     
     if (!m_backgroundVerts.empty())
     {
-        renderer->BindTexture(m_texture);
+        //renderer->BindTexture(m_texture);
         renderer->DrawVertexArray((int)m_backgroundVerts.size(), m_backgroundVerts.data());
     }
     
 
     if (m_hasBorder && !m_borderVerts.empty())
     {
-        renderer->BindTexture(nullptr);
+        //renderer->BindTexture(nullptr);
         renderer->DrawVertexArray((int)m_borderVerts.size(), m_borderVerts.data());
     }
 

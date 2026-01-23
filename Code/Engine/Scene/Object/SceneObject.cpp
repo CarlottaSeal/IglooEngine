@@ -75,6 +75,16 @@ const Mat44& SceneObject::GetWorldMatrix()
     return m_worldMatrix;*/
 }
 
+const Mat44 SceneObject::GetWorldMatrixWithoutScaling()
+{
+    Mat44 mat = Mat44();
+    //m_cachedWorldMatrix.AppendScaleUniform3D(m_scale);
+    Mat44 rotation = m_orientation.GetAsMatrix_IFwd_JLeft_KUp();
+    mat.Append(rotation);
+    mat.SetTranslation3D(m_position);
+    return mat;
+}
+
 AABB3 SceneObject::GetWorldBounds() const
 {
     //AABB3 local = GetLocalBounds();

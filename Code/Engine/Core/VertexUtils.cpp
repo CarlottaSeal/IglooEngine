@@ -302,6 +302,52 @@ void AddVertsForQuad3DUV(std::vector<Vertex_PCU>& verts, const Vec3& bottomLeft,
 	verts.push_back(Vertex_PCU(topLeft, color, uv2));
 }
 
+void RotateQuadAroundCenterCW90(Vec3& p0, Vec3& p1, Vec3& p2, Vec3& p3, int times)
+{
+	times = (times % 4 + 4) % 4;
+	if (times == 0) return;
+
+	Vec3 center = (p0 + p2) * 0.5f; // 对于单位方块，p0=(0,0), p2=(1,1)，中心=(0.5,0.5)
+
+	auto rotatePoint = [&](Vec3 p) -> Vec3
+	{
+		Vec3 d = p - center;
+		for (int i = 0; i < times; ++i)
+		{
+			// 顺时针 90°： (x, y) -> (y, -x)
+			float oldX = d.x;
+			float oldY = d.y;
+			d.x =  oldY;
+			d.y = -oldX;
+		}
+		return center + d;
+	};
+
+	p0 = rotatePoint(p0);
+	p1 = rotatePoint(p1);
+	p2 = rotatePoint(p2);
+	p3 = rotatePoint(p3);
+}
+
+void AddVertsForQuad3D(std::vector<Vertex_PCUTBN>& verts, const Vec3& bottomLeft, const Vec3& bottomRight,
+	const Vec3& topRight, const Vec3& topLeft, const Rgba8& color, const AABB2& UVs, const Vec3& normal)
+{
+	Vec3 edge1 = bottomRight - bottomLeft;
+	Vec3 edge2 = topLeft - bottomLeft;
+	Vec3 tangent = edge1.GetNormalized();
+	Vec3 bitangent = CrossProduct3D(normal, tangent).GetNormalized();
+    
+	// 添加 6 个顶点（2 个三角形）
+	verts.emplace_back(bottomLeft, color, Vec2(UVs.m_mins.x, UVs.m_mins.y), tangent, bitangent, normal);
+	verts.emplace_back(bottomRight, color, Vec2(UVs.m_maxs.x, UVs.m_mins.y), tangent, bitangent, normal);
+	verts.emplace_back(topRight, color, Vec2(UVs.m_maxs.x, UVs.m_maxs.y), tangent, bitangent, normal);
+    
+	verts.emplace_back(bottomLeft, color, Vec2(UVs.m_mins.x, UVs.m_mins.y), tangent, bitangent, normal);
+	verts.emplace_back(topRight, color, Vec2(UVs.m_maxs.x, UVs.m_maxs.y), tangent, bitangent, normal);
+	verts.emplace_back(topLeft, color, Vec2(UVs.m_mins.x, UVs.m_maxs.y), tangent, bitangent, normal);
+
+}
+
 void AddVertsForAABB3D(std::vector<Vertex_PCU>& verts, const AABB3& bounds, const Rgba8& color, const AABB2& UVs)
 {
 	Vec2 uvAtMins = UVs.m_mins;

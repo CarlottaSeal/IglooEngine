@@ -19,13 +19,17 @@ class SaveSystem
 public:
     SaveSystem(SaveConfig config);
     ~SaveSystem();
+
+    static bool EnsureDirectory(const std::string& path);
+    static bool EnsureDirectoryForFile(const std::string& filepath);
+    static bool DirectoryExists(const std::string& path);
     
     SaveFormat GetDefaultFormat() const { return m_defaultFormat; }
     
-    bool Save(const std::string& filename, const ISerializable* object, SaveFormat format = SaveFormat::BINARY);
+    bool Save(const std::string& filename, const ISerializable* object, SaveFormat format = SaveFormat::BINARY, bool createIfNeeded= true);
     bool Load(const std::string& filename, ISerializable* object, SaveFormat format = SaveFormat::BINARY);
     
-    bool SaveBinary(const std::string& filename, const std::vector<uint8_t>& data);
+    bool SaveBinary(const std::string& filename, const std::vector<uint8_t>& data, bool createDirectoryIfNeeded = true);
     bool LoadBinary(const std::string& filename, std::vector<uint8_t>& data);
     bool LoadBinaryObject(const std::string& filename, ISerializable* object);
     
@@ -59,6 +63,13 @@ public:
     bool QuickSave(int slot, const ISerializable* object, SaveFormat format = SaveFormat::BINARY);
     bool QuickLoad(int slot, ISerializable* object, SaveFormat format = SaveFormat::BINARY);
     
+    // Save context management for subdirectories
+    void PushSaveContext(const std::string& subdirectory);
+    void PopSaveContext();
+    std::string GetCurrentSaveDirectory() const;
+    size_t GetStackSize() const { return m_directoryStack.size(); }
+    void DumpContextStack() const;
+    
 private:
     std::string GetFullPath(const std::string& filename) const;
     std::string GetExtensionForFormat(SaveFormat format) const;
@@ -67,4 +78,5 @@ private:
     SaveConfig m_config;
     std::string m_saveDirectory = "Saves";
     SaveFormat m_defaultFormat = SaveFormat::BINARY;
+    std::vector<std::string> m_directoryStack;  // For context management
 };

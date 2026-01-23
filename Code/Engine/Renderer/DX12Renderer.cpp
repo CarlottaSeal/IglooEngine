@@ -1,18 +1,15 @@
-//#ifndef WIN32_LEAN_AND_MEAN
-
 #include "Engine/Renderer/DX12Renderer.hpp"
 
-#include "Cache/CardBVH.h"
-#include "GI/GISystem.h"
 
 #ifdef ENGINE_DX12_RENDERER
-
 #include "Renderer.hpp"
 #include "ConstantBuffer.hpp"
+#include "GIVisualization.h"
 #include "IndexBuffer.hpp"
 #include "Shader.hpp"
 #include "VertexBuffer.hpp"
 #include "SDFTexture3D.h"
+#include "ShaderIncludeHandler.h"
 #include "Cache/RadianceCacheManager.h"
 #include "Cache/SurfaceCard.h"
 #include "Engine/Renderer/BitmapFont.hpp"
@@ -25,7 +22,11 @@
 #include "Engine/Core/FileUtils.hpp"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/Object/Mesh/MeshObject.h"
-#include "Engine/Scene/SDF/SDFCommon.h"
+#include "Cache/CardBVH.h"
+#include "Cache/ScreenProbeFinalGather.h"
+#include "Cache/CombineSurfaceCache.h"
+#include "Cache/SurfaceRadiosityCache.h"
+#include "GI/GISystem.h"
 
 #include "ThirdParty/ImGui/imgui.h"
 #include "ThirdParty/ImGui/implot.h"
@@ -37,6 +38,20 @@
 // using Microsoft::WRL::ComPtr;
 
 extern GISystem* g_theGISystem;
+
+#ifdef ENGINE_DEBUG_RENDER
+#define DEBUG_TDR(msg) OutputDebugStringA("[TDR] " msg "\n")
+#define CHECK_DEVICE() do { \
+HRESULT hr = m_device->GetDeviceRemovedReason(); \
+if (FAILED(hr)) { \
+OutputDebugStringA("[TDR FATAL] Device Removed!\n"); \
+DebugBreak(); \
+} \
+} while(0)
+#else
+#define DEBUG_TDR(msg)
+#define CHECK_DEVICE()
+#endif
 
 DX12Renderer::DX12Renderer(RendererConfig config)
 {
@@ -59,6 +74,10 @@ void DX12Renderer::Startup()
 	Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
 	D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
 	debugController->EnableDebugLayer();
+	Microsoft::WRL::ComPtr<ID3D12Debug1> debugController1;
+	if (SUCCEEDED(debugController.As(&debugController1))) {
+		debugController1->SetEnableGPUBasedValidation(TRUE);
+	}
 #endif
 
 	IDXGIFactory4* factory;
@@ -211,7 +230,6 @@ void DX12Renderer::Startup()
 		size_t totalBufferSize = alignedSize * 256;
     
 		m_constantBuffers[cbSlot] = new ConstantBuffer(totalBufferSize, alignedSize);
-    
 		// 创建一个大buffer
 		D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(totalBufferSize);
 		hr = m_device->CreateCommittedResource(
@@ -234,7 +252,7 @@ void DX12Renderer::Startup()
 
 	// create a depth stencil descriptor heap so we can get a pointer to the depth stencil buffer
 	D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-	dsvHeapDesc.NumDescriptors = 1;
+	dsvHeapDesc.NumDescriptors = 1 + SHADOW_MAP_DSV_COUNT;
 	dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
 	dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 	hr = m_device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&m_dsvDescHeap));
@@ -252,7 +270,9 @@ void DX12Renderer::Startup()
 
 	CD3DX12_HEAP_PROPERTIES defaultProperties(D3D12_HEAP_TYPE_DEFAULT);
 	//CD3DX12_RESOURCE_DESC depthStencilTextureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_D32_FLOAT, m_config.m_window->GetClientDimensions().x, m_config.m_window->GetClientDimensions().y, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-	CD3DX12_RESOURCE_DESC depthStencilTextureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_TYPELESS, m_config.m_window->GetClientDimensions().x, m_config.m_window->GetClientDimensions().y, 1, 0, 1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+	CD3DX12_RESOURCE_DESC depthStencilTextureDesc = CD3DX12_RESOURCE_DESC::Tex2D(DXGI_FORMAT_R32_TYPELESS,
+		m_config.m_window->GetClientDimensions().x, m_config.m_window->GetClientDimensions().y, 1, 1,
+		1, 0, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
 
 	m_device->CreateCommittedResource(
 		&defaultProperties,
@@ -263,7 +283,6 @@ void DX12Renderer::Startup()
 		IID_PPV_ARGS(&m_depthStencilBuffer)
 	);
 	m_depthStencilBuffer->SetName(L"DepthStencilBuffer");
-
 	m_device->CreateDepthStencilView(m_depthStencilBuffer, &depthStencilDesc, m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart());
 
 	// Create the command list.
@@ -272,6 +291,7 @@ void DX12Renderer::Startup()
 	//When a command list is created, it is created in the "recording" state. We do not want to record to the command list yet, so we Close() the command list after we create it.
 	hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocator[0], m_pipelineStateObject, IID_PPV_ARGS(&m_commandList));
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12 Cannot Create CommandList!");
+	m_commandList->SetName(L"Main Command List");	
 	//hr = m_commandList->Close(); //第一帧end时close
 	//GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12 cannot close the new created CommandList!");
 	//ID3D12CommandList* ppCommandLists[] = { m_commandList };
@@ -338,23 +358,34 @@ void DX12Renderer::Startup()
 
 	if (m_config.m_enableGI) //TODO: 这里的renderMode应该是一个组合管线，由多种搭配组合而成
 	{
-		CreateCardCaptureResources();
+		StartupComputeQueue();
+
+		CreateShadowMapResources();
+		
+		CreateCardCapturePassResources();
 		CreateCardCapturePipelineStates();
 
-		CreateGBufferResources();
+		CreateGBufferPassResources();
 		//m_gBuffer.m_depth = m_depthStencilBuffer;
 		CreateDepthSRV();
 		
 		CreateComputeRootSignature();
 		
 		CreateRadianceCacheResources();
-		CreateCompositePSO();
+		CreateCompositeResources();
 
 		CreateSDFGenerationRootSignature();
 		CreateSDFGenerationPSO();
+		
+		CreateGlobalSDFPassResources();
 
 		CreateRadianceCacheUpdatePSO();
 		CreateRadianceCacheResources();
+
+		CreateCombineSurfaceCacheResources();
+		CreateSurfaceCacheRadiosityResources();
+		CreateScreenProbeGatherResources();
+		CreateGIVisualizationResources();
 	}
 
 	ImGuiStartUp();
@@ -390,6 +421,9 @@ void DX12Renderer::BeginFrame()
 	m_commandList->SetGraphicsRootDescriptorTable(14, descriptorHandle);
 
 	ImGuiBeginFrame();
+
+	m_currentRenderMode = RenderMode::UNKNOWN;
+	m_currentActivePass = ActivePass::UNKNOWN;
 }
 
 void DX12Renderer::EndFrame()
@@ -408,8 +442,8 @@ void DX12Renderer::EndFrame()
 		m_commandList->ResourceBarrier(1, &barrier);
 	}
 
-	m_currentRenderMode = RenderMode::UNKNOWN;
-	m_currentActivePass = ActivePass::UNKNOWN;
+	//m_currentRenderMode = RenderMode::UNKNOWN;
+	//m_currentActivePass = ActivePass::UNKNOWN;
 	m_forwardPassActive = false;
 
 	HRESULT hr = m_commandList->Close();
@@ -423,13 +457,11 @@ void DX12Renderer::EndFrame()
 
 	hr = m_commandQueue->Signal(m_fence[currentFrameIndex], currentFenceValue);
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12: Failed to signal fence");
-
 	hr = m_swapChain->Present(1, 0);
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12: Present failed");
 
 	m_radianceCache.EndFrame(); //TODO: meishayong
 	
-
 	m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
 	if (m_fence[m_frameIndex]->GetCompletedValue() < m_fenceValue[m_frameIndex])
@@ -471,21 +503,35 @@ void DX12Renderer::EndFrame()
 
 void DX12Renderer::ShutDown()
 {
-	ImGuiShutDown();
 	if (m_giSystem)
 		m_giSystem->Shutdown();
-
+	if (m_computeQueue)
+		WaitForComputeQueue();
 	for (int i = 0; i < FRAME_BUFFER_COUNT; ++i)
 	{
 		m_frameIndex = i;
 		WaitForPreviousFrame();
 	}
+	ImGuiShutDown();
 
-	for (int scIdx = 0; scIdx < SURFACE_CACHE_TYPE_COUNT; scIdx++)
-	{
-		m_surfaceCaches[scIdx].Shutdown();
-	}
-
+	m_surfaceRadiosity->Shutdown();
+	m_screenProbeFinalGather->Shutdown();
+	m_combineSurfaceCache->Shutdown();
+	m_giVisualization->Shutdown();
+	delete m_surfaceRadiosity;
+	m_surfaceRadiosity = nullptr;
+	delete m_screenProbeFinalGather;
+	m_screenProbeFinalGather = nullptr;
+	delete m_combineSurfaceCache;
+	m_combineSurfaceCache = nullptr;
+	delete m_giVisualization;
+	m_giVisualization = nullptr;
+	
+	ShutdownComputeQueue();
+	ShutdownShadowMapPass();
+	
+	m_surfaceCache.Shutdown();
+	
 	for (BitmapFont* font : m_loadedFonts)
 	{
 		delete font;
@@ -528,7 +574,7 @@ void DX12Renderer::ShutDown()
 
 	DX_SAFE_RELEASE(m_gBuffer.m_albedo);
 	DX_SAFE_RELEASE(m_gBuffer.m_normal);
-	DX_SAFE_RELEASE(m_gBuffer.m_motion);
+	DX_SAFE_RELEASE(m_gBuffer.m_worldPos);
 	DX_SAFE_RELEASE(m_gBuffer.m_material);
 	
 	m_radianceCache.Shutdown();
@@ -552,12 +598,22 @@ void DX12Renderer::ShutDown()
 		DX_SAFE_RELEASE(cardCapturePair.second);
 	}
 	m_cardCapturePSOConfiguration.clear();
-	DX_SAFE_RELEASE(m_compositePSO);
 	DX_SAFE_RELEASE(m_sdfGenerationPSO);
 
+	ShutdownCompositePass();
 	DX_SAFE_RELEASE(m_graphicsRootSignature); //its bound in pso
 	DX_SAFE_RELEASE(m_computeRootSignature);
 	DX_SAFE_RELEASE(m_sdfGenerationRootSignature);
+
+	DX_SAFE_RELEASE(m_globalSDFTexture);
+	DX_SAFE_RELEASE(m_voxelVisibilityBuffer);
+	DX_SAFE_RELEASE(m_voxelLightingTexture);
+	DX_SAFE_RELEASE(m_instanceInfoBuffer);
+	DX_SAFE_RELEASE(m_instanceInfoUploadBuffer);
+	DX_SAFE_RELEASE(m_buildGlobalSDFPSO);
+	DX_SAFE_RELEASE(m_buildVisibilityPSO);
+	DX_SAFE_RELEASE(m_injectLightingPSO);
+	DX_SAFE_RELEASE(m_globalSDFRootSignature);
 
 	DX_SAFE_RELEASE(m_swapChain);
 	
@@ -612,7 +668,7 @@ void DX12Renderer::ClearScreen(Rgba8 const& clearColor)
 	//{
 	//BeginForwardPass();
 	//ClearForwardPassRTV(clearColor);
-
+	UNUSED(clearColor); //TODO
 	m_commandList->ClearDepthStencilView(m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
 	//}
@@ -688,12 +744,6 @@ void DX12Renderer::BeginForwardPass()
 			m_renderTargets[m_frameIndex], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		m_commandList->ResourceBarrier(1, &barrier);
 	}
-	
-	PassModeConstants modeConstants;
-	modeConstants.RenderMode =static_cast<uint32_t>(RenderMode::FORWARD);
-	m_constantBuffers[k_passConstantsSlot]->AppendData(&modeConstants, sizeof(PassModeConstants), m_currentDrawIndex);
-	BindConstantBuffer(k_passConstantsSlot, m_constantBuffers[k_passConstantsSlot]);
-
 	m_currentActivePass = ActivePass::BACKBUFFER;
 	m_forwardPassActive = true;
 }
@@ -801,7 +851,7 @@ void DX12Renderer::SetGeneralLightConstants(Rgba8 sunColor, const Vec3& sunNorma
 
 		lightConstant.LightsArray[i] = light;
 	}
-	
+	m_lightConstant = lightConstant;
 	m_constantBuffers[k_generalLightConstantsSlot]->AppendData(&lightConstant, sizeof(GeneralLightConstants), m_currentDrawIndex);
 	BindConstantBuffer(k_generalLightConstantsSlot, m_constantBuffers[k_generalLightConstantsSlot]);
 }
@@ -833,85 +883,6 @@ void DX12Renderer::SetMaterialConstants(const Texture* diffuseTex, const Texture
 	// cb->m_dx12ConstantBuffer->Unmap(0, nullptr);
 	cb->AppendData(&materialConstant, sizeof(MaterialConstants), m_currentDrawIndex); 
 	BindConstantBuffer(k_materialConstantsSlot, cb);
-}
-
-void DX12Renderer::SetComputeSurfaceCacheConstants(SurfaceCacheType type, size_t batchStart, int bindComputeSlot)
-{
-	SurfaceCacheConstants constants = {};
-
-	switch (type)
-	{
-	case SURFACE_CACHE_TYPE_PRIMARY:
-		constants.AtlasWidth = (float)m_giSystem->m_config.m_primaryAtlasSize;
-		constants.AtlasHeight = (float)m_giSystem->m_config.m_primaryAtlasSize;
-		constants.TileSize = m_giSystem->m_config.m_primaryTileSize;
-		break;
-
-	case SURFACE_CACHE_TYPE_GI:
-		constants.AtlasWidth = (float)m_giSystem->m_config.m_giAtlasSize;
-		constants.AtlasHeight = (float)m_giSystem->m_config.m_giAtlasSize;
-		constants.TileSize = m_giSystem->m_config.m_giTileSize;
-		break;
-	}
-
-	constants.ScreenWidth = (float)m_config.m_window->GetClientDimensions().x;
-	constants.ScreenHeight = (float)m_config.m_window->GetClientDimensions().y;
-
-	Mat44 worldToCamera = m_currentCam.WorldToCameraTransform;
-	Mat44 cameraToRender = m_currentCam.CameraToRenderTransform;
-	Mat44 renderToClip = m_currentCam.RenderToClipTransform;
-
-	Mat44 viewProj = renderToClip;
-	viewProj.Append(cameraToRender);   
-	viewProj.Append(worldToCamera);    
-	constants.ViewProj = viewProj;
-	constants.ViewProjInverse = viewProj.GetInverse();
-
-	Mat44 prevWorldToCamera = m_previousCam.WorldToCameraTransform;
-	Mat44 prevCameraToRender = m_previousCam.CameraToRenderTransform;
-	Mat44 prevRenderToClip = m_previousCam.RenderToClipTransform;
-
-	Mat44 prevViewProj = prevWorldToCamera;
-	prevViewProj.Append(prevCameraToRender);
-	prevViewProj.Append(prevRenderToClip);
-	constants.PrevViewProj = prevViewProj;
-
-	constants.TilesPerRow = (uint32_t)(constants.AtlasWidth / constants.TileSize);
-	constants.CurrentFrame = m_frameIndex;
-	constants.CameraPosition = m_currentCam.CameraWorldPosition;
-
-	constants.TemporalBlend = m_giSystem->m_config.m_enableTemporal ? 0.9f : 0.0f;
-
-	float cameraMovement = GetDistanceSquared3D(m_currentCam.CameraWorldPosition,
-		m_previousCam.CameraWorldPosition);
-	if (cameraMovement > 1.0f)  
-	{
-		constants.TemporalBlend = 0.5f;
-	}
-	else
-	{
-		constants.TemporalBlend = 0.9f; 
-	}
-
-	size_t batchEnd = min(batchStart + s_maxCardsPerBatch, m_giSystem->m_dirtyCards.size());
-	constants.ActiveCardCount = (uint32_t)(batchEnd - batchStart);
-    
-	// uint32_t* flatArray = (uint32_t*)constants.DirtyCardIndices;
-	// for (size_t i = 0; i < constants.ActiveCardCount; ++i)
-	// {
-	// 	flatArray[i] = m_giSystem->m_dirtyCards[batchStart + i];
-	// }
-	//
-	// for (size_t i = constants.ActiveCardCount; i < s_maxCardsPerBatch; ++i)
-	// {
-	// 	flatArray[i] = 0;
-	// }
-	m_constantBuffers[k_surfaceCacheConstantsSlot]->AppendData(&constants, 
-			sizeof(SurfaceCacheConstants), m_currentDrawIndex);
-	D3D12_GPU_VIRTUAL_ADDRESS cbAddress = 
-		m_constantBuffers[k_surfaceCacheConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-		+ m_constantBuffers[k_surfaceCacheConstantsSlot]->m_offset;
-	m_commandList->SetComputeRootConstantBufferView(bindComputeSlot, cbAddress);
 }
 
 void DX12Renderer::DrawVertexArray(int numVertexes, const Vertex_PCU* vertex)
@@ -1007,7 +978,7 @@ void DX12Renderer::DrawVertexIndexArray(std::vector<Vertex_PCUTBN> const& verts,
 	ringVBO->AppendData(verts.data(), vertexBufferSize);     
 	unsigned int iboOffset = ringIBO->AppendData(indexes.data(), indexBufferSize);    
 
-	DrawIndexedVertexBuffer(ringVBO, ringIBO, numOfIndexes, iboOffset / sizeof(unsigned int)); //offset 以索引为单位
+	DrawIndexedVertexBuffer(ringVBO, ringIBO, numOfIndexes, (int)iboOffset / sizeof(unsigned int)); //offset 以索引为单位
 }
 
 void DX12Renderer::DrawVertexBuffer(VertexBuffer* vbo, int vertexCount, int vertexOffset /*= 0 */)
@@ -1019,22 +990,19 @@ void DX12Renderer::DrawVertexBuffer(VertexBuffer* vbo, int vertexCount, int vert
 	SetGraphicsStatesIfChanged();
 	BindVertexBuffer(vbo);
 	
-	// ✅ offset 正确传入，单位是“顶点数”
+	// offset 正确传入，单位是“顶点数”
 	m_commandList->DrawInstanced(vertexCount, 1, vertexOffset, 0);
 	m_currentDrawIndex ++;
 }
 
 void DX12Renderer::DrawIndexedVertexBuffer(VertexBuffer* vbo, IndexBuffer* ibo, int indexCount, int indexOffset)
 {
-	// m_constantBuffers[k_cameraConstantsSlot]->AppendData(&m_currentCam, sizeof(CameraConstants), m_frameIndex); 
-	// BindConstantBuffer(k_cameraConstantsSlot,
-	// 	m_constantBuffers[k_cameraConstantsSlot]);
-
 	SetGraphicsStatesIfChanged();
 	BindVertexBuffer(vbo);
 	BindIndexBuffer(ibo);
 	m_commandList->DrawIndexedInstanced(indexCount, 1, indexOffset, 0, 0);
-	m_currentDrawIndex ++;
+
+	m_currentDrawIndex++;
 }
 
 Shader* DX12Renderer::CreateShader(char const* shaderName, VertexType type)
@@ -1116,18 +1084,20 @@ bool DX12Renderer::CompileShaderToByteCode(ID3DBlob** shaderByteCode, char const
 	// Enable better shader debugging with the graphics debugging tools.
 	UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION | 
 		D3DCOMPILE_PREFER_FLOW_CONTROL | D3DCOMPILE_ENABLE_STRICTNESS	|
-		D3DCOMPILE_DEBUG_NAME_FOR_SOURCE;
+		D3DCOMPILE_DEBUG_NAME_FOR_SOURCE | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
 #else
-	UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+	UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_UNBOUNDED_DESCRIPTOR_TABLES;
 #endif
 
 	ID3DBlob* shaderBlob = NULL;
 	ID3DBlob* errorBlob = NULL;
 
+	ShaderIncludeHandler includeHandler("Data/Shaders");
+
 	// Compile shader
 	HRESULT hr = D3DCompile(
 		source, strlen(source),
-		name, nullptr, nullptr,
+		name, nullptr,  &includeHandler,
 		entryPoint, target, compileFlags, 0,
 		&shaderBlob, &errorBlob
 	);
@@ -1624,7 +1594,7 @@ void DX12Renderer::SetGraphicsStatesIfChanged()
 		psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;  
 		psoDesc.RTVFormats[1] = DXGI_FORMAT_R10G10B10A2_UNORM;
 		psoDesc.RTVFormats[2] = DXGI_FORMAT_R8G8B8A8_UNORM;
-		psoDesc.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
+		psoDesc.RTVFormats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	}
 	HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12 Cannot Create Graphics Pipeline State!");
@@ -1672,7 +1642,7 @@ void DX12Renderer::CreateDepthSRV()
 	);
 }
 
-void DX12Renderer::CreateGBufferResources()
+void DX12Renderer::CreateGBufferPassResources()
 {
 	D3D12_CLEAR_VALUE albedoClearValue = {};
 	albedoClearValue.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1696,7 +1666,7 @@ void DX12Renderer::CreateGBufferResources()
 	materialClearValue.Color[3] = 0.0f; // A
 
 	D3D12_CLEAR_VALUE motionClearValue = {};
-	motionClearValue.Format = DXGI_FORMAT_R16G16_FLOAT;
+	motionClearValue.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	motionClearValue.Color[0] = 0.0f; // X
 	motionClearValue.Color[1] = 0.0f; // Y
 	motionClearValue.Color[2] = 0.0f; // Z
@@ -1744,13 +1714,13 @@ void DX12Renderer::CreateGBufferResources()
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create GBuffer material!");
 	m_gBuffer.m_material->SetName(L"GBufferMaterial");
     
-	// Motion Vectors
-	desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	// Motion Vectors -> 改为WorldPos
+	desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	hr = m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE,
 		&desc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &motionClearValue,
-		IID_PPV_ARGS(&m_gBuffer.m_motion));
+		IID_PPV_ARGS(&m_gBuffer.m_worldPos));
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create GBuffer normal!");
-	m_gBuffer.m_motion->SetName(L"GBufferMotion");
+	m_gBuffer.m_worldPos->SetName(L"GBufferWorldPos");
 
 	CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
 		m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
@@ -1777,17 +1747,15 @@ void DX12Renderer::CreateGBufferResources()
 		case 2: // Material
 			srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			break;
-		case 3: // Motion
-			srvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		case 3: // Motion -改为worldPos
+			srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 			break;
 		}
-
 		m_device->CreateShaderResourceView(
 			m_gBuffer.GetResource(i),
 			&srvDesc,
 			srvHandle
 		);
-
 		srvHandle.Offset(1, m_scuDescriptorSize);
 	}
 	//创建完GBuffer的ID3D12Resources后补上它们的rtv
@@ -1810,7 +1778,6 @@ void DX12Renderer::CreateGBufferResources()
 		m_device->CreateRenderTargetView(m_gBuffer.m_normal, &rtvDesc, rtvHandle);
 		rtvHandle.Offset(1, m_rtvDescriptorSize);
 	}
-
 	// Material
 	{
 		rtvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1818,12 +1785,11 @@ void DX12Renderer::CreateGBufferResources()
 		m_device->CreateRenderTargetView(m_gBuffer.m_material, &rtvDesc, rtvHandle);
 		rtvHandle.Offset(1, m_rtvDescriptorSize);
 	}
-
-	// Motion
+	// Motion ->改为worldPos
 	{
-		rtvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+		rtvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
 		rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-		m_device->CreateRenderTargetView(m_gBuffer.m_motion, &rtvDesc, rtvHandle);
+		m_device->CreateRenderTargetView(m_gBuffer.m_worldPos, &rtvDesc, rtvHandle);
 	}
 
 	ShaderConfig cfg;
@@ -1872,19 +1838,13 @@ void DX12Renderer::BeginGBufferPass()
 				D3D12_RESOURCE_STATE_RENDER_TARGET
 			);
 		}
-		/*barriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
-			m_depthStencilBuffer,
-			D3D12_RESOURCE_STATE_DEPTH_READ |
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-			D3D12_RESOURCE_STATE_DEPTH_WRITE
-		);*/
+		// barriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
+		// 	m_depthStencilBuffer,
+		// 	D3D12_RESOURCE_STATE_DEPTH_READ,
+		// 	D3D12_RESOURCE_STATE_DEPTH_WRITE
+		// 	);
 		m_commandList->ResourceBarrier(GBUFFER_COUNT, barriers);
 	}
-
-	PassModeConstants modeConstants;
-	modeConstants.RenderMode =static_cast<uint32_t>(RenderMode::GI);
-	m_constantBuffers[k_passConstantsSlot]->AppendData(&modeConstants, sizeof(PassModeConstants), m_currentDrawIndex);
-	BindConstantBuffer(k_passConstantsSlot, m_constantBuffers[k_passConstantsSlot]);
 
 	m_currentActivePass = ActivePass::GBUFFER;
 	m_gBufferPassActive = true;
@@ -1922,33 +1882,65 @@ void DX12Renderer::ClearGBufferPassRTV()
 
 void DX12Renderer::EndGBufferPass()
 {
-	//ExtractGBufferToSurfaceCache();
 	BeginCardCapturePass();
 	EndCardCapturePass();
-	//BeginRadianceCachePass();
+	 //BeginRadianceCachePass();
+	
+	RenderingGlobalSDFPass();
+	
+	RenderingSurfaceCacheRadiosityPass();
+	RenderingCombineSurfaceCachePass();
+	RenderingScreenProbeGatherPass();
 
-	CompositeFinalImage();
+	RenderingCompositePass();
+	
+	CD3DX12_RESOURCE_BARRIER postCompositeBarriers[] = {
+		// 1. ScreenIndirectLighting（Composite使用的）
+		CD3DX12_RESOURCE_BARRIER::Transition(
+			m_screenProbeFinalGather->GetIndirectLightingTexture(),
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON
+		),
+		// 2. GlobalSDF（Radiosity和ScreenProbe使用的）
+		CD3DX12_RESOURCE_BARRIER::Transition(
+			m_globalSDFTexture,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON
+		),
+		// 3. VoxelLighting（Radiosity和ScreenProbe使用的）+Composite也可以用
+		CD3DX12_RESOURCE_BARRIER::Transition(
+			m_voxelLightingTexture,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON
+		),
+		CD3DX12_RESOURCE_BARRIER::Transition(
+			m_depthStencilBuffer,
+			D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_DEPTH_WRITE
+		),
+		CD3DX12_RESOURCE_BARRIER::Transition(
+	m_surfaceCache.m_atlasTexture,
+	D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+	D3D12_RESOURCE_STATE_COMMON,
+	D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
+),
+CD3DX12_RESOURCE_BARRIER::Transition(
+	m_surfaceCache.m_cardMetadataBuffer,
+	D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+	D3D12_RESOURCE_STATE_COMMON
+),
+	};
+	m_commandList->ResourceBarrier(_countof(postCompositeBarriers), postCompositeBarriers);
+	
+	// CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+	// 		m_depthStencilBuffer,
+	// 		D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+	// 		D3D12_RESOURCE_STATE_DEPTH_WRITE
+	// 	);
+	// m_commandList->ResourceBarrier(1, &barrier);
 
-	if (m_debugVisualizeSurfaceCache)
-	{
-		VisualizeSurfaceCache();
-	}
-
-	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-		m_depthStencilBuffer,
-		D3D12_RESOURCE_STATE_DEPTH_READ |
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-		D3D12_RESOURCE_STATE_DEPTH_WRITE  // 恢复为可写
-	);
-	m_commandList->ResourceBarrier(1, &barrier);
 	m_gBufferPassActive = false;
-
-	for (int i = 0; i < SURFACE_CACHE_TYPE_COUNT; i++)
-	{
-		m_surfaceCaches[i].SwapBuffers();
-	}
-
-	m_radianceCache.SwapBuffers();  //TODO 暂时还只有一层
+	m_radianceCache.SwapBuffers();
 }
 
 void DX12Renderer::UnbindGBufferPassRT()
@@ -1968,7 +1960,6 @@ void DX12Renderer::CreateSDFGenerationRootSignature()
     
 	// [0] = Input SRVs (t0-t3): Vertex, Index, BVHNode, BVHTriIndices
 	ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0);
-    
 	// [1] = Output UAV (u0): SDF Texture3D
 	ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0);
     
@@ -1976,20 +1967,17 @@ void DX12Renderer::CreateSDFGenerationRootSignature()
 	params[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
 	params[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_ALL);
 	params[2].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
-    
 	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc;
 	rootSigDesc.Init(3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
     
 	ID3DBlob* signature = nullptr;
 	ID3DBlob* error = nullptr;
-    
 	HRESULT hr = D3D12SerializeRootSignature(
 		&rootSigDesc,
 		D3D_ROOT_SIGNATURE_VERSION_1,
 		&signature,
 		&error
 	);
-    
 	if (FAILED(hr))
 	{
 		if (error)
@@ -2000,17 +1988,14 @@ void DX12Renderer::CreateSDFGenerationRootSignature()
 		}
 		GUARANTEE_OR_DIE(false, "Failed to serialize SDF root signature!");
 	}
-    
 	hr = m_device->CreateRootSignature(
 		0,
 		signature->GetBufferPointer(),
 		signature->GetBufferSize(),
 		IID_PPV_ARGS(&m_sdfGenerationRootSignature)
 	);
-    
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create SDF root signature!");
 	m_sdfGenerationRootSignature->SetName(L"SDFGenerationRootSig");
-    
 	if (signature) signature->Release();
 }
 
@@ -2029,57 +2014,68 @@ void DX12Renderer::CreateSDFGenerationPSO()
     
 	HRESULT hr = m_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&m_sdfGenerationPSO));
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create SDF generation PSO!");
-    
 	m_sdfGenerationPSO->SetName(L"SDFGenerationPSO");
 	cs->Release();
 }
 
-SDFTexture3D* DX12Renderer::GenerateSDFOnGPU(const std::vector<Vertex_PCUTBN>& vertices,
-	const std::vector<uint32_t>& indices, const BVH& bvh, const AABB3& bounds, int resolution)
+SDFTexture3D* DX12Renderer::CreateSDFTextureFromData(const std::vector<Vertex_PCUTBN>& vertices,
+                                             const std::vector<uint32_t>& indices, const BVH& bvh, const AABB3& bounds, int resolution)
 {
+	if (m_nextSDFTextureIndex >= MAX_SDF_TEXTURE_COUNT)
+	{
+		DebuggerPrintf("[DX12] Cannot generating more SDF textures.");
+		return nullptr;
+	}
 	SDFTexture3D* sdf = new SDFTexture3D(resolution);
-	DebuggerPrintf("[DX12] Starting GPU SDF generation (resolution=%d)\n", resolution);
+	DebuggerPrintf("[DX12] Starting GPU SDF generation (resolution=%d) on Async Compute Queue\n", resolution);
     
     std::vector<GPUBVHNode> bvhNodes;
     std::vector<uint32_t> bvhTriIndices;
     bvh.FlattenForGPU(bvhNodes, bvhTriIndices);
-    
     if (bvhNodes.empty())
     {
         DebuggerPrintf("[DX12] BVH is empty, cannot generate SDF\n");
         return nullptr;
     }
-    
     DebuggerPrintf("[DX12] SDF Gen: %zu verts, %zu indices, %zu BVH nodes\n",
                    vertices.size(), indices.size(), bvhNodes.size());
-    
+
+	if (m_computeFenceValue > 0)  // 如果不是第一次调用
+	{
+		WaitForComputeQueue();
+		DebuggerPrintf("[DX12] Previous SDF generation completed, starting new one\n");
+	}
+	// 1. Reset Compute Allocator和CommandList
+	m_computeAllocator->Reset();
+	m_computeCommandList->Reset(m_computeAllocator, nullptr);
+	
     ID3D12Resource* vertexBuffer = CreateStructuredBuffer(sdf, 
-        vertices.data(), 
-        vertices.size(),
-        sizeof(Vertex_PCUTBN)
-    ,
-        L"SDF_VertexBuffer"
+                                                          vertices.data(), 
+                                                          vertices.size(),
+                                                          sizeof(Vertex_PCUTBN)
+                                                          ,
+                                                          L"SDF_VertexBuffer", m_computeCommandList
     );
     ID3D12Resource* indexBuffer = CreateStructuredBuffer(sdf,
-        indices.data(),
-        indices.size(),
-        sizeof(uint32_t)
-    ,
-        L"SDF_IndexBuffer"
+                                                         indices.data(),
+                                                         indices.size(),
+                                                         sizeof(uint32_t)
+                                                         ,
+                                                         L"SDF_IndexBuffer", m_computeCommandList
     );
     ID3D12Resource* bvhNodeBuffer = CreateStructuredBuffer(sdf,
-        bvhNodes.data(),
-        bvhNodes.size(),
-        sizeof(GPUBVHNode)
-    ,
-        L"SDF_BVHNodeBuffer"
+                                                           bvhNodes.data(),
+                                                           bvhNodes.size(),
+                                                           sizeof(GPUBVHNode)
+                                                           ,
+                                                           L"SDF_BVHNodeBuffer", m_computeCommandList
     );
     ID3D12Resource* bvhTriBuffer = CreateStructuredBuffer(sdf,
-        bvhTriIndices.data(),
-        bvhTriIndices.size(),
-        sizeof(uint32_t)
-    ,
-        L"SDF_BVHTriIndicesBuffer"
+                                                          bvhTriIndices.data(),
+                                                          bvhTriIndices.size(),
+                                                          sizeof(uint32_t)
+                                                          ,
+                                                          L"SDF_BVHTriIndicesBuffer", m_computeCommandList
     );
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
         m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
@@ -2114,12 +2110,12 @@ SDFTexture3D* DX12Renderer::GenerateSDFOnGPU(const std::vector<Vertex_PCUTBN>& v
     texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     texDesc.Width = resolution;
     texDesc.Height = resolution;
-    texDesc.DepthOrArraySize = (UINT16)resolution;
+    texDesc.DepthOrArraySize = resolution;
     texDesc.MipLevels = 1;
     texDesc.Format = DXGI_FORMAT_R32_FLOAT;
     texDesc.SampleDesc.Count = 1;
     texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;  // ✅ UAV
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     
     CD3DX12_HEAP_PROPERTIES defaultProps(D3D12_HEAP_TYPE_DEFAULT);
     
@@ -2127,7 +2123,7 @@ SDFTexture3D* DX12Renderer::GenerateSDFOnGPU(const std::vector<Vertex_PCUTBN>& v
         &defaultProps,
         D3D12_HEAP_FLAG_NONE,
         &texDesc,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // ✅ 初始状态
+        D3D12_RESOURCE_STATE_COMMON,  // 🔥 改成COMMON，由Compute Queue管理状态
         nullptr,
         IID_PPV_ARGS(&sdf->m_sdfTexture3D)
     );
@@ -2149,97 +2145,120 @@ SDFTexture3D* DX12Renderer::GenerateSDFOnGPU(const std::vector<Vertex_PCUTBN>& v
     uavDesc.Texture3D.FirstWSlice = 0;
     uavDesc.Texture3D.WSize = resolution;
     m_device->CreateUnorderedAccessView(sdf->m_sdfTexture3D, nullptr, &uavDesc, uavHandle);
-    
-    // 6. Dispatch Compute Shader
-    m_commandList->SetPipelineState(m_sdfGenerationPSO);
-    m_commandList->SetComputeRootSignature(m_sdfGenerationRootSignature);
-    
+	
+    // 2. 设置Compute Pipeline
+    m_computeCommandList->SetPipelineState(m_sdfGenerationPSO);
+    m_computeCommandList->SetComputeRootSignature(m_sdfGenerationRootSignature);
     ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
-    m_commandList->SetDescriptorHeaps(1, heaps);
+    m_computeCommandList->SetDescriptorHeaps(1, heaps);
     
-    // 绑定SRVs (t0-t3)
+    // 3. 转换资源到UAV状态
+    CD3DX12_RESOURCE_BARRIER toUAV = CD3DX12_RESOURCE_BARRIER::Transition(
+        sdf->m_sdfTexture3D,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+    m_computeCommandList->ResourceBarrier(1, &toUAV);
+    
+    // 4. 绑定SRVs (t0-t3)
     CD3DX12_GPU_DESCRIPTOR_HANDLE gpuSrvHandle(
         m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
         SDF_GEN_VERTEX_SRV,
         m_scuDescriptorSize
     );
-    m_commandList->SetComputeRootDescriptorTable(0, gpuSrvHandle);
+    m_computeCommandList->SetComputeRootDescriptorTable(0, gpuSrvHandle);
     
-    // 绑定UAV (u0)
+    // 5. 绑定UAV (u0)
     CD3DX12_GPU_DESCRIPTOR_HANDLE gpuUavHandle(
         m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
         SDF_GEN_OUTPUT_UAV,
         m_scuDescriptorSize
     );
-    m_commandList->SetComputeRootDescriptorTable(1, gpuUavHandle);
+    m_computeCommandList->SetComputeRootDescriptorTable(1, gpuUavHandle);
     
-    // 绑定Constants
+    // 6. 设置常量缓冲区
     SDFGenerationConstants constants;
     constants.BoundsMin = bounds.m_mins;
     constants.Resolution = resolution;
     constants.BoundsMax = bounds.m_maxs;
     constants.NumTriangles = (uint32_t)(indices.size() / 3);
-	
-	m_constantBuffers[k_sdfGenerationConstantsSlot]->AppendData(&constants, sizeof(SDFGenerationConstants), m_currentDrawIndex);
-	D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress = m_constantBuffers[k_sdfGenerationConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-	+ m_constantBuffers[k_sdfGenerationConstantsSlot]->m_offset;
-    m_commandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
+	constants.NumVertices = static_cast<uint32_t>(vertices.size());
+	constants.NumBVHNodes = static_cast<uint32_t>(bvhNodes.size());
+
+	m_computeConstantBuffer->AppendData(&constants, sizeof(SDFGenerationConstants), 0);
+	D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress = 
+		m_computeConstantBuffer->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_computeConstantBuffer->m_offset;
+	m_computeCommandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
+	// m_constantBuffers[k_sdfGenerationConstantsSlot]->AppendData(&constants, sizeof(SDFGenerationConstants), m_currentDrawIndex);
+	// D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress = m_constantBuffers[k_sdfGenerationConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+	// + m_constantBuffers[k_sdfGenerationConstantsSlot]->m_offset;
+ //    m_computeCommandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
     
-    // Dispatch
+    // 7. Dispatch
     int numGroups = (resolution + 7) / 8;
-    m_commandList->Dispatch(numGroups, numGroups, numGroups);
+    m_computeCommandList->Dispatch(numGroups, numGroups, numGroups);
     
     DebuggerPrintf("[DX12] Dispatched SDF generation: %dx%dx%d groups\n", 
                    numGroups, numGroups, numGroups);
     
-    // 7. UAV Barrier
+    // 8. UAV Barrier
     CD3DX12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(sdf->m_sdfTexture3D);
-    m_commandList->ResourceBarrier(1, &uavBarrier);
+    m_computeCommandList->ResourceBarrier(1, &uavBarrier);
     
-    // 8. Transition到SRV
+    // 9. 转换到SRV状态
     auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
         sdf->m_sdfTexture3D,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
-    m_commandList->ResourceBarrier(1, &toSRV);
+    m_computeCommandList->ResourceBarrier(1, &toSRV);
     
-	m_currentFrameTempResources.push_back(vertexBuffer);
-	m_currentFrameTempResources.push_back(indexBuffer);
-	m_currentFrameTempResources.push_back(bvhNodeBuffer);
-	m_currentFrameTempResources.push_back(bvhTriBuffer);
+    // 关键：提交到Async Compute Queue
+    // 10. Close CommandList
+    m_computeCommandList->Close();
+    // 11. 提交到Compute Queue（异步执行，不阻塞！）
+    ID3D12CommandList* computeLists[] = { m_computeCommandList };
+    m_computeQueue->ExecuteCommandLists(1, computeLists);
+    // 12. Signal Fence（不等待完成）
+    m_computeFenceValue++;
+    m_computeQueue->Signal(m_computeFence, m_computeFenceValue);
     
+    DebuggerPrintf("[DX12] SDF generation submitted to Async Compute Queue (fence=%llu)\n", 
+                   m_computeFenceValue);
+    // 注意：这些temp buffers不能立即释放，因为Compute Queue还在使用, createStructuredBuffer时储存到tempBuffers里了
+    // 创建最终的SRV
     if (m_nextSDFDescriptorIndex >= SDF_TEXTURE_SRV_BASE + MAX_SDF_TEXTURE_COUNT)
     {
         DebuggerPrintf("[DX12] SDF descriptor pool exhausted!\n");
         delete sdf;
         return nullptr;
     }
-    
-    sdf->m_srvHeapIndex = m_nextSDFDescriptorIndex++;
-    
+    sdf->m_srvHeapIndex = m_nextSDFDescriptorIndex;
+	m_nextSDFDescriptorIndex ++;
+	sdf->m_sdfTextureIndex = m_nextSDFTextureIndex;
+	m_nextSDFTextureIndex ++;
     CD3DX12_CPU_DESCRIPTOR_HANDLE finalSrvHandle(
         m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
         sdf->m_srvHeapIndex,
         m_scuDescriptorSize
     );
-    
     D3D12_SHADER_RESOURCE_VIEW_DESC finalSrvDesc = {};
     finalSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
     finalSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
     finalSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     finalSrvDesc.Texture3D.MipLevels = 1;
     finalSrvDesc.Texture3D.MostDetailedMip = 0;
-    
     m_device->CreateShaderResourceView(sdf->m_sdfTexture3D, &finalSrvDesc, finalSrvHandle);
-    
     m_loadedSDFs.push_back(sdf);
     DebuggerPrintf("[DX12] SDF registered, SRV index: %d\n", sdf->m_srvHeapIndex);
+    // 立即返回 不等待Compute Queue完成
+    // SDF会在后台异步生成
     return sdf;
 }
 
 ID3D12Resource* DX12Renderer::CreateStructuredBuffer(SDFTexture3D* sdfOwner, const void* data, size_t numElements, size_t elementSize,
-	const wchar_t* debugName)
+                                                     const wchar_t* debugName, ID3D12GraphicsCommandList* commandList)
 {
 	UINT64 bufferSize = numElements * elementSize;
     
@@ -2275,15 +2294,13 @@ ID3D12Resource* DX12Renderer::CreateStructuredBuffer(SDFTexture3D* sdfOwner, con
 	);
     
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Create upload buffer failed");
-    
 	// 3. 上传数据
 	void* mapped = nullptr;
 	uploadBuffer->Map(0, nullptr, &mapped);
 	memcpy(mapped, data, bufferSize);
 	uploadBuffer->Unmap(0, nullptr);
-    
 	// 4. 拷贝到Default heap
-	m_commandList->CopyResource(buffer, uploadBuffer);
+	commandList->CopyResource(buffer, uploadBuffer);
     
 	// 5. Transition到SRV可读
 	auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -2291,10 +2308,10 @@ ID3D12Resource* DX12Renderer::CreateStructuredBuffer(SDFTexture3D* sdfOwner, con
 		D3D12_RESOURCE_STATE_COPY_DEST,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
 	);
-	m_commandList->ResourceBarrier(1, &barrier);
+	commandList->ResourceBarrier(1, &barrier);
 	uploadBuffer->SetName(L"SDFStructureUploadBuffer");
     
-	m_currentFrameTempResources.push_back(uploadBuffer);
+	//m_currentFrameTempResources.push_back(uploadBuffer);
 	if (sdfOwner)
 	{
 		sdfOwner->m_tempBuffers.push_back(uploadBuffer);
@@ -2311,6 +2328,1100 @@ D3D12_GPU_DESCRIPTOR_HANDLE DX12Renderer::GetSRVHandle(uint32_t index)
 		index,
 		m_scuDescriptorSize
 	);
+}
+
+SDFTexture3D* DX12Renderer::CreateSDFTextureFromData(const std::vector<float>& data, int resolution)
+{
+	if (data.empty() || resolution <= 0)
+    {
+        ERROR_RECOVERABLE("CreateSDF3DFromData: invalid parameters");
+        return nullptr;
+    }
+    size_t expectedSize = static_cast<size_t>(resolution) * resolution * resolution;
+    if (data.size() != expectedSize)
+    {
+        ERROR_RECOVERABLE(Stringf("CreateSDF3DFromData: data size mismatch (expected %zu, got %zu)",
+                                  expectedSize, data.size()).c_str());
+        return nullptr;
+    }
+    ID3D12Device* device = m_device;
+    ID3D12GraphicsCommandList* commandList = m_commandList;
+    if (!device || !commandList)
+    {
+        ERROR_RECOVERABLE("CreateSDF3DFromData: invalid D3D12 objects");
+        return nullptr;
+    }
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    texDesc.Width = resolution;
+    texDesc.Height = resolution;
+    texDesc.DepthOrArraySize = (UINT16)resolution;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_HEAP_PROPERTIES defaultHeapProps = {};
+    defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    ID3D12Resource* texture = nullptr;
+    HRESULT hr = device->CreateCommittedResource(
+        &defaultHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&texture)
+    );
+
+    if (FAILED(hr) || !texture)
+    {
+        ERROR_RECOVERABLE("Failed to create 3D texture");
+        return nullptr;
+    }
+
+    UINT64 uploadBufferSize = 0;
+    device->GetCopyableFootprints(&texDesc, 0, 1, 0, nullptr, nullptr, nullptr, &uploadBufferSize);
+
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC uploadBufferDesc = {};
+    uploadBufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadBufferDesc.Width = uploadBufferSize;
+    uploadBufferDesc.Height = 1;
+    uploadBufferDesc.DepthOrArraySize = 1;
+    uploadBufferDesc.MipLevels = 1;
+    uploadBufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uploadBufferDesc.SampleDesc.Count = 1;
+    uploadBufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* uploadBuffer = nullptr;
+    hr = device->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadBufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&uploadBuffer)
+    );
+    if (FAILED(hr) || !uploadBuffer)
+    {
+        ERROR_RECOVERABLE("Failed to create upload buffer");
+        texture->Release();
+        return nullptr;
+    }
+
+    void* mappedData = nullptr;
+    hr = uploadBuffer->Map(0, nullptr, &mappedData);
+    if (SUCCEEDED(hr) && mappedData)
+    {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+        UINT numRows = 0;
+        UINT64 rowSizeInBytes = 0;
+        UINT64 totalBytes = 0;
+        device->GetCopyableFootprints(&texDesc, 0, 1, 0, &layout, &numRows, &rowSizeInBytes, &totalBytes);
+
+        uint8_t* dstData = static_cast<uint8_t*>(mappedData);
+        for (int z = 0; z < resolution; z++)
+        {
+            for (int y = 0; y < resolution; y++)
+            {
+                size_t srcOffset = (z * resolution * resolution + y * resolution) * sizeof(float);
+                size_t dstOffset = z * layout.Footprint.Depth * layout.Footprint.RowPitch +
+                                  y * layout.Footprint.RowPitch;
+                
+                memcpy(
+                    dstData + dstOffset,
+                    reinterpret_cast<const uint8_t*>(data.data()) + srcOffset,
+                    resolution * sizeof(float)
+                );
+            }
+        }
+        uploadBuffer->Unmap(0, nullptr);
+    }
+    else
+    {
+        ERROR_RECOVERABLE("Failed to map upload buffer");
+        uploadBuffer->Release();
+        texture->Release();
+        return nullptr;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    device->GetCopyableFootprints(&texDesc, 0, 1, 0, &layout, nullptr, nullptr, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
+    srcLocation.pResource = uploadBuffer;
+    srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLocation.PlacedFootprint = layout;
+
+    D3D12_TEXTURE_COPY_LOCATION dstLocation = {};
+    dstLocation.pResource = texture;
+    dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dstLocation.SubresourceIndex = 0;
+    commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
+	
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+
+    hr = commandList->Close();
+    if (FAILED(hr))
+    {
+        ERROR_RECOVERABLE("Failed to close command list");
+        uploadBuffer->Release();
+        texture->Release();
+        return nullptr;
+    }
+    ID3D12CommandList* cmdLists[] = { commandList };
+    m_commandQueue->ExecuteCommandLists(1, cmdLists);
+
+    WaitForPreviousFrame();
+    uploadBuffer->Release();
+
+    UINT srvIndex = m_nextSDFDescriptorIndex;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = GetCPUDescriptorHandle(m_cbvSrvDescHeap, srvIndex);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srvDesc.Texture3D.MipLevels = 1;
+
+    device->CreateShaderResourceView(texture, &srvDesc, srvHandle);
+
+    SDFTexture3D* sdfTexture = new SDFTexture3D(resolution);
+	sdfTexture->m_srvHeapIndex = m_nextSDFDescriptorIndex;
+	m_nextSDFDescriptorIndex ++;
+	sdfTexture->m_sdfTextureIndex = m_nextSDFTextureIndex;
+	m_nextSDFTextureIndex ++;
+
+    DebuggerPrintf("[DX12Renderer] Created SDF3D from data: resolution=%d, %zu floats\n",
+                   resolution, data.size());
+    return sdfTexture;
+}
+
+std::vector<float> DX12Renderer::ReadbackSDF3DData(const SDFTexture3D* sdf)
+{
+	std::vector<float> result;
+    
+    if (!sdf || !sdf->GetResource())
+    {
+        ERROR_RECOVERABLE("ReadbackSDF3DData: invalid SDF texture");
+        return result;
+    }
+    ID3D12Device* device = m_device;
+    ID3D12GraphicsCommandList* commandList = m_commandList;
+    ID3D12Resource* resource = sdf->GetResource();
+    if (!device || !commandList || !resource)
+    {
+        ERROR_RECOVERABLE("ReadbackSDF3DData: invalid D3D12 objects");
+        return result;
+    }
+    D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    UINT64 totalSize = 0;
+    
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
+    UINT numRows = 0;
+    UINT64 rowSizeInBytes = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &layout, &numRows, &rowSizeInBytes, &totalSize);
+	
+    D3D12_HEAP_PROPERTIES readbackHeapProps = {};
+    readbackHeapProps.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC readbackBufferDesc = {};
+    readbackBufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readbackBufferDesc.Width = totalSize;
+    readbackBufferDesc.Height = 1;
+    readbackBufferDesc.DepthOrArraySize = 1;
+    readbackBufferDesc.MipLevels = 1;
+    readbackBufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    readbackBufferDesc.SampleDesc.Count = 1;
+    readbackBufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* readbackBuffer = nullptr;
+    HRESULT hr = device->CreateCommittedResource(
+        &readbackHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &readbackBufferDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&readbackBuffer)
+    );
+    if (FAILED(hr) || !readbackBuffer)
+    {
+        ERROR_RECOVERABLE("Failed to create readback buffer");
+        return result;
+    }
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    commandList->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
+    srcLocation.pResource = resource;
+    srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    srcLocation.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dstLocation = {};
+    dstLocation.pResource = readbackBuffer;
+    dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dstLocation.PlacedFootprint = layout;
+    commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    commandList->ResourceBarrier(1, &barrier);
+    hr = commandList->Close();
+    if (FAILED(hr))
+    {
+        ERROR_RECOVERABLE("Failed to close command list");
+        readbackBuffer->Release();
+        return result;
+    }
+    ID3D12CommandList* cmdLists[] = { commandList };
+    m_commandQueue->ExecuteCommandLists(1, cmdLists);
+    WaitForPreviousFrame();
+    
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = { 0, totalSize };
+    hr = readbackBuffer->Map(0, &readRange, &mappedData);
+
+    if (SUCCEEDED(hr) && mappedData)
+    {
+        int res = sdf->GetResolution();
+        result.resize(res * res * res);
+
+        const uint8_t* srcData = static_cast<const uint8_t*>(mappedData);
+        for (int z = 0; z < res; z++)
+        {
+            for (int y = 0; y < res; y++)
+            {
+                size_t srcOffset = z * layout.Footprint.Depth * layout.Footprint.RowPitch +
+                                  y * layout.Footprint.RowPitch;
+                size_t dstOffset = (z * res * res + y * res) * sizeof(float);
+                
+                memcpy(
+                    reinterpret_cast<uint8_t*>(result.data()) + dstOffset,
+                    srcData + srcOffset,
+                    res * sizeof(float)
+                );
+            }
+        }
+        readbackBuffer->Unmap(0, nullptr);
+        DebuggerPrintf("[DX12Renderer] Read back %zu floats from SDF3D\n", result.size());
+    }
+    else
+    {
+        ERROR_RECOVERABLE("Failed to map readback buffer");
+    }
+    readbackBuffer->Release();
+
+	HRESULT resetHr = m_commandAllocator[m_frameIndex]->Reset();
+	if (SUCCEEDED(resetHr))
+	{
+		resetHr = m_commandList->Reset(m_commandAllocator[m_frameIndex], m_pipelineStateObject);
+		if (FAILED(resetHr))
+		{
+			ERROR_RECOVERABLE("Failed to reset CommandList after SDF readback");
+		}
+	}
+	else
+	{
+		ERROR_RECOVERABLE("Failed to reset CommandAllocator after SDF readback");
+	}
+	
+    return result;
+}
+
+void DX12Renderer::CreateShadowMapResources()
+{
+	D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = SHADOW_MAP_SIZE;
+    desc.Height = SHADOW_MAP_SIZE;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;  // 同时支持 DSV 和 SRV
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clearValue = {};
+    clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    clearValue.DepthStencil.Depth = 1.0f;
+
+    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
+    
+    HRESULT hr = m_device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        //D3D12_RESOURCE_STATE_DEPTH_WRITE, //最好初始状态是srv
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        &clearValue,
+        IID_PPV_ARGS(&m_shadowMapTexture)
+    );
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create shadow map texture!");
+    m_shadowMapTexture->SetName(L"ShadowMapTexture");
+	//dsv creating
+	D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+	dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+	dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+	dsvDesc.Texture2D.MipSlice = 0;
+	UINT dsvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+	// 第 2 个槽位（索引 1）
+	CD3DX12_CPU_DESCRIPTOR_HANDLE shadowDsvHandle(
+		m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+		1,  // 索引 1（第 2 个）
+		dsvDescriptorSize
+	);
+	m_device->CreateDepthStencilView(m_shadowMapTexture, &dsvDesc, shadowDsvHandle);
+	m_shadowDsvHandle = shadowDsvHandle;
+    // 创建 SRV（用于后续采样）
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
+        m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+        SHADOW_MAP_SRV,
+        m_scuDescriptorSize
+    );
+    m_device->CreateShaderResourceView(m_shadowMapTexture, &srvDesc, srvHandle);
+	//PSO
+	std::string shaderSource;
+    FileReadToString(shaderSource, "Data/Shaders/Shadow.hlsl");
+    ID3DBlob* vs = nullptr;
+    CompileShaderToByteCode(&vs, "ShadowVS", shaderSource.c_str(), "VertexMain", "vs_5_0");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        // 其他属性不需要，但为了兼容VBO，保留完整 layout
+        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "BITANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+    psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
+    psoDesc.pRootSignature = m_graphicsRootSignature;
+    psoDesc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    psoDesc.PS = { nullptr, 0 };  // 无 PS！
+    
+    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    // Use FRONT culling - renders back faces to shadow map
+    // This prevents light leaking through thin geometry (necks, edges)
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
+    // 硬件 depth bias - 比 shader bias 更稳定，不会闪烁
+    psoDesc.RasterizerState.DepthBias = 5000;           // 固定偏移
+    psoDesc.RasterizerState.DepthBiasClamp = 0.005f;    // 最大偏移限制
+    psoDesc.RasterizerState.SlopeScaledDepthBias = 2.0f; // 斜率缩放偏移
+    
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    
+    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+    psoDesc.DepthStencilState.DepthEnable = TRUE;
+    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    
+    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 0;  // 无 RTV！
+    psoDesc.SampleDesc.Count = 1;
+	hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_shadowMapPSO));
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Shadow Map PSO!");
+    
+    m_shadowMapPSO->SetName(L"ShadowMapPSO");
+    vs->Release();
+
+	//TransitionResource(m_shadowMapTexture, D3D12_RESOURCE_STATE_DEPTH_WRITE
+	//	, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
+void DX12Renderer::RenderingShadowMapPass()
+{
+	Vec3 sunDir = m_giSystem->m_scene->m_sunDirection.GetNormalized();
+    AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
+    Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
+    float sceneRadius = sceneBounds.GetBoundsSize().GetLength() * 0.5f;
+
+    if (sceneRadius < 1.0f) sceneRadius = 100.0f;
+
+    Vec3 lightPos = sceneCenter - sunDir * sceneRadius * 2.0f;
+
+    Vec3 forward = (sceneCenter - lightPos).GetNormalized();
+    float yaw = Atan2Degrees(forward.y, forward.x);
+    float pitch = Atan2Degrees(-forward.z, sqrtf(forward.x*forward.x + forward.y*forward.y));
+    EulerAngles orientation(yaw, pitch, 0.0f);
+
+    Mat44 worldToCamera = orientation.GetAsMatrix_IFwd_JLeft_KUp();
+    worldToCamera.SetTranslation3D(lightPos);
+    worldToCamera = worldToCamera.GetOrthonormalInverse();
+
+    Mat44 cameraToRender;
+    cameraToRender.SetIJK3D(Vec3(0.f, 0.f, 1.f), Vec3(-1.f, 0.f, 0.f), Vec3(0.f, 1.f, 0.f));
+
+    Mat44 renderToClip = Mat44::MakeOrthoProjection(
+        -sceneRadius, sceneRadius,
+        -sceneRadius, sceneRadius,
+        0.1f, sceneRadius * 4.0f
+    );
+
+    // ============ Shadow Map Stabilization ============
+    // 把shadow map原点snap到texel网格，防止相机移动时抖动
+    {
+        Mat44 shadowMatrix = renderToClip * cameraToRender * worldToCamera;
+
+        // NDC空间中一个texel的大小（NDC范围是-1到1，总共2.0）
+        float texelSizeNDC = 2.0f / (float)SHADOW_MAP_SIZE;
+
+        // 把原点变换到shadow space (NDC)
+        Vec4 origin = shadowMatrix.TransformHomogeneous3D(Vec4(0.f, 0.f, 0.f, 1.f));
+
+        // 透视除法（对于正交投影w应该是1，但保险起见还是做一下）
+        if (origin.w != 0.f)
+        {
+            origin.x /= origin.w;
+            origin.y /= origin.w;
+        }
+
+        // Snap到texel边界（在NDC空间）
+        float snappedX = floorf(origin.x / texelSizeNDC) * texelSizeNDC;
+        float snappedY = floorf(origin.y / texelSizeNDC) * texelSizeNDC;
+
+        // 计算偏移量（NDC空间）
+        float offsetX = snappedX - origin.x;
+        float offsetY = snappedY - origin.y;
+
+        // 应用偏移到投影矩阵
+        Mat44 snapOffset;
+        snapOffset.SetTranslation3D(Vec3(offsetX, offsetY, 0.f));
+        renderToClip = snapOffset * renderToClip;
+    }
+    // ==================================================
+
+	m_cachedLightWorldToCamera = worldToCamera;
+	m_cachedLightCameraToRender = cameraToRender;
+	m_cachedLightRenderToClip = renderToClip;
+    
+    CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_shadowMapTexture,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE
+    );
+    m_commandList->ResourceBarrier(1, &barrier);
+
+    m_commandList->OMSetRenderTargets(0, nullptr, FALSE, &m_shadowDsvHandle);
+    m_commandList->ClearDepthStencilView(
+        m_shadowDsvHandle, 
+        D3D12_CLEAR_FLAG_DEPTH, 
+        1.0f, 0, 
+        0, nullptr
+    );
+
+    D3D12_VIEWPORT viewport = {};
+    viewport.TopLeftX = 0;
+    viewport.TopLeftY = 0;
+    viewport.Width = (float)SHADOW_MAP_SIZE;
+    viewport.Height = (float)SHADOW_MAP_SIZE;
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    D3D12_RECT scissor = {};
+    scissor.left = 0;
+    scissor.top = 0;
+    scissor.right = (LONG)SHADOW_MAP_SIZE;
+    scissor.bottom = (LONG)SHADOW_MAP_SIZE;
+    m_commandList->RSSetViewports(1, &viewport);
+    m_commandList->RSSetScissorRects(1, &scissor);
+
+    m_commandList->SetPipelineState(m_shadowMapPSO);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    ShadowConstants shadowConsts = {};
+	shadowConsts.LightWorldToCamera = worldToCamera;   
+	shadowConsts.LightCameraToRender = cameraToRender;
+	shadowConsts.LightRenderToClip = renderToClip;
+    shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
+    shadowConsts.ShadowBias = 0.05f;  // Increased from 0.002
+	shadowConsts.SoftnessFactor = 1.0f;
+    shadowConsts.LightSize = 3.f;
+    m_constantBuffers[k_shadowConstantsSlot]->AppendData(&shadowConsts, sizeof(ShadowConstants), 0);
+    BindConstantBuffer(k_shadowConstantsSlot, m_constantBuffers[k_shadowConstantsSlot]);
+
+    const std::vector<MeshObject*>& allObjects = m_giSystem->m_scene->m_meshObjects;
+    for (MeshObject* meshObj : allObjects)
+    {
+        if (!meshObj) continue;
+    	ModelConstants modelConstants;
+    	modelConstants.ModelToWorldTransform = meshObj->m_cachedWorldMatrix;
+    	meshObj->m_color.GetAsFloats(modelConstants.ModelColor);
+    	m_constantBuffers[k_modelConstantsSlot]->AppendData(&modelConstants, sizeof(ModelConstants), m_currentDrawIndex); 
+    	BindConstantBuffer(k_modelConstantsSlot, m_constantBuffers[k_modelConstantsSlot]); //改 TODO
+        
+        StaticMesh* mesh = meshObj->GetMesh();
+    	BindVertexBuffer(mesh->m_vertexBuffer);
+    	BindIndexBuffer(mesh->m_indexBuffer);
+        m_commandList->DrawIndexedInstanced((UINT)mesh->m_indices.size(), 1, 0, 0, 0);
+        m_currentDrawIndex++;
+    }
+    // 3.8 转换回 SRV 状态供后续采样
+    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_shadowMapTexture,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    );
+    m_commandList->ResourceBarrier(1, &barrier);
+}
+
+void DX12Renderer::ShutdownShadowMapPass()
+{
+	DX_SAFE_RELEASE(m_shadowMapTexture)
+	DX_SAFE_RELEASE(m_shadowMapPSO)
+}
+
+void DX12Renderer::CreateGlobalSDFPassResources()
+{
+	const D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart();
+	const UINT inc = m_scuDescriptorSize;
+	//CreateGlobalSDFTexture
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+	texDesc.Width = GLOBAL_SDF_RESOLUTION;
+	texDesc.Height = GLOBAL_SDF_RESOLUTION;
+	texDesc.DepthOrArraySize = GLOBAL_SDF_RESOLUTION;
+	texDesc.MipLevels = 1;
+	texDesc.Format = DXGI_FORMAT_R32G32_FLOAT;  // R = 距离, G = 实例索引
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	D3D12_HEAP_PROPERTIES defaultHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	HRESULT hr = m_device->CreateCommittedResource(
+		&defaultHeapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(&m_globalSDFTexture)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "[VoxelScene] Failed to create Global SDF texture!");
+	m_globalSDFTexture->SetName(L"VoxelScene_GlobalSDF");
+	
+	// CreateVoxelVisibilityBuffer: 6 方向 × 每个 Voxel
+	uint32_t totalVoxels = GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION;
+	//uint32_t bufferSize = sizeof(VoxelVisibilityGPU) * totalVoxels * 3;
+	uint32_t bufferSize = sizeof(uint32_t) * totalVoxels * 3; //Typed buffer
+	//D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+		bufferSize,
+		D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+	);
+	hr = m_device->CreateCommittedResource(
+		&defaultHeapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&bufferDesc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(&m_voxelVisibilityBuffer)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "[VoxelScene] Failed to create Voxel Visibility buffer!");
+	m_voxelVisibilityBuffer->SetName(L"VoxelScene_VoxelVisibility");
+	
+	//CreateVoxelLightingTexture
+	D3D12_RESOURCE_DESC voxelLightingTexDesc = {};
+	voxelLightingTexDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+	voxelLightingTexDesc.Width = GLOBAL_SDF_RESOLUTION;
+	voxelLightingTexDesc.Height = GLOBAL_SDF_RESOLUTION;
+	voxelLightingTexDesc.DepthOrArraySize = GLOBAL_SDF_RESOLUTION;
+	voxelLightingTexDesc.MipLevels = 1;
+	voxelLightingTexDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	voxelLightingTexDesc.SampleDesc.Count = 1;
+	voxelLightingTexDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	//heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	hr = m_device->CreateCommittedResource(
+		&defaultHeapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&voxelLightingTexDesc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(&m_voxelLightingTexture)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "[VoxelScene] Failed to create Voxel Lighting texture!");
+	m_voxelLightingTexture->SetName(L"VoxelScene_VoxelLighting");
+
+	//CreateInstanceInfoBuffer
+	uint32_t meshSDFBufferSize = sizeof(MeshSDFInfoGPU) * MAX_INSTANCES;
+	D3D12_RESOURCE_DESC meshSDFBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(meshSDFBufferSize);
+	hr = m_device->CreateCommittedResource(
+		&defaultHeapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&meshSDFBufferDesc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(&m_instanceInfoBuffer)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "[VoxelScene] Failed to create Instance Info buffer!");
+	m_instanceInfoBuffer->SetName(L"VoxelScene_InstanceInfo");
+    
+	// Upload Buffer
+	D3D12_HEAP_PROPERTIES uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+	hr = m_device->CreateCommittedResource(
+		&uploadHeapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&meshSDFBufferDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_instanceInfoUploadBuffer)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "[VoxelScene] Failed to create Instance Info upload buffer!");
+	m_instanceInfoUploadBuffer->SetName(L"VoxelScene_InstanceInfoUpload");
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC globalSDFUavDesc = {};
+    globalSDFUavDesc.Format = DXGI_FORMAT_R32G32_FLOAT;  // float2
+    globalSDFUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    globalSDFUavDesc.Texture3D.MipSlice = 0;
+    globalSDFUavDesc.Texture3D.FirstWSlice = 0;
+    globalSDFUavDesc.Texture3D.WSize = GLOBAL_SDF_RESOLUTION;
+    
+    m_device->CreateUnorderedAccessView(
+        m_globalSDFTexture,
+        nullptr,
+        &globalSDFUavDesc,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, GLOBAL_SDF_UAV, inc));
+    
+    D3D12_UNORDERED_ACCESS_VIEW_DESC lightingUavDesc = {};
+    lightingUavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;  // float4
+    lightingUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    lightingUavDesc.Texture3D.MipSlice = 0;
+    lightingUavDesc.Texture3D.FirstWSlice = 0;
+    lightingUavDesc.Texture3D.WSize = GLOBAL_SDF_RESOLUTION; 
+    m_device->CreateUnorderedAccessView(
+        m_voxelLightingTexture,
+        nullptr,
+        &lightingUavDesc,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, VOXEL_LIGHTING_UAV, inc));
+	
+	D3D12_UNORDERED_ACCESS_VIEW_DESC visibilityUavDesc = {};
+	visibilityUavDesc.Format = DXGI_FORMAT_R32_UINT;
+	visibilityUavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+	visibilityUavDesc.Buffer.FirstElement = 0;
+	visibilityUavDesc.Buffer.NumElements = 
+		GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION * 3;
+	//visibilityUavDesc.Buffer.StructureByteStride = sizeof(VoxelVisibilityGPU);
+	visibilityUavDesc.Buffer.StructureByteStride = 0;  // ← Typed buffer无stride
+	visibilityUavDesc.Buffer.CounterOffsetInBytes = 0;
+	visibilityUavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+	m_device->CreateUnorderedAccessView(
+		m_voxelVisibilityBuffer,
+		nullptr,
+		&visibilityUavDesc,
+		CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, VISIBILITY_UAV, inc));
+    
+    // SRV Desc
+    D3D12_SHADER_RESOURCE_VIEW_DESC globalSDFSrvDesc = {};
+    globalSDFSrvDesc.Format = DXGI_FORMAT_R32G32_FLOAT;
+    globalSDFSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    globalSDFSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    globalSDFSrvDesc.Texture3D.MipLevels = 1;
+    globalSDFSrvDesc.Texture3D.MostDetailedMip = 0;
+    m_device->CreateShaderResourceView(
+        m_globalSDFTexture,
+        &globalSDFSrvDesc,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, GLOBAL_SDF_SRV, inc));
+	
+	D3D12_SHADER_RESOURCE_VIEW_DESC voxelLightingSrvDesc = {};
+	voxelLightingSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;  
+	voxelLightingSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+	voxelLightingSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	voxelLightingSrvDesc.Texture3D.MipLevels = 1;
+	voxelLightingSrvDesc.Texture3D.MostDetailedMip = 0;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE voxelLightingSrvHandle = cpuStart;
+	voxelLightingSrvHandle.ptr += VOXEL_LIGHTING_SRV * m_scuDescriptorSize;
+
+	m_device->CreateShaderResourceView(
+		m_voxelLightingTexture,  // 你的 VoxelLighting 资源
+		&voxelLightingSrvDesc,
+		voxelLightingSrvHandle
+	);
+    D3D12_SHADER_RESOURCE_VIEW_DESC visibilitySrvDesc = {};
+    visibilitySrvDesc.Format = DXGI_FORMAT_R32_UINT;
+    visibilitySrvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    visibilitySrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    visibilitySrvDesc.Buffer.FirstElement = 0;
+    visibilitySrvDesc.Buffer.NumElements =
+        GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION * GLOBAL_SDF_RESOLUTION * 3;
+    visibilitySrvDesc.Buffer.StructureByteStride = 0;
+    m_device->CreateShaderResourceView(
+        m_voxelVisibilityBuffer,
+        &visibilitySrvDesc,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, VISIBILITY_SRV, inc));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC atlasSrvDesc = {};
+	atlasSrvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	atlasSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;  // 改这里！
+	atlasSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	atlasSrvDesc.Texture2DArray.MipLevels = 1;
+	atlasSrvDesc.Texture2DArray.MostDetailedMip = 0;
+	atlasSrvDesc.Texture2DArray.FirstArraySlice = 0;
+	atlasSrvDesc.Texture2DArray.ArraySize = SURFACE_CACHE_LAYER_COUNT; 
+	atlasSrvDesc.Texture2DArray.PlaneSlice = 0;
+    m_device->CreateShaderResourceView(
+        m_surfaceCache.m_atlasTexture,
+        &atlasSrvDesc,
+        CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, SURFACE_ATLAS_SRV, inc));
+	D3D12_SHADER_RESOURCE_VIEW_DESC instanceInfoSrvDesc = {};
+	instanceInfoSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
+	instanceInfoSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	instanceInfoSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	instanceInfoSrvDesc.Buffer.FirstElement = 0;
+	instanceInfoSrvDesc.Buffer.NumElements = MAX_INSTANCES;
+	instanceInfoSrvDesc.Buffer.StructureByteStride = sizeof(MeshSDFInfoGPU);
+	m_device->CreateShaderResourceView(
+		m_instanceInfoBuffer,
+		&instanceInfoSrvDesc,
+		CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, INSTANCE_INFO_SRV, inc));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC cardMetaSrvDesc = {};
+	cardMetaSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
+	cardMetaSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+	cardMetaSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	cardMetaSrvDesc.Buffer.FirstElement = 0;
+	cardMetaSrvDesc.Buffer.NumElements = 64*64;  // TODO：其实应该从cache获取
+	cardMetaSrvDesc.Buffer.StructureByteStride = sizeof(SurfaceCardMetadata);
+	m_device->CreateShaderResourceView(
+		m_surfaceCache.m_cardMetadataBuffer,
+		&cardMetaSrvDesc,
+		CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, CARD_METADATA_SRV, inc));
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC nullSrvDesc = {};
+	nullSrvDesc.Format = DXGI_FORMAT_R8_UNORM;
+	nullSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+	nullSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	nullSrvDesc.Texture3D.MipLevels = 1;
+	for (UINT i = 0; i < MAX_SDF_TEXTURE_COUNT; ++i)
+	{
+		m_device->CreateShaderResourceView(nullptr, &nullSrvDesc, 
+			CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, (UINT)SDF_TEXTURE_SRV_BASE + i, inc));
+	}
+	
+	CD3DX12_ROOT_PARAMETER1 rootParams[5]; 
+    CD3DX12_DESCRIPTOR_RANGE1 ranges[6];
+    // [0] Constants (b0)
+    rootParams[0].InitAsConstants(sizeof(VoxelSceneConstants)/4, 0, 0, D3D12_SHADER_VISIBILITY_ALL);
+    // [1] UAV Table (u0-u2): GlobalSDF, VoxelLighting, Visibility
+    ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0,
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0);
+    rootParams[1].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
+    // [2] SRV Table (t0-t3, space0): InstanceInfo, SurfaceAtlas, CardMetadata, Visibility
+    //     ↑ 移除GlobalSDF，从t1开始！
+    ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0,  // t1: InstanceInfo
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0);
+    ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2, 0,  // t2: SurfaceAtlas
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 1);
+    ranges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0,  // t3: CardMetadata
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 2);
+    ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4, 0,  // t4: Visibility
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 3);
+    rootParams[2].InitAsDescriptorTable(4, &ranges[1], D3D12_SHADER_VISIBILITY_ALL);
+    // [3] GlobalSDF SRV (t0, space0) - 单独的Table，只在Pass 2/3用
+    ranges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0,  // t0
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0);
+    rootParams[3].InitAsDescriptorTable(1, &ranges[5], D3D12_SHADER_VISIBILITY_ALL);
+    // [4] Bindless SDF Textures (t0, space1)
+    CD3DX12_DESCRIPTOR_RANGE1 bindlessRange;
+    bindlessRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, MAX_SDF_TEXTURE_COUNT, 0, 1,
+        D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0);
+    rootParams[4].InitAsDescriptorTable(1, &bindlessRange, D3D12_SHADER_VISIBILITY_ALL);
+    
+	// Static Sampler
+	CD3DX12_STATIC_SAMPLER_DESC staticSamplers[1];
+	staticSamplers[0].Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+		D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+	CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc;
+	rootSigDesc.Init_1_1(_countof(rootParams), rootParams, 1, staticSamplers,
+		D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+	ID3DBlob* serialized = nullptr;
+    ID3DBlob* error = nullptr;
+    hr = D3D12SerializeVersionedRootSignature(&rootSigDesc, &serialized, &error);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            DebuggerPrintf("[VoxelScene] Root signature serialization error: %s\n",
+                          (char*)error->GetBufferPointer());
+            error->Release();
+        }
+        ERROR_AND_DIE("Failed to serialize VoxelScene root signature!");
+		}
+		hr = m_device->CreateRootSignature(
+        0,
+        serialized->GetBufferPointer(),
+        serialized->GetBufferSize(),
+        IID_PPV_ARGS(&m_globalSDFRootSignature)
+    );
+    serialized->Release();
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create VoxelScene root signature!");
+    m_globalSDFRootSignature->SetName(L"VoxelScene_RootSignature");
+	//Create PSOs
+    {
+		std::string buildGlobalSDFSource;
+		int result = FileReadToString(buildGlobalSDFSource,"Data/Shaders/BuildGlobalSDF.hlsl" );
+		if (result < 0)
+		{
+			DebuggerPrintf("[VoxelScene] Failed to load BuildGlobalSDF.hlsl\n");
+		}
+		ID3DBlob* csBlob = nullptr;
+		bool success = CompileShaderToByteCode(&csBlob, "BuildGlobalSDF", buildGlobalSDFSource.c_str(),
+			"CSMain", "cs_5_1");
+		if (!success || !csBlob)
+			DebuggerPrintf("[DX12Renderer] Failed to compile BuildGlobalSDF.hlsl\n");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_globalSDFRootSignature;
+        psoDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
+        psoDesc.CS.BytecodeLength = csBlob->GetBufferSize();
+        
+        hr = m_device->CreateComputePipelineState(
+            &psoDesc,
+            IID_PPV_ARGS(&m_buildGlobalSDFPSO)
+        );
+        csBlob->Release();
+        GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create BuildGlobalSDF PSO!");
+        m_buildGlobalSDFPSO->SetName(L"VoxelScene_BuildGlobalSDF_PSO");
+    }
+    {
+		std::string buildVoxelVisibilitySource;
+		int result = FileReadToString(buildVoxelVisibilitySource,"Data/Shaders/BuildVoxelVisibility.hlsl" );
+		if (result < 0)
+		{
+			DebuggerPrintf("[VoxelScene] Failed to load BuildVoxelVisibility.hlsl\n");
+		}
+		ID3DBlob* csBlob = nullptr;
+		bool success = CompileShaderToByteCode(&csBlob, "BuildVoxelVisibility", buildVoxelVisibilitySource.c_str(),
+			"CSMain", "cs_5_1");
+		if (!success || !csBlob)
+			DebuggerPrintf("[DX12Renderer] Failed to compile BuildVoxelVisibility.hlsl\n");
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_globalSDFRootSignature;
+        psoDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
+        psoDesc.CS.BytecodeLength = csBlob->GetBufferSize();
+		
+		hr = m_device->CreateComputePipelineState(
+            &psoDesc,
+            IID_PPV_ARGS(&m_buildVisibilityPSO)
+        );
+        csBlob->Release();
+        GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create BuildVisibility PSO!");
+        m_buildVisibilityPSO->SetName(L"VoxelScene_BuildVisibility_PSO");
+    }
+    {
+		std::string injectLightingSource;
+		int result = FileReadToString(injectLightingSource,"Data/Shaders/InjectVoxelLighting.hlsl" );
+		if (result < 0)
+		{
+			DebuggerPrintf("[VoxelScene] Failed to load InjectVoxelLighting.hlsl\n");
+		}
+        ID3DBlob* csBlob = nullptr;
+		bool success = CompileShaderToByteCode(&csBlob, "InjectVoxelLighting", injectLightingSource.c_str(),
+			"CSMain", "cs_5_1");
+		if (!success || !csBlob)
+			DebuggerPrintf("[DX12Renderer] Failed to compile InjectVoxelLighting.hlsl\n");
+		
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_globalSDFRootSignature;
+        psoDesc.CS.pShaderBytecode = csBlob->GetBufferPointer();
+        psoDesc.CS.BytecodeLength = csBlob->GetBufferSize();
+        hr = m_device->CreateComputePipelineState(
+            &psoDesc,
+            IID_PPV_ARGS(&m_injectLightingPSO)
+        );
+        csBlob->Release();
+        GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create InjectLighting PSO!");
+        m_injectLightingPSO->SetName(L"VoxelScene_InjectLighting_PSO");
+    }
+    DebuggerPrintf("[VoxelScene] All PSOs created\n");
+}
+
+void DX12Renderer::RenderingGlobalSDFPass()
+{
+	VoxelSceneConstants constants;
+	constants.SceneBoundsMax = m_giSystem->m_scene->m_sceneBounds.m_maxs;
+	constants.SceneBoundsMin = m_giSystem->m_scene->m_sceneBounds.m_mins;
+	constants.VoxelResolution = GLOBAL_SDF_RESOLUTION;
+	Vec3 sceneSize = m_giSystem->m_scene->m_sceneBounds.GetBoundsSize();
+	constants.VoxelSize.x = sceneSize.x / (float)GLOBAL_SDF_RESOLUTION;
+	constants.VoxelSize.y = sceneSize.y / (float)GLOBAL_SDF_RESOLUTION;
+	constants.VoxelSize.z = sceneSize.z / (float)GLOBAL_SDF_RESOLUTION;
+	constants.MaxTraceSteps = 64;
+	constants.InstanceCount = (uint32_t)m_giSystem->m_scene->m_meshObjects.size();
+	constants.SDFThreshold = constants.VoxelSize.x * 0.5f;
+	constants.CardCount = m_giSystem->m_scene->m_nextCardID;
+	constants.MaxTraceDistance = sceneSize.GetLength();
+	constants.AtlasWidth = (float)m_giSystem->m_config.m_primaryAtlasSize;
+	constants.AtlasHeight = (float)m_giSystem->m_config.m_primaryAtlasSize;
+	
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuStart = m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart();
+	UINT inc = m_scuDescriptorSize;
+	constexpr uint32_t NUMTHREADS = 8;
+	uint32_t groups = (constants.VoxelResolution + NUMTHREADS - 1) / NUMTHREADS;
+
+	m_commandList->SetDescriptorHeaps(1, &m_cbvSrvDescHeap);
+	m_commandList->SetComputeRootSignature(m_globalSDFRootSignature);
+	
+	if (m_giSystem->m_scene->m_needsRebuildGlobalLighting)
+	{
+		WaitForComputeQueue(); //确认一开始注册的meshSDF都生成了
+		DebuggerPrintf("[GlobalSDF] All mesh SDFs ready\n");
+		//UploadInstanceInfos(gpu)
+		std::vector<MeshSDFInfoGPU> meshInfos = m_giSystem->m_scene->m_meshInfos;
+		void* mappedData = nullptr;
+		HRESULT hr = m_instanceInfoUploadBuffer->Map(0, nullptr, &mappedData);
+		if (SUCCEEDED(hr))
+		{
+			memcpy(mappedData, meshInfos.data(), sizeof(MeshSDFInfoGPU) * meshInfos.size());
+			m_instanceInfoUploadBuffer->Unmap(0, nullptr);
+		}
+		TransitionResource(m_instanceInfoBuffer,D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+		m_commandList->CopyBufferRegion(
+		   m_instanceInfoBuffer, 0,
+		   m_instanceInfoUploadBuffer, 0,
+		   sizeof(MeshSDFInfoGPU) * meshInfos.size()
+		);
+		TransitionResource(m_instanceInfoBuffer,D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		DebuggerPrintf("[GlobalSDF] Uploaded %zu instance infos\n", meshInfos.size());
+	
+    	TransitionResource(m_globalSDFTexture, 
+    	    D3D12_RESOURCE_STATE_COMMON, 
+    	    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    	TransitionResource(m_voxelLightingTexture,
+    	    D3D12_RESOURCE_STATE_COMMON,
+    	    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    	TransitionResource(m_voxelVisibilityBuffer,
+    	    D3D12_RESOURCE_STATE_COMMON,
+    	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    	TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
+    	    D3D12_RESOURCE_STATE_COMMON,
+    	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    	TransitionResource(m_surfaceCache.m_atlasTexture,
+			//D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    	
+    	// Pass 1: BuildGlobalSDF
+    	m_commandList->SetPipelineState(m_buildGlobalSDFPSO);
+    	m_commandList->SetComputeRoot32BitConstants(0, sizeof(VoxelSceneConstants)/4, &constants, 0);
+    	// [1] UAV Table
+    	m_commandList->SetComputeRootDescriptorTable(1,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, GLOBAL_SDF_UAV, inc));
+    	// [2] SRV Table (不包含GlobalSDF，只有InstanceInfo等)
+    	m_commandList->SetComputeRootDescriptorTable(2,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, INSTANCE_INFO_SRV, inc));  // 从385开始
+    	// [3] GlobalSDF SRV Table - Pass 1不用，不绑定或绑定到null
+    	// 可以不调用SetComputeRootDescriptorTable(3, ...)
+    	// [4] Bindless
+    	m_commandList->SetComputeRootDescriptorTable(4,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, SDF_TEXTURE_SRV_BASE, inc));
+    	m_commandList->Dispatch(groups, groups, groups);
+    	
+    	// Pass 2: BuildVoxelVisibility
+    	TransitionResource(m_globalSDFTexture,
+    	    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    	TransitionResource(m_voxelVisibilityBuffer,
+    	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    	    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    	m_commandList->SetPipelineState(m_buildVisibilityPSO);
+    	m_commandList->SetComputeRoot32BitConstants(0, (UINT)sizeof(VoxelSceneConstants)/4, &constants, 0);
+    	// [1] UAV Table
+    	m_commandList->SetComputeRootDescriptorTable(1,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, VISIBILITY_UAV, inc));
+    	// [2] SRV Table
+    	m_commandList->SetComputeRootDescriptorTable(2,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, INSTANCE_INFO_SRV, inc));
+    	// [3] GlobalSDF SRV Table 
+    	m_commandList->SetComputeRootDescriptorTable(3,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, GLOBAL_SDF_SRV, inc));  // 382
+    	// [4] Bindless
+    	m_commandList->SetComputeRootDescriptorTable(4,
+    	    CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, SDF_TEXTURE_SRV_BASE, inc));
+    	m_commandList->Dispatch(groups, groups, groups);
+
+		//turn back
+		TransitionResource(m_voxelVisibilityBuffer,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		D3D12_RESOURCE_STATE_COMMON);
+		TransitionResource(m_globalSDFTexture, 
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 
+			D3D12_RESOURCE_STATE_COMMON);
+		TransitionResource(m_surfaceCache.m_atlasTexture,
+			//D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+			);
+		TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_COMMON);
+		TransitionResource(m_voxelLightingTexture,
+	D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  
+	D3D12_RESOURCE_STATE_COMMON);
+
+		m_giSystem->m_scene->m_needsRebuildGlobalLighting = false;
+		DebuggerPrintf("[GlobalSDF] Global SDF pass completed {including Phase 1&2&3}.\n");
+	}
+    // Pass 3: InjectVoxelLighting
+    TransitionResource(m_voxelVisibilityBuffer,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	TransitionResource(m_voxelLightingTexture,
+	D3D12_RESOURCE_STATE_COMMON,
+	D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+	TransitionResource(m_globalSDFTexture,
+		D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
+		D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	TransitionResource(m_surfaceCache.m_atlasTexture,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);  //TODO: srv和nonsrv是一个状态，似乎不会冲突
+    m_commandList->SetPipelineState(m_injectLightingPSO);
+    m_commandList->SetComputeRoot32BitConstants(0, sizeof(VoxelSceneConstants)/4, &constants, 0);
+    // [1] UAV Table
+    m_commandList->SetComputeRootDescriptorTable(1,
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, GLOBAL_SDF_UAV, inc));
+    // [2] SRV Table
+    m_commandList->SetComputeRootDescriptorTable(2,
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, INSTANCE_INFO_SRV, inc));
+    // [3] GlobalSDF SRV Table
+    m_commandList->SetComputeRootDescriptorTable(3,
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, GLOBAL_SDF_SRV, inc));
+    // [4] Bindless
+    m_commandList->SetComputeRootDescriptorTable(4,
+        CD3DX12_GPU_DESCRIPTOR_HANDLE(gpuStart, SDF_TEXTURE_SRV_BASE, inc));
+    m_commandList->Dispatch(groups, groups, groups);
+    
+    TransitionResource(m_voxelLightingTexture,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COMMON);
+    TransitionResource(m_globalSDFTexture,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COMMON);
+    TransitionResource(m_voxelVisibilityBuffer,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COMMON);
+    TransitionResource(m_surfaceCache.m_atlasTexture,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COMMON);
+    TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_COMMON);
 }
 
 void DX12Renderer::CreateGraphicsRootSignature()
@@ -2341,15 +3452,15 @@ void DX12Renderer::CreateGraphicsRootSignature()
 		// [16] = Surface Cache SRVs
 		static CD3DX12_DESCRIPTOR_RANGE surfaceCacheSRVs;
 		surfaceCacheSRVs.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-		                      SURFACE_CACHE_BUFFER_COUNT * (DESCRIPTORS_PER_SURFACE_BUFFER/2), SURFACE_CACHE_SRV, 0);
+		                        (DESCRIPTORS_PER_SURFACE_BUFFER/2), SURFACE_CACHE_SRV, 0);
 		rootParameters[16].InitAsDescriptorTable(1, &surfaceCacheSRVs, D3D12_SHADER_VISIBILITY_ALL);
 
 		// [17] = Surface Cache UAVs (u0 + u1)
 		static CD3DX12_DESCRIPTOR_RANGE surfaceCacheUAVs;
 		surfaceCacheUAVs.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-		                      SURFACE_CACHE_BUFFER_COUNT * (DESCRIPTORS_PER_SURFACE_BUFFER/2), 0, 0);  // u0, u1
+		                       (DESCRIPTORS_PER_SURFACE_BUFFER/2), 0, 0);  // u0, u1
 		rootParameters[17].InitAsDescriptorTable(1, &surfaceCacheUAVs, D3D12_SHADER_VISIBILITY_ALL);
-		// u0, u1, u2, u3, u4, u5（如果包含 Buffer 1 的 UAVs） 那就是6
+		// u0, u1, u2, u3, u4, u5（如果包含 Buffer 1 的 UAVs） 那就是6 ->应该是不可能包含的
 		
 		// [18-19] = Radiance Cache 
 		rootParameters[18].InitAsShaderResourceView(RADIANCE_CACHE_SRV, 0); 
@@ -2362,15 +3473,23 @@ void DX12Renderer::CreateGraphicsRootSignature()
 		rootParameters[23].InitAsConstantBufferView(17, 0);  // b17 - SSR settings TODO:改
 		//[24-25] = Temporal
 		rootParameters[24].InitAsShaderResourceView(TEMPORAL_PREV_SRV_INDEX, 0); 
-		rootParameters[25].InitAsShaderResourceView(TEMPORAL_MOTION_SRV_INDEX, 0); 
-		// // [26-31] = reserved
-		for (UINT i = 26; i < 32; ++i)
+		rootParameters[25].InitAsShaderResourceView(TEMPORAL_MOTION_SRV_INDEX, 0);
+		//[26]
+		CD3DX12_DESCRIPTOR_RANGE shadowMapRange;
+		shadowMapRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, SHADOW_MAP_SRV_INDEX, 0);  // t240
+		rootParameters[26].InitAsDescriptorTable(1, &shadowMapRange, D3D12_SHADER_VISIBILITY_PIXEL);
+ 
+		//[27] Screen Indirect Lighting SRV
+		static CD3DX12_DESCRIPTOR_RANGE screenIndirectRange;
+		screenIndirectRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, SCREEN_INDIRECT_LIGHTING_SRV_REGISTER, 0);  // t241
+		rootParameters[27].InitAsDescriptorTable(1, &screenIndirectRange, D3D12_SHADER_VISIBILITY_PIXEL);
+		// [28-31] = reserved
+		for (UINT i = 28; i < 32; ++i)
 		{
-			rootParameters[i].InitAsConstantBufferView(18 + (i-26), 0);
+			rootParameters[i].InitAsConstantBufferView(18 + (i-27), 0);
 		}
         
-		D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
-    
+		D3D12_STATIC_SAMPLER_DESC samplers[3] = {};
 		// Sampler 0: Point Sampler (s0) - 用于 GBuffer、精确采样
 		samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
 		samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;  // 改为 CLAMP，避免边界问题
@@ -2400,12 +3519,27 @@ void DX12Renderer::CreateGraphicsRootSignature()
 		samplers[1].ShaderRegister = 1;  
 		samplers[1].RegisterSpace = 0;
 		samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+		// Sampler 2: Shadow Comparison Sampler (s2) - 用于PCF阴影
+		samplers[2].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+		samplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+		samplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+		samplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+		samplers[2].MipLODBias = 0;
+		samplers[2].MaxAnisotropy = 1;
+		samplers[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+		samplers[2].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;  // 边界外=无阴影
+		samplers[2].MinLOD = 0.0f;
+		samplers[2].MaxLOD = D3D12_FLOAT32_MAX;
+		samplers[2].ShaderRegister = 2;  // s2
+		samplers[2].RegisterSpace = 0;
+		samplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     
 		CD3DX12_ROOT_SIGNATURE_DESC rsigDesc = {};
 		rsigDesc.Init(
 			_countof(rootParameters),
 			rootParameters,
-			2,  // 2 samplers
+			3,  // 3 samplers
 			samplers, 
 			rootSignatureFlags
 		);
@@ -2432,27 +3566,27 @@ void DX12Renderer::CreateGraphicsRootSignature()
 	}
 }
 
-void DX12Renderer::CreateComputeRootSignature()
+void DX12Renderer::CreateComputeRootSignature() //暂时也没在用了
 {
     static CD3DX12_DESCRIPTOR_RANGE descriptorRanges[11];
 
     // [0] GBuffer SRVs (t0-t4)
     descriptorRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, GBUFFER_COUNT + DEPTH_SRV_COUNT, 0, 0); // t0-t4
 
-    // [1] Surface Cache Atlas UAV (u0-u1) - PRIMARY + GI
-    descriptorRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, SURFACE_CACHE_TYPE_COUNT, 0, 0); // u0-u1
+    // [1] Surface Cache Atlas UAV (u0-u1) - PRIMARY + GI ->u0, primary
+    descriptorRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0); // u0-u1->改为只有一种
 
-    // [2] Surface Cache Metadata UAV (u2-u3)
-    descriptorRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, SURFACE_CACHE_TYPE_COUNT, SURFACE_CACHE_TYPE_COUNT, 0); // u2-u3
+    // [2] Surface Cache Metadata UAV (u2-u3) ->u1, primary
+    descriptorRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0); // u2-u3->改为只有一种
 
-    // [3] Radiance Cache Probe UAV (u4)
-    descriptorRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, SURFACE_CACHE_TYPE_COUNT * 2, 0); // u4
+    // [3] Radiance Cache Probe UAV (u4) ->(u2-u3) 
+    descriptorRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1 * 2, 0); 
 
     // [4] Additional UAVs (u5-u6) - 预留
-    descriptorRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, SURFACE_CACHE_TYPE_COUNT * 2 + 1, 0); // u5-u6
+    descriptorRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 1 * 2 + 1, 0);
 
-    // [5] Previous Surface Cache Atlas SRV (t5)
-    descriptorRanges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, PREVIOUS_SURFACE_CACHE_RESOURCE_COUNT,
+    // [5] Previous Surface Cache Atlas SRV (t5) 预留->TODO:应该是没用了
+    descriptorRanges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
         GBUFFER_COUNT + DEPTH_SRV_COUNT, 0); // t5
 
     // [6] Card Metadata SRV (t6)
@@ -2464,7 +3598,7 @@ void DX12Renderer::CreateComputeRootSignature()
 
     // [8] Surface Cache Atlas SRV for Radiance Cache (t8-t9)
     // 这是给 Radiance Cache Update 读取 Surface Cache 用的
-    descriptorRanges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, SURFACE_CACHE_TYPE_COUNT, 8, 0); 
+    descriptorRanges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8, 0); 
 
     // [9] Radiance Cache Probe SRV (Previous frame, t7)
     descriptorRanges[9].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7, 0);
@@ -2519,7 +3653,7 @@ void DX12Renderer::CreateComputeRootSignature()
     // [14] = Surface Cache Metadata SRV for Radiance Cache (t202-t203)
     // 用于 Radiance Cache Update 读取 Card Metadata
     static CD3DX12_DESCRIPTOR_RANGE surfCacheMetaSrvRange;
-    surfCacheMetaSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, SURFACE_CACHE_TYPE_COUNT, 202, 0); // t202-t203
+    surfCacheMetaSrvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 202, 0); // t202-t203 TODO:显然不对
     computeRootParameters[14].InitAsDescriptorTable(1, &surfCacheMetaSrvRange, D3D12_SHADER_VISIBILITY_ALL);
 
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
@@ -2597,34 +3731,20 @@ void DX12Renderer::CreateComputeRootSignature()
     DebuggerPrintf("[Renderer] Created Compute Root Signature with Radiance Cache support\n");
 }
 
-void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache* cache, int bufferIndex)
+void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache* cache)
 {
 	if (cache == nullptr)
 		return;
-
 	const D3D12_CPU_DESCRIPTOR_HANDLE cpuStart = m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart();
 	const UINT inc = m_scuDescriptorSize;
-
 	int idxSrvAtlas = 0;
 	int idxSrvMeta = 0;
 	int idxUavRadiance = 0; 
 	int idxUavMeta = 0;
-
-	if (cache->m_type == SURFACE_CACHE_TYPE_PRIMARY)
-	{
-		idxSrvAtlas = PrimaryAtlasSrvIndex(bufferIndex);
-		idxSrvMeta = PrimaryMetaSrvIndex(bufferIndex);
-		idxUavRadiance = PrimaryAtlasUavIndex(bufferIndex);  
-		idxUavMeta = PrimaryMetaUavIndex(bufferIndex);
-	}
-	else // SURFACE_CACHE_TYPE_GI
-	{
-		idxSrvAtlas = GIAtlasSrvIndex(bufferIndex);
-		idxSrvMeta = GIMetaSrvIndex(bufferIndex);
-		idxUavRadiance = GIAtlasUavIndex(bufferIndex); 
-		idxUavMeta = GIMetaUavIndex(bufferIndex);
-	}
-
+		idxSrvAtlas = PrimaryAtlasSrvIndex(0);
+		idxSrvMeta = PrimaryMetaSrvIndex(0);
+		idxUavRadiance = PrimaryAtlasUavIndex(0);  
+		idxUavMeta = PrimaryMetaUavIndex(0);
 	{
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 		srvDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2635,13 +3755,11 @@ void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache
 		srvDesc.Texture2DArray.ArraySize = SURFACE_CACHE_LAYER_COUNT;  // SRV可以访问所有layers
 
 		m_device->CreateShaderResourceView(
-			cache->m_atlasTexture[bufferIndex],
+			cache->m_atlasTexture,
 			&srvDesc,
 			CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, idxSrvAtlas, inc)
 		);
 	}
-
-	// Radiance Layer UAV（按理来说应该只写入这一个layer -> LIGHT）
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
 		uavDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -2653,13 +3771,12 @@ void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache
 		uavDesc.Texture2DArray.ArraySize = SURFACE_CACHE_LAYER_COUNT;
 
 		m_device->CreateUnorderedAccessView(
-			cache->m_atlasTexture[bufferIndex],
+			cache->m_atlasTexture,
 			nullptr,
 			&uavDesc,
 			CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, idxUavRadiance, inc)
 		);
 	}
-
 	// Metadata SRV
 	{
 		D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -2670,13 +3787,12 @@ void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache
 		srvDesc.Buffer.StructureByteStride = sizeof(SurfaceCardMetadata);
 
 		m_device->CreateShaderResourceView(
-			cache->m_cardMetadataBuffer[bufferIndex],
+			cache->m_cardMetadataBuffer,
 			&srvDesc,
 			CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, idxSrvMeta, inc)
 		);
 	}
-
-	// Metadata UAV
+	// Metadata UAV ->UAV其实用处不大
 	{
 		D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
 		uavDesc.Format = DXGI_FORMAT_UNKNOWN;
@@ -2686,112 +3802,183 @@ void DX12Renderer::CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache
 		uavDesc.Buffer.StructureByteStride = sizeof(SurfaceCardMetadata);
 
 		m_device->CreateUnorderedAccessView(
-			cache->m_cardMetadataBuffer[bufferIndex],
+			cache->m_cardMetadataBuffer,
 			nullptr,
 			&uavDesc,
 			CD3DX12_CPU_DESCRIPTOR_HANDLE(cpuStart, idxUavMeta, inc)
 		);
 	}
-
-	CD3DX12_RESOURCE_BARRIER barriers[] = {
-		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->m_atlasTexture[bufferIndex],
-			D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-		),
-		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->m_cardMetadataBuffer[bufferIndex],
-			D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-		)
-	};
-	m_commandList->ResourceBarrier(2, barriers);
+	// CD3DX12_RESOURCE_BARRIER barriers[] = {
+	// 	CD3DX12_RESOURCE_BARRIER::Transition(
+	// 		cache->m_atlasTexture[bufferIndex],
+	// 		D3D12_RESOURCE_STATE_COMMON,
+	// 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+	// 	),
+	// 	CD3DX12_RESOURCE_BARRIER::Transition(
+	// 		cache->m_cardMetadataBuffer[bufferIndex],
+	// 		D3D12_RESOURCE_STATE_COMMON,
+	// 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+	// 	)
+	// };
+	// m_commandList->ResourceBarrier(2, barriers);
 }
 
-void DX12Renderer::CompositeFinalImage() //TODO: 想做RenderNode型渲染器就要改名，现在这个实际上只是GBuffer+SurfaceCache管线的
+void DX12Renderer::RenderingCompositePass()
 {
-	if (!m_giSystem || !m_gBufferPassActive)
-		return;
+    if (!m_giSystem || !m_gBufferPassActive)
+        return;
 	
-	BeginForwardPass();
-	if (!m_hasBackBufferCleared)
-	{
-		ClearForwardPassRTV(Rgba8::AQUA);
-	}
-
-	CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(
-		m_rtvDescHeap->GetCPUDescriptorHandleForHeapStart(),
-		m_frameIndex,
-		m_rtvDescriptorSize
-	);
-	//CD3DX12_CPU_DESCRIPTOR_HANDLE dsvHandle(m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart());
-	//m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
-	m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-
-	m_commandList->SetGraphicsRootSignature(m_graphicsRootSignature);
-
-	ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
-	m_commandList->SetDescriptorHeaps(_countof(heaps), heaps);
-	
-	//绑定GBuffer SRV表 -> 看是否需要访问原GBuffer数据进行更复杂的合成等
-	// Transition GBuffer resources to SRV state 
-	CD3DX12_RESOURCE_BARRIER barriers[GBUFFER_COUNT + DEPTH_SRV_COUNT];
-	for (int i = 0; i < GBUFFER_COUNT; ++i)
-	{
-		barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(
-			m_gBuffer.GetResource(i),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+	CD3DX12_RESOURCE_BARRIER preCompositeBarrier = 
+		CD3DX12_RESOURCE_BARRIER::Transition(
+			m_screenProbeFinalGather->GetIndirectLightingTexture(),
+			D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
 		);
-	} 
-	// 深度缓冲：保持深度读取，添加像素着色器资源
-	barriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
-		m_depthStencilBuffer,
-		D3D12_RESOURCE_STATE_DEPTH_READ |
-		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-		D3D12_RESOURCE_STATE_DEPTH_READ |
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-	);
-	m_commandList->ResourceBarrier(GBUFFER_COUNT+DEPTH_SRV_COUNT, barriers);
-	// 绑定GBuffer（已经在SRV状态）和Surface Cache用于读取
-	CD3DX12_GPU_DESCRIPTOR_HANDLE gbufferHandle(
+	m_commandList->ResourceBarrier(1, &preCompositeBarrier);
+	
+    BeginForwardPass();
+    if (!m_hasBackBufferCleared)
+    {
+        ClearForwardPassRTV(Rgba8::BLACK);
+    }
+    
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(
+        m_rtvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+        m_frameIndex,
+        m_rtvDescriptorSize
+    );
+    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+    
+    // CD3DX12_RESOURCE_BARRIER barriers[GBUFFER_COUNT + DEPTH_SRV_COUNT];
+    // for (int i = 0; i < GBUFFER_COUNT; ++i)
+    // {
+    //     barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(
+    //         m_gBuffer.GetResource(i),
+    //         D3D12_RESOURCE_STATE_RENDER_TARGET,
+    //         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    //     );
+    // }
+    // barriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
+    //     m_depthStencilBuffer,
+    //     D3D12_RESOURCE_STATE_DEPTH_WRITE,
+    //     D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    // );
+    //m_commandList->ResourceBarrier(GBUFFER_COUNT + DEPTH_SRV_COUNT, barriers);
+    
+    m_commandList->SetGraphicsRootSignature(m_graphicsRootSignature);
+    ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
+    m_commandList->SetDescriptorHeaps(_countof(heaps), heaps);
+    
+    CompositeConstants constants = {};
+    constants.ClipToRenderTransform = m_currentCam.RenderToClipTransform.GetInverse();
+    constants.RenderToCameraTransform = m_currentCam.CameraToRenderTransform.GetInverse();
+    constants.CameraToWorldTransform = m_currentCam.WorldToCameraTransform.GetInverse();
+    
+    IntVec2 screenDims = m_config.m_window->GetClientDimensions();
+    constants.ScreenWidth = (float)screenDims.x;
+    constants.ScreenHeight = (float)screenDims.y;
+    constants.IndirectIntensity = 1.0f;
+    constants.DirectIntensity = 1.0f;
+    if (m_giSystem && m_giSystem->m_scene)
+    {
+    	Rgba8 color = m_giSystem->m_scene->m_sunColor;
+    	float sunColorAsFloats[4];
+    	color.GetAsFloats(sunColorAsFloats);
+    	constants.SunColor[0] = sunColorAsFloats[0];
+    	constants.SunColor[1] = sunColorAsFloats[1];
+    	constants.SunColor[2] = sunColorAsFloats[2];
+    	constants.SunColor[3] = sunColorAsFloats[3];
+        constants.SunNormal[0] = m_giSystem->m_scene->m_sunDirection.GetNormalized().x;
+        constants.SunNormal[1] = m_giSystem->m_scene->m_sunDirection.GetNormalized().y;
+        constants.SunNormal[2] = m_giSystem->m_scene->m_sunDirection.GetNormalized().z;
+    }
+    else
+    {
+    	Vec3 normal = Vec3(0.5f, -0.8f, -0.3f).GetNormalized();
+    	constants.SunColor[0] = 1.f;
+    	constants.SunColor[1] = 1.f;
+    	constants.SunColor[2] = 1.f;
+    	constants.SunColor[3] = 1.f;
+        constants.SunNormal[0] = normal.x;
+        constants.SunNormal[1] = normal.y;
+        constants.SunNormal[2] = normal.z;
+    }
+	
+    constants.AmbientIntensity = 0.0f;  // 设为0，ambient通过GI间接光来实现
+    constants.AmbientColor = Vec3(0.0f, 0.0f, 0.0f);
+    constants.ShadowBias = 0.05f;  // Increased from 0.002 - needs to be proportional to scene scale
+    
+    constants.LightWorldToCamera = m_cachedLightWorldToCamera;
+    constants.LightCameraToRender = m_cachedLightCameraToRender;
+    constants.LightRenderToClip = m_cachedLightRenderToClip;
+    
+    constants.ShadowMapSize = (float)SHADOW_MAP_SIZE;
+    constants.AOStrength = 0.5f;
+	constants.LightSize = 3.f;
+	constants.SoftnessFactor = 1.f;
+    
+    m_constantBuffers[k_compositeConstantsSlot]->AppendData(&constants, sizeof(CompositeConstants), 0);
+    
+    // [1] Camera Constants (b1)
+    D3D12_GPU_VIRTUAL_ADDRESS cameraCBAddress =
+        m_constantBuffers[k_cameraConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_cameraConstantsSlot]->m_offset;
+    m_commandList->SetGraphicsRootConstantBufferView(k_cameraConstantsSlot, cameraCBAddress);
+    // [4] GeneralLight Constants (b4) - 点光源/聚光灯
+    D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress =
+        m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_generalLightConstantsSlot]->m_offset;
+    m_commandList->SetGraphicsRootConstantBufferView(k_generalLightConstantsSlot, lightCBAddress);
+    // [12] Composite Constants (b12)
+    D3D12_GPU_VIRTUAL_ADDRESS compositeCBAddress = 
+        m_constantBuffers[k_compositeConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_compositeConstantsSlot]->m_offset;
+    m_commandList->SetGraphicsRootConstantBufferView(k_compositeConstantsSlot, compositeCBAddress);
+    // [15] GBuffer SRVs (t200-t204)
+    CD3DX12_GPU_DESCRIPTOR_HANDLE gbufferHandle(
+        m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+        GBUFFER_SRV_START_SLOT,  // 214
+        m_scuDescriptorSize
+    );
+    m_commandList->SetGraphicsRootDescriptorTable(15, gbufferHandle);
+    
+    // // [16] Surface Cache SRVs (如果 Shader 需要)
+    // BindSurfaceCacheForGraphics(&m_surfaceCache);
+    // // [18] Radiance Cache SRV (如果 Shader 需要)
+    // BindRadianceCacheForGraphics(&m_radianceCache);
+    // [26] Shadow Map SRV
+    CD3DX12_GPU_DESCRIPTOR_HANDLE shadowMapHandle(
+        m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+        SHADOW_MAP_SRV,  // Shadow Map 在描述符堆中的位置
+        m_scuDescriptorSize
+    );
+    m_commandList->SetGraphicsRootDescriptorTable(26, shadowMapHandle);
+	// [27] Screen Indirect Lighting SRV
+	CD3DX12_GPU_DESCRIPTOR_HANDLE indirectLightHandle(
 		m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
-		NUM_CONSTANT_BUFFERS + MAX_TEXTURE_COUNT,
+		SCREEN_INDIRECT_LIGHTING_SRV, //430
 		m_scuDescriptorSize
 	);
-	m_commandList->SetGraphicsRootDescriptorTable(15, gbufferHandle);
+	m_commandList->SetGraphicsRootDescriptorTable(27, indirectLightHandle);
+    m_commandList->SetPipelineState(m_compositePSO);
     
-	SurfaceCache* cache = GetCurrentCache(SURFACE_CACHE_TYPE_PRIMARY);
-	BindSurfaceCacheForGraphics(cache);
+    m_commandList->RSSetViewports(1, &m_viewport);
+    m_commandList->RSSetScissorRects(1, &m_scissorRect);
+    m_commandList->IASetVertexBuffers(0, 0, nullptr);
+    m_commandList->IASetIndexBuffer(nullptr);
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+    //DebuggerPrintf("[Composite] Pass completed\n");
 
-	BindRadianceCacheForGraphics(&m_radianceCache);
+	
+	RenderingGIVisualizationPass(constants);
+}
 
-	// //Rebind surfacecache const
-	// D3D12_GPU_VIRTUAL_ADDRESS cbAddress =
-	// 	m_constantBuffers[k_surfaceCacheConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-	// 	+ m_constantBuffers[k_surfaceCacheConstantsSlot]->m_offset;
-	// m_commandList->SetGraphicsRootConstantBufferView(k_surfaceCacheConstantsSlot, cbAddress);
-	//rebind camera
-	D3D12_GPU_VIRTUAL_ADDRESS cameraCBAddress =
-		m_constantBuffers[k_cameraConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-		+ m_constantBuffers[k_cameraConstantsSlot]->m_offset;
-	m_commandList->SetGraphicsRootConstantBufferView(k_cameraConstantsSlot, cameraCBAddress);
-	//Rebind radiancecache const
-	D3D12_GPU_VIRTUAL_ADDRESS cbAddress =
-		m_constantBuffers[k_radianceCacheConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-		+ m_constantBuffers[k_radianceCacheConstantsSlot]->m_offset;
-	m_commandList->SetGraphicsRootConstantBufferView(k_radianceCacheConstantsSlot, cbAddress);
-
-	m_commandList->SetPipelineState(m_compositePSO);
-
-	m_commandList->RSSetViewports(1, &m_viewport);
-	m_commandList->RSSetScissorRects(1, &m_scissorRect);
-
-	m_commandList->IASetVertexBuffers(0, 0, nullptr);
-	m_commandList->IASetIndexBuffer(nullptr);
-	m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-	m_commandList->DrawInstanced(3, 1, 0, 0);
+void DX12Renderer::ShutdownCompositePass()
+{
+	DX_SAFE_RELEASE(m_compositePSO);
+	DX_SAFE_RELEASE(m_graphicsRootSignature);
 }
 
 void DX12Renderer::BeginCardCapturePass()
@@ -2804,20 +3991,19 @@ void DX12Renderer::BeginCardCapturePass()
 	const std::vector<uint32_t>& dirtyCards = m_giSystem->GetDirtyCards();  
 	if (dirtyCards.empty())
 		return;
+	
+	CD3DX12_GPU_DESCRIPTOR_HANDLE shadowMapHandle(
+		m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		SHADOW_MAP_SRV,  // 387
+		m_scuDescriptorSize
+	);
+	m_commandList->SetGraphicsRootDescriptorTable(26, shadowMapHandle);
 
 	m_currentCaptureIndex = 0;
-	//ID3D12Resource* atlasTexture = m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture();
-
-	// // Transition atlas to RTV state
-	// CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-	// 	atlasTexture,
-	// 	D3D12_RESOURCE_STATE_COMMON,
-	// 	D3D12_RESOURCE_STATE_RENDER_TARGET
-	// );
-	// m_commandList->ResourceBarrier(1, &barrier);
-	// 7. 转换状态：Atlas COMMON -> COPY_DEST
+	
 	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-		m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture(),
+		m_surfaceCache.GetAtlasTexture(),
+		//D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 		D3D12_RESOURCE_STATE_COPY_DEST
 	);
@@ -2826,7 +4012,11 @@ void DX12Renderer::BeginCardCapturePass()
     m_currentActivePass = ActivePass::CARDCAPTURE;
 
 	UploadCardMetadataToGPU();
+	
+	RenderingShadowMapPass();
+	
 	CaptureDirtySurfaceCards(s_maxCardsPerBatch);
+	//CaptureDirtySurfaceCards(1);
 }
 
 void DX12Renderer::EndCardCapturePass()
@@ -2835,15 +4025,25 @@ void DX12Renderer::EndCardCapturePass()
 	{
 		return;
 	}
-
-	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-		m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture(),
-		D3D12_RESOURCE_STATE_COPY_DEST,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-	);
-	m_commandList->ResourceBarrier(1, &barrier);
- 
-	DebuggerPrintf("[Renderer] End Card Capture Pass\n");
+	// CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+	// 	m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetAtlasTexture(),
+	// 	D3D12_RESOURCE_STATE_COPY_DEST,
+	// 	D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+	// );
+	// m_commandList->ResourceBarrier(1, &barrier);
+	
+		// CardMetadata: PIXEL_SHADER_RESOURCE → COMMON
+		TransitionResource(
+			m_surfaceCache.m_cardMetadataBuffer,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON);
+		// Atlas Texture: PIXEL_SHADER_RESOURCE → COMMON
+		TransitionResource(
+			m_surfaceCache.m_atlasTexture,
+			D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_COMMON);
+	
+	DebuggerPrintf("[CardCapture] END CardCapture Pass\n");
 	m_currentActivePass = ActivePass::UNKNOWN;
 }
 
@@ -2863,16 +4063,15 @@ void DX12Renderer::UploadCardMetadataToGPU()
 {
 	if (m_giSystem->m_cardMetadataCPU.empty())
 		return;
-	
-	for (int type = 0; type < SURFACE_CACHE_TYPE_COUNT; type++)
-	{
-		SurfaceCache cache = m_surfaceCaches[type];
+	//for (int type = 0; type < SURFACE_CACHE_TYPE_COUNT; type++)
+	//{
+		SurfaceCache cache = m_surfaceCache;
 		if (!cache.m_initialized)
-			continue;
+			return;
         
-		ID3D12Resource* uploadBuffer = cache.GetCurrentMetadataUploadBuffer();
+		ID3D12Resource* uploadBuffer = cache.GetMetadataUploadBuffer();
 		if (!uploadBuffer)
-			continue;
+			return;;
         
 		void* mappedData = nullptr;
 		HRESULT hr = uploadBuffer->Map(0, nullptr, &mappedData);
@@ -2884,7 +4083,7 @@ void DX12Renderer::UploadCardMetadataToGPU()
 			memcpy(mappedData, m_giSystem->m_cardMetadataCPU.data(), dataSize);
 			uploadBuffer->Unmap(0, nullptr);
             
-			ID3D12Resource* defaultBuffer = cache.GetCurrentMetadataBuffer();
+			ID3D12Resource* defaultBuffer = cache.GetMetadataBuffer();
 			if (defaultBuffer)
 			{
                 TransitionResource(uploadBuffer, 
@@ -2899,9 +4098,12 @@ void DX12Renderer::UploadCardMetadataToGPU()
 				TransitionResource(defaultBuffer, 
 					D3D12_RESOURCE_STATE_COPY_DEST, 
 					D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+				TransitionResource(uploadBuffer, 
+				D3D12_RESOURCE_STATE_COPY_SOURCE, 
+				D3D12_RESOURCE_STATE_GENERIC_READ);//新增的
 			}
 		}
-	}
+	//}
 }
 
 void DX12Renderer::CaptureDirtySurfaceCards(uint32_t maxCardsPerFrame)
@@ -2942,7 +4144,6 @@ void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, Card
 {
 	uint32_t width = card->m_pixelResolution.x;   
 	uint32_t height = card->m_pixelResolution.y;  
-    
 	D3D12_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;       
 	viewport.TopLeftY = 0.0f;     
@@ -2950,40 +4151,30 @@ void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, Card
 	viewport.Height = (float)height; 
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
-    
 	m_commandList->RSSetViewports(1, &viewport);
-    
 	D3D12_RECT scissorRect = {};
 	scissorRect.left = 0;            
 	scissorRect.top = 0;            
 	scissorRect.right = (LONG)width; 
 	scissorRect.bottom = (LONG)height;
-    
 	m_commandList->RSSetScissorRects(1, &scissorRect);
 
-	// D3D12_CPU_DESCRIPTOR_HANDLE rtvHandles[SURFACE_CACHE_LAYER_COUNT];
-	// for (int layer = 0; layer < SURFACE_CACHE_LAYER_COUNT; ++layer)
-	// {
-	// 	rtvHandles[layer] = GetCardCaptureRTVHandle(layer);
-	// }
-	//    
 	// m_commandList->OMSetRenderTargets(
 	// 	SURFACE_CACHE_LAYER_COUNT,
 	// 	rtvHandles,
 	// 	FALSE,
 	// 	nullptr  // 可选：如果需要 depth，传入 DSV handle
 	// );
-	m_commandList->OMSetRenderTargets(SURFACE_CACHE_LAYER_COUNT,
-		m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempRtvs, FALSE, nullptr);
+	m_commandList->OMSetRenderTargets(SURFACE_CACHE_LAYER_CAPTURE_COUNT,
+		m_surfaceCache.m_tempCapture.m_tempRtvs, FALSE, nullptr);
 	float clearColor[4] = { 0, 0, 0, 0 };
-	for (int i = 0; i < SURFACE_CACHE_LAYER_COUNT; i++)
+	for (int i = 0; i < SURFACE_CACHE_LAYER_CAPTURE_COUNT; i++)
 	{
-		m_commandList->ClearRenderTargetView(m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempRtvs[i],
+		m_commandList->ClearRenderTargetView(m_surfaceCache.m_tempCapture.m_tempRtvs[i],
 		                                     clearColor, 0, nullptr);
 	}
 	//SetupCardCaptureCamera(card, instance, templ);
 	CardCaptureConstants captureConsts = {};
-    
 	captureConsts.CardOrigin = instance->m_worldOrigin;
 	captureConsts.CardAxisX = instance->m_worldAxisX;
 	captureConsts.CardAxisY = instance->m_worldAxisY;
@@ -3005,35 +4196,34 @@ void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, Card
 	
 	DrawObjectsForCardCapture(card);
 
-	for (int i = 0; i < SURFACE_CACHE_LAYER_COUNT; i++)
+	for (int i = 0; i < SURFACE_CACHE_LAYER_CAPTURE_COUNT; i++)
 	{
 		CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-			m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempTextures[i],
+			m_surfaceCache.m_tempCapture.m_tempTextures[i],
 			D3D12_RESOURCE_STATE_RENDER_TARGET,
 			D3D12_RESOURCE_STATE_COPY_SOURCE
 		);
 		m_commandList->ResourceBarrier(1, &barrier);
 	}
-    
 	// 8. 复制到 Atlas 的不同层
-	for (int layer = 0; layer < SURFACE_CACHE_LAYER_COUNT; layer++)
+	for (int layer = 0; layer < SURFACE_CACHE_LAYER_CAPTURE_COUNT; layer++)
 	{
 		CopyCardToAtlasLayer(
-			m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempTextures[layer],
-			m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture(),
+			m_surfaceCache.m_tempCapture.m_tempTextures[layer],
+			m_surfaceCache.GetAtlasTexture(),
 			layer,
 			card->m_atlasPixelCoord.x,
 			card->m_atlasPixelCoord.y,
-			card->m_pixelResolution.x,  // ⚠️ 实际分辨率，不是最大分辨率
+			card->m_pixelResolution.x,  //实际分辨率，不是最大分辨率
 			card->m_pixelResolution.y
 		);
 	}
     
 	// 9. 转换状态：恢复temp textures-> RTV
-	for (int i = 0; i < SURFACE_CACHE_LAYER_COUNT; i++)
+	for (int i = 0; i < SURFACE_CACHE_LAYER_CAPTURE_COUNT; i++)
 	{
 		CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-			m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempTextures[i],
+			m_surfaceCache.m_tempCapture.m_tempTextures[i],
 			D3D12_RESOURCE_STATE_COPY_SOURCE,
 			D3D12_RESOURCE_STATE_RENDER_TARGET
 		);
@@ -3051,15 +4241,12 @@ void DX12Renderer::DrawObjectsForCardCapture(SurfaceCard* card)
 	MeshObject* obj = static_cast<MeshObject*>(m_giSystem->m_scene->GetSceneObject(card->m_meshObjectID));
 	if (!obj || !obj->GetMesh())
 		return;
-
 	StaticMesh* mesh = obj->GetMesh();
-
 	ModelConstants modelConstants;
 	modelConstants.ModelToWorldTransform = obj->m_cachedWorldMatrix;
 	obj->m_color.GetAsFloats(modelConstants.ModelColor);
 	m_constantBuffers[k_cardCaptureModelConstantsSlot]->AppendData(&modelConstants, sizeof(ModelConstants), m_currentCaptureIndex); 
 	BindConstantBuffer(k_cardCaptureModelConstantsSlot, m_constantBuffers[k_cardCaptureModelConstantsSlot]);
-
 	ConstantBuffer* cb = m_constantBuffers[k_cardCaptureMaterialConstantsSlot];
 	MaterialConstants materialConstant = {};
 	if (mesh->m_diffuseTexture)
@@ -3079,8 +4266,6 @@ void DX12Renderer::DrawObjectsForCardCapture(SurfaceCard* card)
 	
 	BindVertexBuffer(mesh->m_vertexBuffer);
 	BindIndexBuffer(mesh->m_indexBuffer);
-
-	// DrawIndexed
 	m_commandList->DrawIndexedInstanced((UINT)mesh->m_indices.size(), 1, 0, 0, 0);
 }
 
@@ -3235,47 +4420,20 @@ void DX12Renderer::CreateCardCapturePSO(const IntVec2& resolution)
 
 void DX12Renderer::InitializeSurfaceCaches()
 {
-	m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].Initialize(
+	m_surfaceCache.Initialize(
 		m_device,
 		m_giSystem->m_config.m_primaryAtlasSize,
-		m_giSystem->m_config.m_primaryTileSize,
-		SURFACE_CACHE_TYPE_PRIMARY
+		m_giSystem->m_config.m_primaryTileSize
 	);
-
-	for (int i = 0; i < SURFACE_CACHE_BUFFER_COUNT; i++)
-	{
-		CreateSurfaceCacheDescriptorsAndTransitionStates(&m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY], i);
-	}
-
-	if (m_giSystem->m_config.m_enableMultipleTypes)
-	{
-		m_surfaceCaches[SURFACE_CACHE_TYPE_GI].Initialize(m_device,
-			m_giSystem->m_config.m_primaryAtlasSize,
-			m_giSystem->m_config.m_primaryTileSize,
-			SURFACE_CACHE_TYPE_GI); 
-		for (int i = 0; i < SURFACE_CACHE_BUFFER_COUNT; i++)
-		{
-			CreateSurfaceCacheDescriptorsAndTransitionStates(&m_surfaceCaches[SURFACE_CACHE_TYPE_GI], i);
-		}
-	}
+	
+	CreateSurfaceCacheDescriptorsAndTransitionStates(&m_surfaceCache);
 }
 
-SurfaceCache* DX12Renderer::GetCurrentCache(SurfaceCacheType type)
-{
-	return &m_surfaceCaches[type];
-}
-
-SurfaceCache* DX12Renderer::GetPreviousCache(SurfaceCacheType type)
-{
-	// 同一个对象，通过GetPreviousAtlasTexture()访问previous buffer
-	return &m_surfaceCaches[type];
-}
-
-void DX12Renderer::CreateCardCaptureResources()
+void DX12Renderer::CreateCardCapturePassResources()
 {
 	InitializeSurfaceCaches();
 
-	for (int layer = 0; layer < SURFACE_CACHE_LAYER_COUNT; ++layer)
+	for (int layer = 0; layer < SURFACE_CACHE_LAYER_CAPTURE_COUNT; ++layer)
 	{
 		CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvDescHeap->GetCPUDescriptorHandleForHeapStart());
 		//ID3D12Resource* atlasTexture = m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture();
@@ -3289,9 +4447,9 @@ void DX12Renderer::CreateCardCaptureResources()
 		//rtvDesc.Texture2DArray.ArraySize = 1;
 
 		rtvHandle.Offset(GBUFFER_COUNT+FRAME_BUFFER_COUNT + layer, m_rtvDescriptorSize);
-		m_device->CreateRenderTargetView(m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempTextures[layer],
+		m_device->CreateRenderTargetView(m_surfaceCache.m_tempCapture.m_tempTextures[layer],
 		                                 &rtvDesc, rtvHandle);
-		m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].m_tempCapture.m_tempRtvs[layer] = rtvHandle;
+		m_surfaceCache.m_tempCapture.m_tempRtvs[layer] = rtvHandle;
 	}
 
 	CreateCardCapturePipelineStates();
@@ -3305,112 +4463,98 @@ void DX12Renderer::CreateCardCapturePipelineStates()
 		IntVec2(128, 128),
 		IntVec2(512, 512)
 	};
-
 	for (const IntVec2& res : resolutions)
 	{
 		CreateCardCapturePSO(res); 
 	}
 }
 
-void DX12Renderer::CreateCompositePSO()
+void DX12Renderer::CreateCompositeResources()
 {
-	const char* shaderName = "Data/Shaders/CompositeShader";
-	Shader* test = GetShaderByName(shaderName);
-	if (test)
-	{
-		return;
-	}
-	std::string shaderHLSLName = std::string(shaderName) + ".hlsl";
-
-	std::string shaderSource;
-	int result = FileReadToString(shaderSource, shaderHLSLName);
-	if (result < 0)
-	{
-		ERROR_AND_DIE("Fail to create shader from this shaderName");
-	}
-
-	ShaderConfig sConfig;
-	sConfig.m_name = std::string(shaderName);
-	sConfig.m_pixelEntryPoint = "CompositePS";
-	sConfig.m_vertexEntryPoint = "CompositeVS";
-	//Shader* shader = new Shader(sConfig);
-
-	ID3DBlob* vertexShader;
-	ID3DBlob* pixelShader;
-
-	CompileShaderToByteCode(&vertexShader, "VertexShader", shaderSource.c_str(), sConfig.m_vertexEntryPoint.c_str(), "vs_5_0");
-	CompileShaderToByteCode(&pixelShader, "PixelShader", shaderSource.c_str(), sConfig.m_pixelEntryPoint.c_str(), "ps_5_1");
-
-	D3D12_INPUT_LAYOUT_DESC emptyInputLayout = { nullptr, 0 };
-    
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    
-    // Root Signature（必须包含所有需要的资源）
-    psoDesc.pRootSignature = m_graphicsRootSignature;
-    
-    psoDesc.VS = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
-    psoDesc.PS = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };
-    
-    psoDesc.InputLayout = emptyInputLayout;
-    
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    
-    // Render Target 格式（必须与 BackBuffer 一致）
-    psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-    
-    psoDesc.SampleDesc.Count = 1;
-    psoDesc.SampleDesc.Quality = 0;
-    psoDesc.SampleMask = UINT_MAX;
-    
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;  // 不剔除
-    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
-    psoDesc.RasterizerState.DepthClipEnable = TRUE;
-    
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    psoDesc.BlendState.RenderTarget[0].BlendEnable = FALSE;
-    
-    // 深度/模板状态（禁用深度测试）
-    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState.DepthEnable = FALSE;
-    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
-    psoDesc.DSVFormat = DXGI_FORMAT_UNKNOWN;  // 不使用深度缓冲
-    
-    HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_compositePSO));
-    
+	ID3DBlob* error = nullptr;
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* psBlob = nullptr;
+    UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+    #ifdef NDEBUG
+    compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    #endif
+    HRESULT hr = D3DCompileFromFile(
+        L"Data/Shaders/CompositeShader.hlsl", 
+        nullptr, 
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "CompositeVS", "vs_5_1", 
+        compileFlags, 0, 
+        &vsBlob, &error);
     if (FAILED(hr))
     {
-        DX_SAFE_RELEASE(vertexShader);
-        DX_SAFE_RELEASE(pixelShader);
-        ERROR_AND_DIE("Failed to create Composite PSO!");
+        if (error)
+        {
+            DebuggerPrintf("[Composite] VS compile error: %s\n", 
+                (char*)error->GetBufferPointer());
+            error->Release();
+        }
+        return;
+    }
+    hr = D3DCompileFromFile(
+        L"Data/Shaders/CompositeShader.hlsl", 
+        nullptr, 
+        D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "CompositePS", "ps_5_1", 
+        compileFlags, 0, 
+        &psBlob, &error);
+    if (FAILED(hr))
+    {
+        if (error)
+        {
+            DebuggerPrintf("[Composite] PS compile error: %s\n", 
+                (char*)error->GetBufferPointer());
+            error->Release();
+        }
+        vsBlob->Release();
+    	ERROR_AND_DIE("Failed to compile CompositeShader and create CompositePSO!");
+        return;
     }
     
-    m_compositePSO->SetName(L"CompositePSO");
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_graphicsRootSignature;
+    psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+    psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;  // Back Buffer 格式
+    psoDesc.SampleDesc.Count = 1;
+    hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_compositePSO));
+    vsBlob->Release();
+    psBlob->Release();
+    if (FAILED(hr))
+    {
+        DebuggerPrintf("[Composite] Failed to create PSO: 0x%08X\n", hr);
+        return;
+    }
+    m_compositePSO->SetName(L"Composite_PSO");
     
-    DebuggerPrintf("[CreateCompositePSO] Successfully created Composite PSO\n");
-    
-    // 释放 Shader 字节码
-    DX_SAFE_RELEASE(vertexShader);
-    DX_SAFE_RELEASE(pixelShader);
+    DebuggerPrintf("[Composite] Resources created successfully\n");
 }
 
 void DX12Renderer::BindSurfaceCacheForCompute(SurfaceCache* cache) //暂时用不到咧 <-还是要复用起来
 {
 	if (!cache) return;
-    
 	// 转换Surface Cache资源到UAV状态
 	CD3DX12_RESOURCE_BARRIER barriers[] =
 	{
 		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->GetCurrentAtlasTexture(),
+			cache->GetAtlasTexture(),
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS
 		),
 		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->GetCurrentMetadataBuffer(),
+			cache->GetMetadataBuffer(),
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS
 		)
@@ -3435,26 +4579,24 @@ void DX12Renderer::BindSurfaceCacheForGraphics(SurfaceCache* cache)
 {
 	if (!cache) 
 		return;
-    
 	// 转换Surface Cache到SRV状态（从UAV转换）
 	CD3DX12_RESOURCE_BARRIER barriers[] = {
+		// CD3DX12_RESOURCE_BARRIER::Transition(
+		// 	cache->GetAtlasTexture(),
+		// 	D3D12_RESOURCE_STATE_COMMON,
+		// 	//D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // 从UAV
+		// 	D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE  // 到SRV
+		// ),
 		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->GetCurrentAtlasTexture(),
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,  // 从UAV
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE  // 到SRV
-		),
-		CD3DX12_RESOURCE_BARRIER::Transition(
-			cache->GetCurrentMetadataBuffer(),
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, //暂时是这样，之后有了radiance cache它俩会统一~
+			cache->GetMetadataBuffer(),
+			D3D12_RESOURCE_STATE_COMMON,
+			//D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, //暂时是这样，之后有了radiance cache它俩会统一~
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
 		)
 	};
-	m_commandList->ResourceBarrier(2, barriers);
+	m_commandList->ResourceBarrier(1, barriers);
 
-	int t = cache->m_type;
-
-	int baseSlot = (t == 0) ? PrimaryAtlasSrvIndex(m_frameIndex)
-		: GIAtlasSrvIndex(m_frameIndex);
+	int baseSlot = PrimaryAtlasSrvIndex(0);
 
 	// 绑定 Surface Cache SRVs（Atlas + Metadata）到 16
 	CD3DX12_GPU_DESCRIPTOR_HANDLE surfaceCacheSRVHandle(
@@ -3467,61 +4609,6 @@ void DX12Renderer::BindSurfaceCacheForGraphics(SurfaceCache* cache)
 
 void DX12Renderer::VisualizeSurfaceCache()
 {
-	 // Simple visualization - copy atlas to back buffer
-    //if (!m_giSystem)
-    //    return;
-    //
-    //SurfaceCache* cache = m_giSystem->GetCurrentCache(SURFACE_CACHE_TYPE_PRIMARY);
-    //if (!cache || !cache->GetAtlasTexture())
-    //    return;
-    //
-    //// Transition resources
-    //CD3DX12_RESOURCE_BARRIER barriers[] = {
-    //    CD3DX12_RESOURCE_BARRIER::Transition(
-    //        m_renderTargets[m_frameIndex],
-    //        D3D12_RESOURCE_STATE_RENDER_TARGET,
-    //        D3D12_RESOURCE_STATE_COPY_DEST
-    //    ),
-    //    CD3DX12_RESOURCE_BARRIER::Transition(
-    //        cache->GetAtlasTexture(),
-    //        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-    //        D3D12_RESOURCE_STATE_COPY_SOURCE
-    //    )
-    //};
-    //m_commandList->ResourceBarrier(2, barriers);
-    //
-    //// Copy first layer of atlas to back buffer (for visualization)
-    //D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
-    //srcLocation.pResource = cache->GetAtlasTexture();
-    //srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    //srcLocation.SubresourceIndex = 0; // First layer (albedo)
-    //
-    //D3D12_TEXTURE_COPY_LOCATION dstLocation = {};
-    //dstLocation.pResource = m_renderTargets[m_frameIndex];
-    //dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    //dstLocation.SubresourceIndex = 0;
-    //
-    //// Copy region (scale down if atlas is larger than screen)
-    //uint32_t copyWidth = min(m_config.m_window->GetClientDimensions().x, 
-    //                         (int)m_giSystem->m_config.m_primaryAtlasSize);
-    //uint32_t copyHeight = min(m_config.m_window->GetClientDimensions().y,
-    //                         (int)m_giSystem->m_config.m_primaryAtlasSize);
-    //
-    //D3D12_BOX srcBox = {0, 0, 0, copyWidth, copyHeight, 1};
-    //m_commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, &srcBox);
-    //
-    //// Transition back
-    //barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(
-    //    m_renderTargets[m_frameIndex],
-    //    D3D12_RESOURCE_STATE_COPY_DEST,
-    //    D3D12_RESOURCE_STATE_RENDER_TARGET
-    //);
-    //barriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(
-    //    cache->GetAtlasTexture(),
-    //    D3D12_RESOURCE_STATE_COPY_SOURCE,
-    //    D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    //);
-    //m_commandList->ResourceBarrier(2, barriers);
 }
 
 void DX12Renderer::InitializeRadianceCache()
@@ -3619,14 +4706,12 @@ void DX12Renderer::CreateRadianceCacheUpdatePSO()
 		return;
 	}
 	std::string shaderHLSLName = std::string(shaderName) + ".hlsl";
-
 	std::string shaderSource;
 	int result = FileReadToString(shaderSource, shaderHLSLName);
 	if (result < 0)
 	{
 		ERROR_AND_DIE("Fail to create shader from this shaderName");
 	}
-
 	ID3DBlob* computeShaderBlob = nullptr;
 	bool success = CompileShaderToByteCode(
 		&computeShaderBlob,
@@ -3635,7 +4720,6 @@ void DX12Renderer::CreateRadianceCacheUpdatePSO()
 		"CSMain",
 		"cs_5_1"
 	);
-    
 	if (!success || !computeShaderBlob)
 	{
 		ERROR_AND_DIE("[DX12Renderer] Failed to compile RadianceCacheUpdate.hlsl!");
@@ -3699,7 +4783,7 @@ void DX12Renderer::BeginRadianceCachePass()
     constants.CameraPositionY = camPos.y;
     constants.CameraPositionZ = camPos.z;
     
-    constants.ViewProj = m_camera.GetProjectionMatrix(); //有问题
+    constants.ViewProj = m_camera.GetProjectionMatrix(); //肯定有问题
     constants.ViewProjInverse = constants.ViewProj.GetOrthonormalInverse();
     
     constants.ScreenWidth = (float)m_config.m_window->GetClientDimensions().x;
@@ -3710,12 +4794,10 @@ void DX12Renderer::BeginRadianceCachePass()
     constants.MaxTraceDistance = 50.0f;
     constants.ProbeSpacing = 2.0f;
     
-    // Surface Cache 信息
-    SurfaceCache* surfaceCache = GetCurrentCache(SURFACE_CACHE_TYPE_PRIMARY);
     constants.ActiveCardCount = (uint32_t)m_giSystem->GetCurrentSurfaceCardMetadataCPU().size();
-    constants.AtlasWidth = surfaceCache->m_atlasSize;
-    constants.AtlasHeight = surfaceCache->m_atlasSize;
-    constants.TileSize = surfaceCache->m_tileSize;
+    constants.AtlasWidth = m_surfaceCache.m_atlasSize;
+    constants.AtlasHeight = m_surfaceCache.m_atlasSize;
+    constants.TileSize = m_surfaceCache.m_tileSize;
     constants.BVHNodeCount = m_cardBVHNodeCount;
 
 	m_constantBuffers[k_radianceCacheConstantsSlot]->AppendData(&constants, sizeof(RadianceCacheConstants), m_currentDrawIndex); 
@@ -3724,7 +4806,7 @@ void DX12Renderer::BeginRadianceCachePass()
 	 
     // Surface Cache Atlas → SRV
     TransitionResource(
-        surfaceCache->GetCurrentAtlasTexture(),
+        m_surfaceCache.GetAtlasTexture(),
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
@@ -3735,7 +4817,6 @@ void DX12Renderer::BeginRadianceCachePass()
         D3D12_RESOURCE_STATE_COMMON,
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     );
-    
     // Current Probe Buffer → UAV
     TransitionResource(
         m_radianceCache.GetCurrentProbeBuffer(),
@@ -3779,18 +4860,16 @@ void DX12Renderer::BeginRadianceCachePass()
 
 void DX12Renderer::EndRadianceCachePass()
 {
-	// ========== 9. UAV Barrier ==========
 	D3D12_RESOURCE_BARRIER uavBarrier = {};
 	uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
 	uavBarrier.UAV.pResource = m_radianceCache.GetCurrentProbeBuffer();
 	m_commandList->ResourceBarrier(1, &uavBarrier);
     
 	TransitionResource(
-		m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY].GetCurrentAtlasTexture(),
+		m_surfaceCache.GetAtlasTexture(),
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
 	);
-    
 	TransitionResource(
 		m_radianceCache.GetCurrentProbeBuffer(),
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -3849,14 +4928,12 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
         DebuggerPrintf("  [11] Probe SRV (Previous): descriptor index %d\n", srvIndex);
     }
     
-    // ========================================
-    // Root Parameter [10]: Surface Cache Atlas SRV (t200-t201)
-    // ========================================
+    // Root Parameter [10]: Surface Cache Atlas SRV 
     {
         // 绑定 PRIMARY Surface Cache Atlas（用于采样直接光照）
-        SurfaceCache* primaryCache = &m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY];
-        int currentIndex = primaryCache->GetCurrentBufferIndex();
-        int atlasSrvIndex = PrimaryAtlasSrvIndex(currentIndex);  // 例如 219
+        //SurfaceCache* primaryCache = &m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY];
+        //int currentIndex = primaryCache->GetCurrentBufferIndex();
+        int atlasSrvIndex = PrimaryAtlasSrvIndex(0);  // 例如 219 TODO
         
         D3D12_GPU_DESCRIPTOR_HANDLE atlasSrvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
             gpuStart,
@@ -3868,15 +4945,11 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
         
         DebuggerPrintf("  [10] Surface Cache Atlas SRV: descriptor index %d\n", atlasSrvIndex);
     }
-    
-    // ========================================
     // Root Parameter [6]: Card Metadata SRV (t6)
-    // ========================================
     {
-        // 使用 PRIMARY Surface Cache 的 Metadata
-        SurfaceCache* primaryCache = &m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY];
-        int currentIndex = primaryCache->GetCurrentBufferIndex();
-        int metaSrvIndex = PrimaryMetaSrvIndex(currentIndex); 
+        //SurfaceCache* primaryCache = &m_surfaceCache;
+        //int currentIndex = primaryCache->GetCurrentBufferIndex();
+        int metaSrvIndex = PrimaryMetaSrvIndex(0); 
         D3D12_GPU_DESCRIPTOR_HANDLE metaSrvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
             gpuStart,
             metaSrvIndex,
@@ -3888,13 +4961,11 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
         DebuggerPrintf("  [6] Card Metadata SRV: descriptor index %d\n", metaSrvIndex);
     }
     
-    // ========================================
-    // Root Parameter [12]: Card BVH SRVs (t240-t241)
-    // ========================================
+    // Root Parameter [12]: Card BVH SRVs
     {
         // 注意：这里绑定的是 BVH Nodes 的起始位置
         // Descriptor Range 会自动覆盖 t240 (Nodes) 和 t241 (Indices)
-        int bvhNodeSrvIndex = CARD_BVH_NODE_SRV;  // 240
+        int bvhNodeSrvIndex = CARD_BVH_NODE_SRV;  //228
         
         D3D12_GPU_DESCRIPTOR_HANDLE bvhHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
             gpuStart,
@@ -3908,9 +4979,7 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
             bvhNodeSrvIndex, bvhNodeSrvIndex + 1);
     }
     
-    // ========================================
     // Root Parameter [13]: Radiance Cache Constants (b13)
-    // ========================================
     {
         RadianceCacheConstants rcConstants = {};
         
@@ -3940,7 +5009,7 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
         rcConstants.MaxTraceDistance = 100.0f;  // 可配置
         rcConstants.ProbeSpacing = 2.0f;        // 可配置
         
-        SurfaceCache* primaryCache = &m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY];
+        SurfaceCache* primaryCache = &m_surfaceCache;
         rcConstants.ActiveCardCount = (uint32_t)m_giSystem->GetCurrentSurfaceCardMetadataCPU().size();
         rcConstants.AtlasWidth = primaryCache->m_atlasSize;
         rcConstants.AtlasHeight = primaryCache->m_atlasSize;
@@ -3955,19 +5024,15 @@ void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
         );
         D3D12_GPU_VIRTUAL_ADDRESS cbvAddress = 
             m_constantBuffers[k_radianceCacheConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress();
-        m_commandList->SetComputeRootConstantBufferView(k_radianceCacheConstantsSlot, cbvAddress);
+        m_commandList->SetComputeRootConstantBufferView(0, cbvAddress);
         
         DebuggerPrintf("  [13] Radiance Cache Constants: %u probes, %u active, %u updating\n",
             rcConstants.MaxProbes, rcConstants.ActiveProbeCount, rcConstants.UpdateProbeCount);
     }
     
-    // ========================================
     // Root Parameter [1]: Update List Buffer (已在其他地方处理)
-    // ========================================
     // Update List 在 cache->UploadProbeData() 中上传
-    // 这里不需要额外绑定
-    
-    DebuggerPrintf("[Renderer] ✅ Radiance Cache bound for Compute\n");
+    DebuggerPrintf("[Renderer] Radiance Cache bound for Compute\n");
 }
 
 void DX12Renderer::BindRadianceCacheForGraphics(RadianceCache* cache)
@@ -3988,7 +5053,6 @@ void DX12Renderer::BindRadianceCacheForGraphics(RadianceCache* cache)
     
 	D3D12_GPU_VIRTUAL_ADDRESS probeBufferAddress = currentProbeBuffer->GetGPUVirtualAddress();
 	m_commandList->SetGraphicsRootShaderResourceView(18, probeBufferAddress);
-    
 	// DebuggerPrintf("[Renderer] Bound Radiance Cache SRV at GPU address 0x%llx\n", 
 	// 			   probeBufferAddress);
 }
@@ -3997,7 +5061,6 @@ void DX12Renderer::UploadBufferData(ID3D12Resource* dstBuffer, const void* srcDa
 {
 	if (!dstBuffer || !srcData || dataSize == 0)
 		return;
-    
 	// 创建 Upload Heap
 	D3D12_HEAP_PROPERTIES uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
 	D3D12_RESOURCE_DESC uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(dataSize);
@@ -4011,12 +5074,10 @@ void DX12Renderer::UploadBufferData(ID3D12Resource* dstBuffer, const void* srcDa
 		nullptr,
 		IID_PPV_ARGS(&uploadBuffer)
 	);
-    
 	if (FAILED(hr))
 	{
 		ERROR_AND_DIE("[DX12Renderer] Failed to create upload buffer!");
 	}
-    
 	// Map and copy
 	void* mappedData = nullptr;
 	hr = uploadBuffer->Map(0, nullptr, &mappedData);
@@ -4025,13 +5086,10 @@ void DX12Renderer::UploadBufferData(ID3D12Resource* dstBuffer, const void* srcDa
 		memcpy(mappedData, srcData, dataSize);
 		uploadBuffer->Unmap(0, nullptr);
 	}
-    
 	// Transition dst to COPY_DEST
 	TransitionResource(dstBuffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    
 	// Copy
 	m_commandList->CopyResource(dstBuffer, uploadBuffer);
-    
 	// Transition back to SRV
 	TransitionResource(dstBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     
@@ -4047,18 +5105,14 @@ void DX12Renderer::CreateCardBVHBuffers(const std::vector<GPUCardBVHNode>& nodes
         DebuggerPrintf("[DX12Renderer] Warning: Empty BVH data\n");
         return;
     }
-    
-    // ========== 1. 创建 BVH Node Buffer ==========
+    // 创建 BVH Node Buffer 
     {
         uint32_t bufferSize = static_cast<uint32_t>(nodes.size() * sizeof(GPUCardBVHNode));
-        
-        // 释放旧资源
         DX_SAFE_RELEASE(m_cardBVHNodeBuffer);
-        
+		
         // 创建 DEFAULT heap
         D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
         D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
-        
         HRESULT hr = m_device->CreateCommittedResource(
             &heapProps,
             D3D12_HEAP_FLAG_NONE,
@@ -4076,21 +5130,16 @@ void DX12Renderer::CreateCardBVHBuffers(const std::vector<GPUCardBVHNode>& nodes
         m_cardBVHNodeBuffer->SetName(L"CardBVH_NodeBuffer");
         m_cardBVHNodeCount = static_cast<uint32_t>(nodes.size());
         
-        // 上传数据
         UploadBufferData(m_cardBVHNodeBuffer, nodes.data(), bufferSize);
     }
-    
-    // ========== 2. 创建 BVH Index Buffer ==========
+    // 创建 BVH Index Buffer
     {
         uint32_t bufferSize = static_cast<uint32_t>(cardIndices.size() * sizeof(uint32_t));
-        
-        // 释放旧资源
         DX_SAFE_RELEASE(m_cardBVHIndexBuffer);
         
         // 创建 DEFAULT heap
         D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
         D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
-        
         HRESULT hr = m_device->CreateCommittedResource(
             &heapProps,
             D3D12_HEAP_FLAG_NONE,
@@ -4099,21 +5148,14 @@ void DX12Renderer::CreateCardBVHBuffers(const std::vector<GPUCardBVHNode>& nodes
             nullptr,
             IID_PPV_ARGS(&m_cardBVHIndexBuffer)
         );
-        
         if (FAILED(hr))
         {
             ERROR_AND_DIE("[DX12Renderer] Failed to create Card BVH index buffer!");
         }
-        
         m_cardBVHIndexBuffer->SetName(L"CardBVH_IndexBuffer");
         m_cardBVHIndexCount = static_cast<uint32_t>(cardIndices.size());
-        
-        // 上传数据
         UploadBufferData(m_cardBVHIndexBuffer, cardIndices.data(), bufferSize);
     }
-    
-    // ========== 3. 创建 Descriptors ==========
-    
     // Node Buffer SRV
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -4131,7 +5173,6 @@ void DX12Renderer::CreateCardBVHBuffers(const std::vector<GPUCardBVHNode>& nodes
         );
         m_device->CreateShaderResourceView(m_cardBVHNodeBuffer, &srvDesc, handle);
     }
-    
     // Index Buffer SRV
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -4149,7 +5190,6 @@ void DX12Renderer::CreateCardBVHBuffers(const std::vector<GPUCardBVHNode>& nodes
         );
         m_device->CreateShaderResourceView(m_cardBVHIndexBuffer, &srvDesc, handle);
     }
-    
     DebuggerPrintf("[DX12Renderer] Created Card BVH buffers: %u nodes, %u indices\n",
                    m_cardBVHNodeCount, m_cardBVHIndexCount);
 }
@@ -4163,7 +5203,6 @@ void DX12Renderer::TransitionResource(ID3D12Resource* resource,
 		DebuggerPrintf("Before and after states are the same, no transition needed.\n");
 		return;
 	}
-    
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
@@ -4187,6 +5226,297 @@ D3D12_GPU_DESCRIPTOR_HANDLE DX12Renderer::GetGPUDescriptorHandle(ID3D12Descripto
 	D3D12_GPU_DESCRIPTOR_HANDLE handle = heap->GetGPUDescriptorHandleForHeapStart();
 	handle.ptr += index * m_scuDescriptorSize;
 	return handle;
+}
+
+void DX12Renderer::CreateCombineSurfaceCacheResources()
+{
+	m_combineSurfaceCache = new CombineSurfaceCache();
+	m_combineSurfaceCache->Initialize(m_device,
+		m_cbvSrvDescHeap);
+}
+
+void DX12Renderer::RenderingCombineSurfaceCachePass()
+{
+	m_combineSurfaceCache->Execute(m_commandList, &m_surfaceCache, m_giSystem->m_scene->m_nextCardID);
+}
+
+void DX12Renderer::CreateSurfaceCacheRadiosityResources()
+{
+	m_surfaceRadiosity = new SurfaceRadiosity();
+	m_surfaceRadiosity->Initialize(
+		m_device,
+		m_cbvSrvDescHeap,
+		m_giSystem->m_config.m_primaryAtlasSize,  // Atlas Width
+		m_giSystem->m_config.m_primaryAtlasSize   // Atlas Height
+	);
+}
+
+void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
+{
+	if (!m_surfaceRadiosity) 
+        return;
+	CD3DX12_RESOURCE_BARRIER preRadiosityBarriers[] = {
+		CD3DX12_RESOURCE_BARRIER::Transition(m_globalSDFTexture,
+			D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+		CD3DX12_RESOURCE_BARRIER::Transition(m_voxelLightingTexture,
+			D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+		CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_atlasTexture,D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES),
+		CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_cardMetadataBuffer,
+			D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+	};
+	m_commandList->ResourceBarrier(_countof(preRadiosityBarriers), preRadiosityBarriers);
+    
+    SurfaceRadiosityConstants constants = {};
+    constants.AtlasWidth = m_giSystem->m_config.m_primaryAtlasSize;        // 4096
+    constants.AtlasHeight = m_giSystem->m_config.m_primaryAtlasSize;      // 4096
+    constants.ProbeGridWidth = constants.AtlasWidth/4;   // 4096 / 4
+    constants.ProbeGridHeight =  constants.AtlasWidth/4;  // 4096 / 4
+    // Radiosity 追踪配置
+    constants.RaysPerProbe = RadiosityConfig::RAYS_PER_PROBE;           // 16
+    constants.ProbeSpacing = (float)RadiosityConfig::PROBE_SPACING;     // 4.0
+    constants.TraceMaxDistance = RadiosityConfig::TRACE_DISTANCE;       // 200.0
+    constants.TraceMaxSteps = RadiosityConfig::TRACE_MAX_STEPS;         // 64
+    // 追踪参数
+    constants.TraceHitThreshold = 0.02f;
+    constants.RayBias = 0.5f;
+    constants.TemporalBlendFactor = RadiosityConfig::TEMPORAL_BLEND;    // 0.05
+    constants.SkyIntensity = 0.3f;
+    // Global SDF 信息
+    AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
+    Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
+    float sceneRadius = sceneBounds.GetBoundsSize().GetLength() * 0.5f;
+    constants.GlobalSDFCenter[0] = sceneCenter.x;
+    constants.GlobalSDFCenter[1] = sceneCenter.y;
+    constants.GlobalSDFCenter[2] = sceneCenter.z;
+    constants.GlobalSDFExtent = sceneRadius;
+    
+    Vec3 invExtent = Vec3(1.0f / sceneRadius, 1.0f / sceneRadius, 1.0f / sceneRadius);
+    constants.GlobalSDFInvExtent[0] = invExtent.x;
+    constants.GlobalSDFInvExtent[1] = invExtent.y;
+    constants.GlobalSDFInvExtent[2] = invExtent.z;
+    constants.GlobalSDFResolution = GLOBAL_SDF_RESOLUTION;  // 根据你的实际 SDF 分辨率
+
+    // Voxel Lighting 场景边界 (与 InjectVoxelLighting 一致)
+    constants.SceneBoundsMin[0] = sceneBounds.m_mins.x;
+    constants.SceneBoundsMin[1] = sceneBounds.m_mins.y;
+    constants.SceneBoundsMin[2] = sceneBounds.m_mins.z;
+    constants.SceneBoundsMax[0] = sceneBounds.m_maxs.x;
+    constants.SceneBoundsMax[1] = sceneBounds.m_maxs.y;
+    constants.SceneBoundsMax[2] = sceneBounds.m_maxs.z;
+
+    constants.DepthWeightScale = 10.0f;
+    constants.NormalWeightScale = 4.0f;
+    constants.FilterRadius = 1;
+    constants.IndirectIntensity = 1.0f;
+    constants.FrameIndex = m_frameIndex;
+    constants.ActiveCardCount = m_giSystem->m_scene->m_nextCardID;
+    
+    ConstantBuffer* radiosityCB = m_constantBuffers[k_surfaceRadiosityConstantsSlot];
+    radiosityCB->AppendData(&constants, sizeof(SurfaceRadiosityConstants), 0);
+    m_surfaceRadiosity->Execute(m_commandList, radiosityCB, constants, &m_surfaceCache);
+}
+
+void DX12Renderer::CreateScreenProbeGatherResources()
+{
+	m_screenProbeFinalGather = new ScreenProbeFinalGather();
+	m_screenProbeFinalGather->Initialize(
+		m_device,
+		m_cbvSrvDescHeap,
+		m_config.m_window->GetClientDimensions().x,  
+		m_config.m_window->GetClientDimensions().y   
+	);
+}
+
+void DX12Renderer::RenderingScreenProbeGatherPass()
+{
+	if (!m_screenProbeFinalGather)
+        return;
+    ScreenProbeConstants constants = {};
+    IntVec2 screenDims = m_config.m_window->GetClientDimensions();
+    constants.ScreenWidth = screenDims.x;
+    constants.ScreenHeight = screenDims.y;
+    constants.ProbeGridWidth = (screenDims.x + 7) / 8;   // 8 像素间距
+    constants.ProbeGridHeight = (screenDims.y + 7) / 8;
+    // Probe 配置
+    constants.ProbeSpacing = SCREEN_PROBE_SPACING;           // 8
+    constants.RaysPerProbe = SCREEN_PROBE_RAYS;              // 64
+    constants.RaysTexWidth = constants.ProbeGridWidth * 8;
+    constants.RaysTexHeight = constants.ProbeGridHeight * 8;
+    // 追踪参数
+    constants.TraceMaxDistance = 100.0f;        // Mesh SDF
+    constants.TraceMaxSteps = 64;
+    constants.TraceHitThreshold = 0.02f;
+    constants.RayBias = 0.5f;
+    constants.MeshSDFTraceDistance = MESH_SDF_TRACE_DISTANCE;   // 100.0
+    constants.VoxelTraceDistance = VOXEL_TRACE_DISTANCE;        // 500.0
+    constants.TemporalBlendFactor = 0.05f;
+    constants.SkyIntensity = 0.3f;
+
+    constants.CurrentFrame = m_frameIndex;
+    constants.OctahedronSize = OCTAHEDRON_SIZE;                 // 8
+    constants.OctahedronBorder = OCTAHEDRON_BORDER;             // 1
+    constants.BorderedOctSize = BORDERED_OCTAHEDRON_SIZE;       // 10
+    
+    AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
+    Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
+    float sceneRadius = sceneBounds.GetBoundsSize().GetLength() * 0.5f;
+    constants.GlobalSDFCenter = sceneCenter;
+    constants.GlobalSDFExtent = sceneRadius;
+    
+    Vec3 invExtent = Vec3(1.0f / sceneRadius, 1.0f / sceneRadius, 1.0f / sceneRadius);
+    constants.GlobalSDFInvExtent = invExtent;
+    constants.GlobalSDFResolution = 128;
+    
+    // if (m_voxelScene.IsValid())
+    // {
+	Vec3 sceneSize = sceneBounds.GetBoundsSize();
+	float maxDim = max(sceneSize.x, max(sceneSize.y, sceneSize.z));
+	constants.VoxelSize = maxDim / (float)GLOBAL_SDF_RESOLUTION; 
+	constants.VoxelResolution = GLOBAL_SDF_RESOLUTION;
+
+	constants.DepthThreshold = 0.1f;
+	constants.PlaneDepthWeight = 10.0f;
+	constants.BRDFWeight = 0.5f;
+	constants.LightingWeight = 0.5f;
+	constants.FilterRadius = 1;
+	constants.DepthWeightScale = 10.0f;
+	constants.NormalWeightScale = 4.0f;
+	constants.AOStrength = 0.5f;
+	constants.OctTexWidth = constants.ProbeGridWidth * BORDERED_OCTAHEDRON_SIZE;
+	constants.OctTexHeight = constants.ProbeGridHeight * BORDERED_OCTAHEDRON_SIZE;
+	constants.Padding3 = 0;
+	constants.Padding4 = 0;
+    
+    constants.AtlasWidth = m_giSystem->m_config.m_primaryAtlasSize;
+    constants.AtlasHeight = m_giSystem->m_config.m_primaryAtlasSize;
+    constants.TileSize = m_giSystem->m_config.m_primaryTileSize;
+    constants.ActiveCardCount = m_giSystem->m_scene->m_nextCardID;
+	constants.CameraPosition = m_currentCam.CameraWorldPosition;
+	
+	constants.WorldToCamera = m_currentCam.WorldToCameraTransform; 
+	constants.CameraToRender = m_currentCam.CameraToRenderTransform; 
+	constants.RenderToClip = m_currentCam.RenderToClipTransform;     
+	constants.CameraToWorld = m_currentCam.WorldToCameraTransform.GetInverse(); 
+	constants.RenderToCamera = m_currentCam.CameraToRenderTransform.GetInverse(); 
+	constants.ClipToRender = m_currentCam.RenderToClipTransform.GetInverse();  
+
+	constants.PrevWorldToCamera = m_previousCam.WorldToCameraTransform;
+	constants.PrevCameraToRender = m_previousCam.CameraToRenderTransform;
+	constants.PrevRenderToClip = m_previousCam.RenderToClipTransform;
+
+	constants.IndirectIntensity = 1.0f;
+	constants.UseHistoryBufferB = m_screenProbeFinalGather->GetUseHistoryB() ? 1 : 0;
+
+	constants.CameraNear = 0.1f;
+	constants.CameraFar = 300.f;
+	m_screenProbeConstants = constants;
+    
+	ConstantBuffer* screenProbeCB = m_constantBuffers[k_screenProbeFinalGatherConstantsSlot];
+	screenProbeCB->AppendData(&constants, sizeof(ScreenProbeConstants), 0);
+
+	CD3DX12_RESOURCE_BARRIER barriers[GBUFFER_COUNT + DEPTH_SRV_COUNT];
+	for (int i = 0; i < GBUFFER_COUNT; ++i)
+	{
+		barriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(
+			m_gBuffer.GetResource(i),
+			D3D12_RESOURCE_STATE_RENDER_TARGET,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+		);
+	}
+	barriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_depthStencilBuffer,
+		D3D12_RESOURCE_STATE_DEPTH_WRITE,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE  
+	);
+	m_commandList->ResourceBarrier(GBUFFER_COUNT + DEPTH_SRV_COUNT, barriers);
+	
+	D3D12_GPU_DESCRIPTOR_HANDLE sdfSrvHandle = GetGPUDescriptorHandle(
+		m_cbvSrvDescHeap,
+		SDF_TEXTURE_SRV_BASE
+	);
+	m_screenProbeFinalGather->Execute(m_commandList, screenProbeCB, constants, sdfSrvHandle, &m_gBuffer, &m_surfaceCache);
+
+	CD3DX12_RESOURCE_BARRIER restoreBarriers[GBUFFER_COUNT + DEPTH_SRV_COUNT];
+	for (int i = 0; i < GBUFFER_COUNT; ++i)
+	{
+		restoreBarriers[i] = CD3DX12_RESOURCE_BARRIER::Transition(
+			m_gBuffer.GetResource(i),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE  // 恢复给后续 Pixel Shader 使用
+		);
+	}
+	restoreBarriers[GBUFFER_COUNT] = CD3DX12_RESOURCE_BARRIER::Transition(
+	m_depthStencilBuffer,
+	D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+	D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+);
+	m_commandList->ResourceBarrier(GBUFFER_COUNT + DEPTH_SRV_COUNT, restoreBarriers);
+}
+
+void DX12Renderer::CreateGIVisualizationResources()
+{
+	m_giVisualization = new GIVisualization();
+	m_giVisualization->Initialize(
+		m_device,
+		m_cbvSrvDescHeap,
+		m_config.m_window->GetClientDimensions().x,  
+		m_config.m_window->GetClientDimensions().y   
+	);
+}
+
+void DX12Renderer::RenderingGIVisualizationPass(const CompositeConstants& compositeConsts)
+{
+    if (!m_vizEnabled)
+        return;
+    
+    if (!m_giVisualization->IsInitialized())
+        return;
+    
+    ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
+    m_commandList->SetDescriptorHeaps(1, heaps);
+    
+    GIVisualizationMode mode = m_vizParams.Mode;
+    
+    if (IsSurfaceCacheMode(mode))
+    {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvDescHeap->GetCPUDescriptorHandleForHeapStart();
+        rtvHandle.ptr += m_frameIndex * m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart();
+
+        //float clearColor[4] = { 0.2f, 0.2f, 0.3f, 1.0f };  // 深蓝灰色
+        float clearColor[4] = { 0.f, 0.f, 0.f, 0.0f }; 
+        m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+        m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+        m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
+
+        float width = (float)m_config.m_window->GetClientDimensions().x;
+        float height = (float)m_config.m_window->GetClientDimensions().y;
+
+        D3D12_VIEWPORT viewport = { 0.0f, 0.0f, width, height, 0.0f, 1.0f };
+        D3D12_RECT scissorRect = { 0, 0, (LONG)width, (LONG)height };
+        m_commandList->RSSetViewports(1, &viewport);
+        m_commandList->RSSetScissorRects(1, &scissorRect);
+    }
+
+    m_giVisualization->Execute(
+        m_commandList,
+        m_constantBuffers[k_giVisualizationConstantsSlot],
+        m_vizParams,
+        compositeConsts,
+        m_screenProbeConstants,
+        m_currentCam,
+        &m_surfaceCache,
+        m_giSystem->m_scene->m_nextCardID
+    );
+
+    if (GIVisualization::NeedsCopyToBackBuffer(mode))
+    {
+        m_giVisualization->CopyOutputToTarget(m_commandList, m_renderTargets[m_frameIndex]);
+    }
 }
 
 void DX12Renderer::SetSamplerMode(SamplerMode samplerMode)
@@ -4242,6 +5572,7 @@ void DX12Renderer::BeginRenderPass(RenderMode renderMode, Rgba8 const& backBuffe
 	}
         
 	m_currentRenderMode = renderMode;
+	CHECK_DEVICE(); 
 }
 
 Texture* DX12Renderer::CreateTextureFromFile(char const* filePath)
@@ -4300,27 +5631,121 @@ void DX12Renderer::WaitForPreviousFrame()
 	// swap the current rtv buffer index so we draw on the correct buffer
 	//m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
-	const UINT64 fence = m_fenceValue[m_frameIndex];
-	HRESULT hr = m_commandQueue->Signal(m_fence[m_frameIndex], fence);
-	GUARANTEE_OR_DIE(SUCCEEDED(hr), "d3d12 cannot signal!");
-	//m_fenceValue[m_frameIndex]++;
-
-   // if the current  fence value is still less than "fenceValue", then we know the GPU has not finished executing
-   // the command queue since it has not reached the "commandQueue->Signal(fence, fenceValue)" command
-	if (m_fence[m_frameIndex]->GetCompletedValue() < fence)
+	const UINT64 fenceValueToSignal = m_fenceValue[m_frameIndex];
+	m_commandQueue->Signal(m_fence[m_frameIndex], fenceValueToSignal);
+	//其实没啥用
+	if (m_fence[m_frameIndex]->GetCompletedValue() < fenceValueToSignal)
 	{
-		//HRESULT hr;
-		// we have the fence create an event which is signaled once the fence's current value is "fenceValue"
-		hr = m_fence[m_frameIndex]->SetEventOnCompletion(m_fenceValue[m_frameIndex], m_fenceEvent);
-		GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12 Cannot SetEventOnCompletion!");
-
-		// We will wait until the fence has triggered the event that it's current value has reached "fenceValue". once it's value
-		// has reached "fenceValue", we know the command queue has finished executing
-		WaitForSingleObject(m_fenceEvent, INFINITE);
+		m_fence[m_frameIndex]->SetEventOnCompletion(fenceValueToSignal, m_fenceEvent);
+    
+		DWORD result = WaitForSingleObject(m_fenceEvent, 5000); // 5秒
+		if (result == WAIT_TIMEOUT) {
+			OutputDebugStringA("[TDR] GPU TIMEOUT!\n");
+			DebugBreak();
+		}
 	}
-
+	// for (auto& res : m_previousFrameTempResources)
+	// {
+	// 	DX_SAFE_RELEASE(res);
+	// }
+	// m_previousFrameTempResources.clear();
+	
 	// increment fenceValue for next frame
 	m_fenceValue[m_frameIndex]++;
+}
+
+void DX12Renderer::WaitForComputeQueue()
+{
+	if (m_computeFence->GetCompletedValue() < m_computeFenceValue)
+	{
+		char buf[128];
+		sprintf_s(buf, "[DX12] Waiting for Compute Queue (fence=%llu)...\n", m_computeFenceValue);
+		OutputDebugStringA(buf);
+        
+		HRESULT hr = m_computeFence->SetEventOnCompletion(m_computeFenceValue, m_computeFenceEvent);
+		GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to set Compute Fence event");
+        
+		DWORD waitResult = WaitForSingleObject(m_computeFenceEvent, INFINITE);
+		GUARANTEE_OR_DIE(waitResult == WAIT_OBJECT_0, "Compute Fence wait failed");
+        
+		OutputDebugStringA("[DX12] Compute Queue completed\n");
+	}
+	else
+	{
+		OutputDebugStringA("[DX12] Compute Queue already completed\n");
+	}
+}
+
+void DX12Renderer::StartupComputeQueue()
+{
+	DebuggerPrintf("[DX12] Creating Async Compute Queue...\n");
+    // 1. 创建Compute Queue
+    D3D12_COMMAND_QUEUE_DESC computeQueueDesc = {};
+    computeQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    computeQueueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    computeQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    computeQueueDesc.NodeMask = 0;
+    HRESULT hr = m_device->CreateCommandQueue(&computeQueueDesc, IID_PPV_ARGS(&m_computeQueue));
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Compute Queue");
+    m_computeQueue->SetName(L"Async Compute Queue");
+    // 2. 创建Compute Allocator
+    hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, 
+                                          IID_PPV_ARGS(&m_computeAllocator));
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Compute Allocator");
+    m_computeAllocator->SetName(L"Compute Allocator");
+    // 3. 创建Compute CommandList
+    hr = m_device->CreateCommandList(0, 
+                                      D3D12_COMMAND_LIST_TYPE_COMPUTE, 
+                                      m_computeAllocator, 
+                                      nullptr, 
+                                      IID_PPV_ARGS(&m_computeCommandList));
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Compute CommandList");
+    m_computeCommandList->SetName(L"Compute CommandList");
+    // 必须Close一次才能后续Reset
+    m_computeCommandList->Close();
+    // 4. 创建Compute Fence
+    hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_computeFence));
+    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Compute Fence");
+    m_computeFence->SetName(L"Compute Fence");
+    // 5. 创建Fence Event
+    m_computeFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    GUARANTEE_OR_DIE(m_computeFenceEvent != nullptr, "Failed to create Compute Fence Event");
+	size_t alignedSize = AlignUp(sizeof(SDFGenerationConstants), 256);
+	//size_t totalBufferSize = alignedSize * 256;
+	m_computeConstantBuffer = new ConstantBuffer(alignedSize, sizeof(SDFGenerationConstants));
+	D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(alignedSize);
+	D3D12_HEAP_PROPERTIES properties = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+	hr = m_device->CreateCommittedResource(
+		&properties,
+		D3D12_HEAP_FLAG_NONE,
+		&resourceDesc,
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&m_computeConstantBuffer->m_dx12ConstantBuffer)
+	);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create compute constant buffer!");
+	CD3DX12_RANGE range(0, 0);
+	hr = m_computeConstantBuffer->m_dx12ConstantBuffer->Map(0, &range,
+		reinterpret_cast<void**>(&m_computeConstantBuffer->m_mappedPtr));
+	m_computeConstantBuffer->m_dx12ConstantBuffer->SetName(L"ComputeConstantBuffer");
+    m_computeFenceValue = 0;
+    DebuggerPrintf("[DX12] Async Compute Queue created successfully\n");
+}
+
+void DX12Renderer::ShutdownComputeQueue()
+{
+	if (m_computeFenceEvent)
+	{
+		CloseHandle(m_computeFenceEvent);
+		m_computeFenceEvent = nullptr;
+	}
+	DX_SAFE_RELEASE(m_computeFence);
+	DX_SAFE_RELEASE(m_computeCommandList);
+	DX_SAFE_RELEASE(m_computeAllocator);
+	DX_SAFE_RELEASE(m_computeQueue);
+	delete m_computeConstantBuffer;
+	m_computeConstantBuffer = nullptr;
+	DebuggerPrintf("[DX12] Async Compute Queue released\n");
 }
 
 void DX12Renderer::ImGuiStartUp()
@@ -4353,18 +5778,15 @@ void DX12Renderer::ImGuiStartUp()
 	int width, height;
 	io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
 
-	// 手动调用一次NewFrame来初始化渲染器状态
 	ImGui_ImplDX12_NewFrame();
 }
-
 void DX12Renderer::ImGuiBeginFrame()
 {
 	ImGui_ImplDX12_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
-	//ImGui::ShowDemoWindow();
+	// GI Visualization 的控制已移至游戏代码，通过公共接口调用
 }
-
 void DX12Renderer::ImGuiEndFrame()
 {
 	ID3D12DescriptorHeap* heaps[] = { m_imguiSrvDescHeap };
@@ -4373,7 +5795,6 @@ void DX12Renderer::ImGuiEndFrame()
 	ImGui::Render();
 	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_commandList);
 }
-
 void DX12Renderer::ImGuiShutDown()
 {
 	ImGui_ImplDX12_Shutdown();
@@ -4381,38 +5802,36 @@ void DX12Renderer::ImGuiShutDown()
 	ImPlot::DestroyContext();
 	ImGui::DestroyContext();
 }
-
 size_t DX12Renderer::GetConstantBufferSize(int cbSlot)
 {
 	if (cbSlot == k_modelConstantsSlot)
-	{
 		return sizeof(ModelConstants);
-	}
 	if (cbSlot == k_cameraConstantsSlot)
-	{
 		return sizeof(CameraConstants);
-	}
 	if (cbSlot == k_perFrameConstantsSlot)
-	{
 		return sizeof(PerFrameConstants);
-	}
 	if (cbSlot == k_materialConstantsSlot)
-	{
 		return sizeof(MaterialConstants);
-	}
 	if (cbSlot == k_generalLightConstantsSlot)
-	{
 		return sizeof(GeneralLightConstants);
-	}
-	if (cbSlot == k_surfaceCacheConstantsSlot)
-	{
-		return sizeof(SurfaceCacheConstants);
-	}
-	if (cbSlot == k_passConstantsSlot)
-	{
-		return sizeof(PassModeConstants);
-	}
+	// if (cbSlot == k_surfaceCacheConstantsSlot)
+	// 	return sizeof(SurfaceCacheConstants);
+	// if (cbSlot == k_passConstantsSlot)
+	// 	return sizeof(PassModeConstants);
 	return 64;
 }
 
+bool DX12Renderer::RenderGIVisualizationImGuiPanel()
+{
+	if (!m_config.m_enableGI)
+		return false;
+
+	if (!m_vizEnabled)
+		return false;
+
+	if (!m_giVisualization || !m_giVisualization->IsInitialized())
+		return false;
+
+	return m_giVisualization->RenderImGuiPanel(m_vizParams);
+}
 #endif

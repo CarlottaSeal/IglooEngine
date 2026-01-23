@@ -7,6 +7,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
+#include "ThirdParty/ImGui/imgui.h"
+
 extern InputSystem* g_theInput;
 extern Window* g_theWindow;
 
@@ -35,6 +37,8 @@ unsigned char const KEYCODE_LEFTCONTROL = VK_CONTROL;
 unsigned char const KEYCODE_RIGHTCONTROL = VK_CONTROL;
 unsigned char const KEYCODE_ENTER = VK_RETURN;
 unsigned char const KEYCODE_BACKSPACE = VK_BACK;
+unsigned char const KEYCODE_TAB = VK_TAB;
+unsigned char const KEYCODE_SPACE = VK_SPACE;
 unsigned char const KEYCODE_INSERT = VK_INSERT;
 unsigned char const KEYCODE_DELETE = VK_DELETE;
 unsigned char const KEYCODE_HOME = VK_HOME;
@@ -77,6 +81,8 @@ void InputSystem::Shutdown()
 
 void InputSystem::BeginFrame()
 {
+	m_cursorState.m_mouseWheelDelta = 0.f;
+	
 	CURSORINFO cursorInfo = {}; // 检查当前光标状态
 	cursorInfo.cbSize = sizeof(CURSORINFO);
 	GetCursorInfo(&cursorInfo);
@@ -244,5 +250,33 @@ Vec2 InputSystem::GetCursorClientPosition() const
 Vec2 InputSystem::GetCursorNormalizedPosition() const
 {
 	return g_theWindow->GetNormalizedMouseUV();
+}
+
+float InputSystem::GetMouseWheelDelta() const
+{
+	return m_cursorState.m_mouseWheelDelta;
+}
+
+void InputSystem::AddMouseWheelDelta(float delta)
+{
+	m_cursorState.m_mouseWheelDelta += delta;
+}
+
+bool InputSystem::ShouldIgnoreMouseInput() const
+{
+	if (ImGui::GetCurrentContext() == nullptr)
+	{
+		return false;
+	}
+	return ImGui::GetIO().WantCaptureMouse;
+}
+
+bool InputSystem::ShouldIgnoreKeyboardInput() const
+{
+	if (ImGui::GetCurrentContext() == nullptr)
+	{
+		return false;
+	}
+	return ImGui::GetIO().WantCaptureKeyboard;
 }
 

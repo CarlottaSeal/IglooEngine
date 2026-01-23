@@ -43,7 +43,8 @@ Camera* Canvas::GetCamera() const
 
 void Canvas::AddElementToCanvas(UIElement* element)
 {
-	for (auto & i : m_uiElementsList)
+	//for (auto & i : m_uiElementsList)
+	for (auto & i : m_children)
 	{
 		if (!i)
 		{
@@ -51,7 +52,7 @@ void Canvas::AddElementToCanvas(UIElement* element)
 			return;
 		}
 	}
-	m_uiElementsList.push_back(element);
+	m_children.push_back(element);
 }
 
 void Canvas::StartUp()

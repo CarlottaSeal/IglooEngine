@@ -12,17 +12,11 @@
 #include "Engine/Math/IntVec2.hpp"
 #include <vector>
 
-// #define DX_SAFE_RELEASE(dxObject)\
-// {\
-//     if ((dxObject) != nullptr)\
-//     {\
-//         (dxObject)->Release();\
-//         (dxObject) = nullptr;\
-//     }\
-// }\
-
 class DX11Renderer;
 class DX12Renderer;
+#ifdef ENGINE_VULKAN_RENDERER
+class VulkanRenderer;
+#endif
 
 class Window;
 class BitmapFont;
@@ -44,49 +38,6 @@ struct ID3D11Texure2D;
 struct ID3D11DepthStencilView;
 struct ID3D11DepthStencilState;
 
-// #if defined(OPAQUE)
-// #undef OPAQUE
-// #endif
-//
-// enum class BlendMode
-// {
-//     ALPHA,
-//     ADDITIVE,
-//     OPAQUE,
-//     COUNT
-// };
-//
-// enum class SamplerMode
-// {
-//     POINT_CLAMP,
-//     BILINEAR_WRAP,
-//     COUNT
-// };
-//
-// enum class RasterizerMode
-// {
-//     SOLID_CULL_NONE,
-//     SOLID_CULL_BACK,
-//     WIREFRAME_CULL_NONE,
-//     WIREFRAME_CULL_BACK,
-//     COUNT
-// };
-//
-// enum class DepthMode
-// {
-//     DISABLED,
-//     READ_ONLY_ALWAYS,
-//     READ_ONLY_LESS_EQUAL,
-//     READ_WRITE_LESS_EQUAL,
-//     COUNT
-// };
-//
-// enum class VertexType
-// {
-//     VERTEX_PCU,
-//     VERTEX_PCUTBN,
-//     COUNT
-// };
 #if defined(ENGINE_DEBUG_RENDER)
     extern void* m_dxgiDebug;
     extern void* m_dxgiDebugModule;
@@ -240,6 +191,13 @@ public:
 			return m_dx12Renderer;
 		}
 #endif
+#ifdef ENGINE_VULKAN_RENDERER
+		VulkanRenderer* GetSubRenderer()
+		{
+			return m_vulkanRenderer;
+		}
+#endif
+
 public:
 		RendererConfig m_config;
 
@@ -250,71 +208,10 @@ protected:
 #ifdef ENGINE_DX12_RENDERER
     DX12Renderer* m_dx12Renderer = nullptr;
 #endif
+#ifdef ENGINE_VULKAN_RENDERER
+    VulkanRenderer* m_vulkanRenderer = nullptr;
+#endif
 
 private:
-    //void* m_windowHandle = nullptr; 
-
-    //void* m_apiRenderingContext = nullptr;
-
-
-//    std::vector<Texture*> m_loadedTextures;
-//
-//    std::vector<BitmapFont*> m_loadedFonts;
-//
-//	//Create variables to store DirectX state
-//	ID3D11Device* m_device = nullptr;
-//	ID3D11DeviceContext* m_deviceContext = nullptr;
-//	IDXGISwapChain* m_swapChain = nullptr;
-//	ID3D11RenderTargetView* m_renderTargetView = nullptr;
-//
-//    std::vector<Shader*> m_loadedShaders;
-//    Shader* m_currentShader = nullptr;
-//    Shader* m_defaultShader = nullptr;
-//
-//    //Vertex Buffer variable
-//    VertexBuffer* m_immediateVBO = nullptr;
-//    VertexBuffer* m_immediateVBOForVertex_PCUTBN = nullptr;
-//
-//    //Index Buffer variable
-//    IndexBuffer* m_immediateIBO = nullptr;
-//
-//    //Camera Constant Buffer variable
-//    ConstantBuffer* m_cameraCBO = nullptr;
-//	ConstantBuffer* m_modelCBO = nullptr;
-//	ConstantBuffer* m_generalLightCBO = nullptr;
-//#ifdef ENGINE_PAST_VERSION_LIGHTS
-//    ConstantBuffer* m_lightCBO = nullptr;
-//    ConstantBuffer* m_pointLightCBO = nullptr;
-//    ConstantBuffer* m_spotLightCBO = nullptr;
-//#endif
-//    ConstantBuffer* m_shadowCBO = nullptr;
-//	ConstantBuffer* m_perFrameCBO = nullptr;
-//
-//    //State-related variables
-//    ID3D11BlendState* m_blendState = nullptr;
-//    BlendMode m_desiredBlendMode = BlendMode::ALPHA;
-//    ID3D11BlendState* m_blendStates[(int)(BlendMode::COUNT)] = {};
-//
-//    const Texture* m_defaultTexture = nullptr;
-//
-//    SamplerMode m_desiredSamplerMode = SamplerMode::POINT_CLAMP;
-//    ID3D11SamplerState* m_samplerState = nullptr;
-//    ID3D11SamplerState* m_samplerStates[(int)(SamplerMode::COUNT)] = {};
-//
-//    RasterizerMode m_desiredRasterizerMode = RasterizerMode::SOLID_CULL_BACK;
-//	ID3D11RasterizerState* m_rasterizerState = nullptr;
-//    ID3D11RasterizerState* m_rasterizerStates[(int)(RasterizerMode::COUNT)] = {};
-//
-//    ID3D11Texture2D* m_depthStencilTexture = nullptr;
-//    ID3D11DepthStencilView* m_depthStencilDSV = nullptr;
-//
-//    ID3D11Texture2D* m_shadowDepthTexture = nullptr;  // Shadow Map
-//	ID3D11DepthStencilView* m_shadowDSV = nullptr;
-//    ID3D11ShaderResourceView* m_shadowSRV = nullptr;
-//    Shader* m_shadowPassShader = nullptr;
-//
-//    DepthMode m_desiredDepthMode = DepthMode::READ_WRITE_LESS_EQUAL;
-//    ID3D11DepthStencilState* m_depthStencilState = nullptr;
-//    ID3D11DepthStencilState* m_depthStencilStates[(int)(DepthMode::COUNT)] = {};
 
 };

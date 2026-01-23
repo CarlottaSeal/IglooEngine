@@ -60,6 +60,16 @@ Vec2 const AABB2::GetBottomCenter() const
 	return (m_mins + m_maxs)/2.f - Vec2(0.f, GetHeight() / 2.f);
 }
 
+Vec2 const AABB2::GetBottomRight() const
+{
+	return Vec2(m_maxs.x, m_mins.y);
+}
+
+Vec2 const AABB2::GetTopLeft() const
+{
+	return Vec2(m_mins.x, m_maxs.y);
+}
+
 Vec2 const AABB2::GetNearestPoint(Vec2 const& uv) const
 {
 	float nearestX = GetClamped(uv.x, m_mins.x, m_maxs.x);

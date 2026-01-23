@@ -1,7 +1,5 @@
 ﻿#include "Scene.h"
 
-#include "SDF/SDFCommon.h"
-#include "SDF/SDFGenerator.h"
 #include "Object/Mesh/MeshObject.h"
 
 #include "Engine/Core/EngineCommon.hpp"
@@ -10,6 +8,7 @@
 #include "Engine/Renderer/Cache/SurfaceCard.h"
 #include "Engine/Renderer/GI/GISystem.h"
 #include <algorithm>
+#include <utility>
 
 Scene::Scene(SceneConfig const config)
     : m_config(config)
@@ -48,70 +47,10 @@ void Scene::InitializeRoughly()
     m_opaqueRenderItems.reserve(1000);
 }
 
-void Scene::RegisterObjectSDF(uint32_t objectID, const Mat44& worldTransform)
+void Scene::InitializeBoundsAndMeshSDF()
 {
-    SDFInstance instance;
-    //instance.m_sdf = sdf;
-    instance.m_worldTransform = worldTransform;
-    instance.m_inverseTransform = worldTransform.GetOrthonormalInverse();
-    m_sdfInstances[objectID] = instance;
-}
-
-float Scene::QuerySDF(const Vec3& worldPos)
-{
-    float minDistance = FLT_MAX;
-    
-    for (const auto& [objectID, instance] : m_sdfInstances)
-    {
-        Vec3 localPos = instance.m_inverseTransform.TransformPosition3D(worldPos);
-        
-        float dist = instance.Sample(localPos);
-        
-        minDistance = MinF(minDistance, dist);
-    }
-    
-    return minDistance;
-}
-
-RaycastResult3D Scene::RaycastWithSDF(const Vec3& origin, const Vec3& direction, float maxDistance) //TODO: 这方法的效率？
-{
-    RaycastResult3D result;
-    
-    const float EPSILON = 0.001f;
-    const int MAX_STEPS = 128;
-    
-    float t = 0.0f;
-    
-    for (int i = 0; i < MAX_STEPS && t < maxDistance; ++i)
-    {
-        Vec3 pos = origin + direction * t;
-        
-        float dist = QuerySDF(pos);
-        
-        if (dist < EPSILON)
-        {
-            result.m_didImpact = true;
-            result.m_impactDist = t;
-            result.m_impactPos = pos;
-            
-            // 计算法线（通过梯度）
-            const float h = 0.01f;
-            Vec3 n;
-            n.x = QuerySDF(pos + Vec3(h, 0, 0)) - QuerySDF(pos - Vec3(h, 0, 0));
-            n.y = QuerySDF(pos + Vec3(0, h, 0)) - QuerySDF(pos - Vec3(0, h, 0));
-            n.z = QuerySDF(pos + Vec3(0, 0, h)) - QuerySDF(pos - Vec3(0, 0, h));
-            result.m_impactNormal = n.GetNormalized();
-            
-            // 找到击中的物体ID
-            result.m_objectID = FindClosestObject(pos);
-            break;
-        }
-        
-        // 前进
-        t += dist;
-    }
-    
-    return result;
+    UpdateSceneBounds();
+    BuildMeshSDFInfos();
 }
 
 void Scene::Update(float deltaTime)
@@ -213,12 +152,17 @@ LightObject* Scene::CreateLightEntity(const std::string& name, LightObjectType t
         spotForward, innerRadius, outerRadius, innerDotThreshold, outerDotThreshold);
     LightObject* ptr = entity.get();
 
-    entity->OnCreate(this);
     m_objects[id] = std::move(entity);
-    
-    AddObjectToLists(ptr);
-    //OnLightObjectTransformChanged(id, true); <-取消这个接口了
+    AddObjectToLists(ptr);      // 先添加到列表，这会调用 ReassignLightIDs() 设置 m_generalLightID
+    ProduceLightVariables();    // 填充光源数据到数组（m_worldLightPositions, m_lightColors 等）
+    ptr->OnCreate(this);        // 然后再 OnCreate，这样 UpdateAffectedCards 中 m_generalLightID 已经有效
+
     return ptr;
+}
+
+void Scene::UpdateCardMetadata()
+{
+    m_config.m_giSystem->UpdateCardMetadata();
 }
 
 void Scene::DestroyObject(uint32_t entityID)
@@ -280,21 +224,22 @@ const SceneObject* Scene::GetSceneObject(uint32_t entityID) const
     return nullptr;
 }
 
-uint32_t Scene::FindClosestObject(const Vec3& pos)
+uint32_t Scene::FindClosestObject(const Vec3& pos) //TODO：没用
 {
-    float minDist = FLT_MAX;
+    UNUSED(pos)
+    //float minDist = FLT_MAX;
     uint32_t closestID = UINT32_MAX;
     
-    for (const auto& [id, instance] : m_sdfInstances)
-    {
-        Vec3 localPos = instance.m_inverseTransform.TransformPosition3D(pos);
-        float dist = instance.Sample(localPos);
-        if (dist < minDist)
-        {
-            minDist = dist;
-            closestID = id;
-        }
-    }
+    // for (const auto& [id, instance] : m_sdfInstances)
+    // {
+    //     Vec3 localPos = instance.m_inverseTransform.TransformPosition3D(pos);
+    //     float dist = instance.Sample(localPos);
+    //     if (dist < minDist)
+    //     {
+    //         minDist = dist;
+    //         closestID = id;
+    //     }
+    // }
     return closestID;
 }
 
@@ -406,9 +351,15 @@ std::vector<uint32_t> Scene::RegisterLightInfluence(uint32_t lightID, const AABB
                 if (dot < light->m_outerDotThresholds)
                     continue;
             }
-            
-            uint32_t wordIndex = lightID / 32;
-            uint32_t bitIndex = lightID & 31;
+
+            // 使用 generalLightID（在 LightsArray 中的索引）而不是 scene object ID
+            // 这样才能与 shader 中的 lightIndex 对应
+            int generalLightID = light->m_generalLightID;
+            if (generalLightID < 0)  // 方向光没有 generalLightID，跳过
+                continue;
+
+            uint32_t wordIndex = generalLightID / 32;
+            uint32_t bitIndex = generalLightID & 31;
             instance->m_lightMask[wordIndex] |= (1u << bitIndex);
             
             instance->m_isDirty = true;
@@ -919,6 +870,80 @@ void Scene::EvictLowPriorityCards_Tiered()
 #endif
 }
 
+void Scene::UpdateSceneBounds()
+{
+    CalculateSceneBounds();
+    m_needsRebuildGlobalLighting = true;
+}
+
+void Scene::CalculateSceneBounds()
+{
+     Vec3 mins = Vec3(FLT_MAX, FLT_MAX, FLT_MAX);
+     Vec3 maxs = Vec3(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+    
+     if (m_meshObjects.empty())
+     {
+         m_sceneBounds = AABB3(Vec3(-1.f, -1.f, -1.f), Vec3(1.f, 1.f, 1.f));
+         return;
+     }
+    
+     for (MeshObject* meshObj : m_meshObjects)
+     {
+         if (meshObj == nullptr)
+             continue;
+         
+         AABB3 bounds = meshObj->GetWorldBounds();
+     
+         mins.x = (bounds.m_mins.x < mins.x) ? bounds.m_mins.x : mins.x;
+         mins.y = (bounds.m_mins.y < mins.y) ? bounds.m_mins.y : mins.y;
+         mins.z = (bounds.m_mins.z < mins.z) ? bounds.m_mins.z : mins.z;
+     
+         maxs.x = (bounds.m_maxs.x > maxs.x) ? bounds.m_maxs.x : maxs.x;
+         maxs.y = (bounds.m_maxs.y > maxs.y) ? bounds.m_maxs.y : maxs.y;
+         maxs.z = (bounds.m_maxs.z > maxs.z) ? bounds.m_maxs.z : maxs.z;
+     }
+    
+     m_sceneBounds = AABB3(mins, maxs);
+}
+
+void Scene::BuildMeshSDFInfos()
+{
+    //return;
+    m_meshInfos.clear();
+    
+    for (MeshObject* meshObj : m_meshObjects)
+    {
+        StaticMesh* mesh = meshObj->GetMesh();
+        SDFTexture3D* sdf = mesh->GetSDF(meshObj->GetScale());
+        if (sdf->GetSDFTextureIndex() == UINT32_MAX)
+            continue;
+        
+        MeshSDFInfoGPU info = {};
+        Mat44 worldTransform = meshObj->GetWorldMatrixWithoutScaling();
+        info.LocalToWorld = worldTransform;
+        info.WorldToLocal = worldTransform.GetOrthonormalInverse();
+        info.SDFTextureIndex = sdf->GetSDFTextureIndex(); //bindless的索引，而非srvHeap中的索引
+        info.LocalToWorldScale = meshObj->GetScale();
+        AABB3 bounds = meshObj->GetMesh()->GetScaledBounds(1.f); //TODO
+        info.LocalBoundsMin = bounds.m_mins;
+        info.LocalBoundsMax = bounds.m_maxs;
+
+        info.CardCount = (uint32_t)meshObj->m_cardInstances.size();
+        info.CardStartIndex = meshObj->m_cardInstances[0].m_surfaceCardId;
+        // //Test
+        // Vec3 meshWorldCenter = meshObj->GetPosition();
+        // Vec3 localPos = info.WorldToLocal.TransformPosition3D(meshWorldCenter);
+        // DebuggerPrintf("Mesh world center: (%.3f, %.3f, %.3f)\n", meshWorldCenter.x, meshWorldCenter.y, meshWorldCenter.z);
+        // DebuggerPrintf("LocalPos after transform: (%.3f, %.3f, %.3f)\n", localPos.x, localPos.y, localPos.z);
+        // DebuggerPrintf("LocalBounds: (%.3f, %.3f, %.3f) to (%.3f, %.3f, %.3f)\n", 
+        //        bounds.m_mins.x, bounds.m_mins.y, bounds.m_mins.z,
+        //        bounds.m_maxs.x, bounds.m_maxs.y, bounds.m_maxs.z);
+        
+        m_meshInfos.push_back(info);
+    }
+    DebuggerPrintf("[Scene] Built %zu instance SDF infos\n", m_meshInfos.size());
+}
+
 void Scene::EvictLowPriorityCards_Advanced(uint32_t targetTilesToFree)
 {
 #ifdef ENGINE_DX12_RENDERER
@@ -1037,7 +1062,7 @@ void Scene::RegisterMeshObjectForGI(MeshObject* object)
 
     StaticMesh* mesh = object->GetMesh();
     uint32_t objectID = object->GetID();
-    //float objectScale = object->GetScale();
+    //float objectScale = object->GetScale(); TODO
 
     std::vector<uint32_t> surfaceCardIDs;
     for (size_t i = 0; i < mesh->m_cardTemplates.size(); i++)
@@ -1076,68 +1101,9 @@ void Scene::RegisterMeshObjectForGI(MeshObject* object)
             m_dirtyCardIDs.push_back(card->m_globalCardID);
         }
     }
-
-#ifdef ENGINE_DX12_RENDERER
-    SDFTexture3D* existingSDF = mesh->GetSDF(objectScale);
-    
-    if (!existingSDF || existingSDF->GetSRVDescriptorIndex() == UINT32_MAX)
-    {
-        DebuggerPrintf("[Scene] Generating SDF for scale=%.1f\n", objectScale);
-        
-        if (!mesh->HasBVH(objectScale))
-        {
-            DebuggerPrintf("[Scene] Building BVH for scale=%.1f\n", objectScale);
-            mesh->BuildBVH(objectScale);
-        }
-        
-        const BVH* bvh = mesh->GetBVH(objectScale);
-        if (!bvh)
-        {
-            DebuggerPrintf("[Scene] ERROR: Failed to get BVH for scale=%.1f\n", objectScale);
-            return;
-        }
-        
-        // 生成scaled vertices和bounds
-        std::vector<Vertex_PCUTBN> scaledVerts = mesh->GetScaledAndTransformedVertices(objectScale);
-        AABB3 scaledBounds = mesh->GetScaledBounds(objectScale);
-        
-        DebuggerPrintf("[Scene] Scaled bounds: min(%.2f, %.2f, %.2f) max(%.2f, %.2f, %.2f)\n",
-                       scaledBounds.m_mins.x, scaledBounds.m_mins.y, scaledBounds.m_mins.z,
-                       scaledBounds.m_maxs.x, scaledBounds.m_maxs.y, scaledBounds.m_maxs.z);
-        
-        // 在GPU上生成SDF
-        SDFTexture3D* sdfTex = m_config.m_renderer->GetSubRenderer()->GenerateSDFOnGPU(
-            scaledVerts,
-            mesh->m_indices,
-            *bvh,
-            scaledBounds,
-            64  // SDF resolution TODO!!!!
-        );
-        
-        if (!sdfTex)
-        {
-            DebuggerPrintf("[Scene] ERROR: Failed to generate SDF\n");
-            return;
-        }
-        
-        mesh->SetSDF(objectScale, sdfTex);
-        existingSDF = sdfTex;
-        
-        DebuggerPrintf("[Scene] SDF generated (SRV index=%u)\n",
-                       sdfTex->GetSRVDescriptorIndex());
-    }
-    else
-    {
-        DebuggerPrintf("[Scene] Reusing existing SDF (SRV index=%u)\n",
-                       existingSDF->GetSRVDescriptorIndex());
-    }
-#endif
     
     GIObjectEntry entry;
     entry.m_objectID = objectID;
-#ifdef ENGINE_DX12_RENDERER
-    entry.m_sdfSRVIndex = existingSDF->GetSRVDescriptorIndex();
-#endif
     entry.m_worldTransform = object->GetWorldMatrix();
     entry.m_worldBounds = object->GetWorldBounds();
     entry.m_lastUpdateFrame = m_currentFrame;
@@ -1165,6 +1131,9 @@ void Scene::RegisterMeshObjectForGI(MeshObject* object)
 
     DebuggerPrintf("[Scene] GI registration complete for object %u (%zu cards)\n",
                    objectID, surfaceCardIDs.size());
+#ifdef ENGINE_DX11_RENDERER
+    //UNUSED(objectScale);
+#endif
 }
 
 void Scene::UnregisterMeshObjectFromGI(uint32_t objectID)
@@ -1228,15 +1197,20 @@ void Scene::RegisterCardsToLightSystem(uint32_t objectID)
                     continue;
             }
             
-            uint32_t lightID = light->GetID();
-            uint32_t wordIndex = lightID / 32;
-            uint32_t bitIndex = lightID & 31;
+            // 使用 generalLightID（在 LightsArray 中的索引）而不是 scene object ID
+            int generalLightID = light->m_generalLightID;
+            if (generalLightID < 0)  // 方向光没有 generalLightID，跳过
+                continue;
+
+            uint32_t wordIndex = generalLightID / 32;
+            uint32_t bitIndex = generalLightID & 31;
             instance->m_lightMask[wordIndex] |= (1u << bitIndex);
-            
+
+            uint32_t lightID = light->GetID();
             m_cardToLightObjects[cardID].push_back(lightID);
             light->m_affectedCards.push_back(cardID);
-            
-            DebuggerPrintf("[Scene]   Light %u affects card %u\n", lightID, cardID);
+
+            DebuggerPrintf("[Scene]   Light %u (arrayIndex %d) affects card %u\n", lightID, generalLightID, cardID);
         }
         
         instance->m_isDirty = true;
@@ -1437,7 +1411,7 @@ SurfaceCard* Scene::GetOrCreateSurfaceCard(uint32_t objectID, uint32_t templateI
     card->m_meshObjectID = objectID;
     card->m_templateIndex = templateIndex;
     
-    // 从模板获取推荐分辨率
+    // 从模板获取推荐分辨率 ->TODO：生成不同分辨率的card
     const SurfaceCardTemplate& templ = mesh->m_cardTemplates[templateIndex];
     card->m_pixelResolution = templ.m_recommendedResolution;
     

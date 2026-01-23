@@ -39,7 +39,7 @@ protected:
     
 protected:
     LightObjectType m_lightType;
-    int m_generalLightID;
+    int m_generalLightID = -1;  // -1 表示未分配（方向光或尚未注册）
     Vec3 m_sunDirection;
     Rgba8 m_sunColor;
     Rgba8 m_lightColor;

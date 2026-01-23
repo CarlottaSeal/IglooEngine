@@ -36,11 +36,13 @@ public:
     void ResetStatus(); //except enabled
 
     void InitializeVerts();
+
+public:
+    std::vector<UIElement*> m_children;
     
 protected:
     UIElement* m_parent;
     ElementType m_type;
-    std::vector<UIElement*> m_children;
 
     AABB2 m_bound;
 

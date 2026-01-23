@@ -6,6 +6,7 @@
 #include "Plane3.h"
 #include "Vec3.hpp"
 
+struct IntVec3;
 struct Vec2;
 struct Vec3;
 struct Vec4;
@@ -74,6 +75,7 @@ float GetDistanceSquared3D(Vec3 const& positionA, Vec3 const& positionB);
 float GetDistanceXY3D(Vec3 const& positionA, Vec3 const& positionB);
 float GetDistanceXYSquared3D(Vec3 const& positionA, Vec3 const& positionB);
 int GetTaxicabDistance2D( IntVec2 const& pointA, IntVec2 const& pointB);
+int GetTaxicabDistance3D( IntVec3 const& pointA, IntVec3 const& pointB);
 float GetProjectedLength2D( Vec2 const& vectorToProject, Vec2 const& vectorToProjectOnto );
 Vec2 const GetProjectedOnto2D(Vec2 const& vectorToProject, Vec2 const& vectorToProjectOnto );
 

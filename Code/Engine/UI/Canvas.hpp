@@ -22,9 +22,8 @@ public:
 	Camera* GetCamera() const;
 
 	void AddElementToCanvas(UIElement* element);
-
-
-	std::vector<UIElement*> m_uiElementsList;
+	
+	//std::vector<UIElement*> m_uiElementsList;
 
 protected:
 	Camera* m_camera = nullptr;

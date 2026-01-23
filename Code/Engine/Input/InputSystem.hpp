@@ -28,6 +28,8 @@ extern unsigned char const  KEYCODE_LEFTCONTROL;
 extern unsigned char const KEYCODE_RIGHTCONTROL;
 extern unsigned char const KEYCODE_ENTER;
 extern unsigned char const KEYCODE_BACKSPACE;
+extern unsigned char const KEYCODE_TAB;
+extern unsigned char const KEYCODE_SPACE;
 extern unsigned char const KEYCODE_INSERT;
 extern unsigned char const KEYCODE_DELETE;
 extern unsigned char const KEYCODE_HOME;
@@ -51,7 +53,7 @@ struct CursorState
 {
 	IntVec2 m_cursorClientDelta;
 	IntVec2 m_cursorClientPosition;
-
+	float      m_mouseWheelDelta      = 0.f; 
 	CursorMode m_cursorMode = CursorMode::POINTER;
 };
 
@@ -91,10 +93,17 @@ public:
 	//with the y-axis inverted to map from Windows conventions to game screen camera conventions
 	Vec2 GetCursorNormalizedPosition() const;
 
+	float GetMouseWheelDelta() const;
+	void AddMouseWheelDelta(float delta);   // 从 Window/消息回调里调用
+
+	bool ShouldIgnoreMouseInput() const;
+	bool ShouldIgnoreKeyboardInput() const;
+	
+public:
 	CursorState m_cursorState;
 	bool m_isCursorVisible = false;
 	Vec2 m_prevCursorClientPosition;
-
+	
 protected:
 	KeyButtonState m_keystates[NUM_KEYCODES];
 	XboxController m_controllers[NUM_XBOX_CONTROLLERS];

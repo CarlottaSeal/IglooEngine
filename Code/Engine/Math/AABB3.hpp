@@ -17,9 +17,12 @@ public:
 
 	Vec3 GetBoundsSize() const;
 	float GetVolume() const;
+	Vec3 GetCenter() const;
 	std::vector<Vec3> GetCorners() const;
 
 	bool IsPointInside(const Vec3& point);
 	void StretchToIncludePoint(const Vec3& point);
 	void StretchToIncludeAABB(const AABB3& other);
+
+	void Translate(const Vec3& translation);
 };

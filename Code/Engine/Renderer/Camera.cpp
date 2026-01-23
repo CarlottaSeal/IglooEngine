@@ -238,7 +238,7 @@ void Camera::UpdateFrustum()
 	// 对于列主序矩阵，Append实现的是右乘
 	// 结果: viewProj = proj * view
 	Mat44 viewProj = proj;
-    viewProj.Append(proj);  
+    viewProj.Append(view);  
 
 	// 直接从ViewProjection矩阵提取frustum平面
 	m_frustum = Frustum::FromViewProjectionMatrix(viewProj, this);

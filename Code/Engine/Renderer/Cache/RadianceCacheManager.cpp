@@ -95,13 +95,14 @@ void RadianceCacheManager::PlaceProbesScreenSpace(
     const Camera& camera,
     const GBufferData& gbuffer)
 {
+    UNUSED(gbuffer);
     // ========== 屏幕空间采样 ==========
     // 在屏幕上每隔 N 个像素采样一次深度，放置 Probe
 
     AABB2 cameraBounds = camera.GetOrthographicBounds();
     Vec2 cameraSize = cameraBounds.GetDimensions();
-    uint32_t screenWidth = cameraSize.x;
-    uint32_t screenHeight = cameraSize.y;
+    uint32_t screenWidth = (uint32_t)cameraSize.x;
+    uint32_t screenHeight = (uint32_t)cameraSize.y;
     uint32_t sampleStep = 32;  // 每 32 像素采样一次 TODO
     
     Mat44 viewProjInverse = camera.GetProjectionMatrix();

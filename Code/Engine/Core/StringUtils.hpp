@@ -17,4 +17,6 @@ Strings SplitStringOnDelimiter(std::string const& originalString, char delimiter
 std::string ReplaceAll(std::string str, const std::string& from, const std::string& to);
 void EraseEmptyStrings(Strings& tokens);
 
+std::string JoinStrings(const Strings& tokens, size_t startIndex, const std::string& delimiter = " ");
+
 

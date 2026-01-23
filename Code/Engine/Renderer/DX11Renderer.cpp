@@ -1413,10 +1413,10 @@ void DX11Renderer::SetModelConstants(const Mat44& modelToWorldTransform, const R
 	BindConstantBuffer(k_modelConstantsSlot, m_modelCBO);
 }
 
-void DX11Renderer::SetShadowConstants(const Mat44& lightViewProjectionMatrix)
+void DX11Renderer::SetShadowConstants(const Mat44& lightViewProjectionMatrix) //TODO:改了
 {
 	ShadowConstants shadowConstants = {};
-	shadowConstants.LightViewProjectionMatrix = lightViewProjectionMatrix;
+	shadowConstants.LightWorldToCamera = lightViewProjectionMatrix;
 
 	CopyCPUToGPU(&shadowConstants, sizeof(ShadowConstants), m_shadowCBO);
 	BindConstantBuffer(k_shadowConstantsSlot, m_shadowCBO);

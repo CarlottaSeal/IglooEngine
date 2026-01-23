@@ -61,12 +61,9 @@ public:
     Vec3 ReconstructWorldPosCPU(Vec2 screenPos, float depth,
         float screenWidth, float screenHeight,
         const Mat44& viewProjInverse);
-    SurfaceCacheConstants PrepareBasicCacheConstants(SurfaceCacheType type, size_t batchStart);
+    // SurfaceCacheConstants PrepareBasicCacheConstants(SurfaceCacheType type, size_t batchStart);
     void UpdateCardMetadata();
     const std::vector<SurfaceCardMetadata>& GetCurrentSurfaceCardMetadataCPU();
-    
-    Vec3 SampleIrradiance(const Vec3& worldPos, const Vec3& normal);
-    float SampleOcclusion(const Vec3& worldPos);
     
     void UpdateStatistics();
     const SurfaceCacheGlobalStats& GetStatistics() const { return m_globalStats; }

@@ -25,7 +25,8 @@ struct GPUBVHNode
 
 	Vec3 m_boundsMax;
 	uint32_t m_triCount;       
-
+	uint32_t m_rightChild;
+	float padding[3];
 	bool IsLeaf() const { return m_triCount > 0; }
 };
 

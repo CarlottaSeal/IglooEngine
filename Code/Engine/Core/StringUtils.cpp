@@ -118,4 +118,16 @@ void EraseEmptyStrings(Strings& tokens)
 	}), tokens.end());
 }
 
+std::string JoinStrings(const Strings& tokens, size_t startIndex, const std::string& delimiter)
+{
+	if (startIndex >= tokens.size()) return "";
+    
+	std::string result = tokens[startIndex];
+	for (size_t i = startIndex + 1; i < tokens.size(); ++i)
+	{
+		result += delimiter + tokens[i];
+	}
+	return result;
+}
+
 

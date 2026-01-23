@@ -101,7 +101,7 @@ struct PSOutput
     float4 Albedo : SV_TARGET0;     // RGBA8
     float4 Normal : SV_TARGET1;     // R10G10B10A2 or RGBA16F
     float4 Material : SV_TARGET2;   // R:roughness G:metallic B:AO 
-    float2 Motion : SV_TARGET3;     // RG16F
+    float4 WorldPos  : SV_TARGET3;     // RG16F
 };
 
 PSOutput GBufferPS(VSOutput input) 
@@ -141,10 +141,11 @@ PSOutput GBufferPS(VSOutput input)
     output.Material.a = 1.0; 
     
     // 4. Motion Vectors
-    float2 currPos = input.CurrClipPos.xy / input.CurrClipPos.w;
-    float2 prevPos = input.PrevClipPos.xy / input.PrevClipPos.w;
-    output.Motion = (currPos - prevPos) * 0.5;
-    
+    //float2 currPos = input.CurrClipPos.xy / input.CurrClipPos.w;
+    //float2 prevPos = input.PrevClipPos.xy / input.PrevClipPos.w;
+    //output.Motion = (currPos - prevPos) * 0.5;
+    output.WorldPos = float4(input.WorldPos, 1.0); 
+
     return output;
 }
     )";

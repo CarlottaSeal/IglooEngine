@@ -1,7 +1,6 @@
 ﻿#include "MeshObject.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
 #include "Engine/Core/StaticMesh.h"
-#include "Engine/Scene/SDF/SDFGenerator.h"
 #include "Engine/Scene/Scene.h"
 
 MeshObject::MeshObject(uint32_t id, const std::string& name, const std::string& path, Vec3 position, EulerAngles rotation)
@@ -102,34 +101,50 @@ void MeshObject::OnTransformChanged()
     // 更新所有CardInstance的世界姿态
     if (m_mesh && m_mesh->m_hasCardTemplates)
     {
-        AABB3 localBounds = GetLocalBounds();
-		//AABB3 localBounds = GetLocalBoundsUntransformed();
+		// 使用原始mesh空间的bounds，这样GetLocalOrigin内部的计算是一致的
+		AABB3 rawBounds = m_mesh->GetAABB3Bounds();
+
+		// 完整的世界变换矩阵
 		Mat44 worldMatrix = m_cachedWorldMatrix;
-		
+
+		// 提取旋转部分（去掉缩放和平移）用于方向向量
+		Mat44 worldRotation = worldMatrix;
+		worldRotation.SetTranslation3D(Vec3(0, 0, 0));
+		worldRotation.SetIJK3D(
+			worldRotation.GetIBasis3D().GetNormalized(),
+			worldRotation.GetJBasis3D().GetNormalized(),
+			worldRotation.GetKBasis3D().GetNormalized()
+		);
+
+		// 总缩放 = mesh缩放 * SceneObject缩放
+		float totalScale = m_mesh->m_modelRelativeScale * m_scale;
+
 		for (size_t i = 0; i < m_cardInstances.size(); i++)
 		{
 			CardInstanceData& instance = m_cardInstances[i];
 			const SurfaceCardTemplate& templ = m_mesh->m_cardTemplates[i];
-			
-			Vec3 localOrigin = templ.GetLocalOrigin(localBounds);
-			Vec3 localNormal = templ.GetLocalNormal();
-			Vec3 localAxisX = templ.GetLocalAxisX();
-			Vec3 localAxisY = templ.GetLocalAxisY();
-			Vec2 localSize = templ.m_localSize;
-	
-			Vec3 translation = worldMatrix.GetTranslation3D();
-			instance.m_worldOrigin = localOrigin + translation;
-			instance.m_worldNormal = localNormal.GetNormalized();
-			
-			instance.m_worldAxisX = localAxisX.GetNormalized();
-			instance.m_worldAxisY = localAxisY.GetNormalized();
-	
-			Vec3 worldSize = localBounds.m_maxs - localBounds.m_mins;
-			instance.m_worldSize.x = DotProduct3D(worldSize, instance.m_worldAxisX);
-			instance.m_worldSize.y =  DotProduct3D(worldSize, instance.m_worldAxisY);
-			
+
+			// 全部在原始mesh空间计算
+			Vec3 localOrigin = templ.GetLocalOrigin(rawBounds);  // 原始空间
+			Vec3 localNormal = templ.GetLocalNormal();           // 原始空间
+			Vec3 localAxisX = templ.GetLocalAxisX();             // 原始空间
+			Vec3 localAxisY = templ.GetLocalAxisY();             // 原始空间
+
+			// 用完整worldMatrix变换位置到世界空间
+			instance.m_worldOrigin = worldMatrix.TransformPosition3D(localOrigin);
+
+			// 方向向量只需旋转（localNormal朝内，取反得到朝外的世界法线）
+			instance.m_worldNormal = -worldRotation.TransformVectorQuantity3D(localNormal).GetNormalized();
+			instance.m_worldAxisX = worldRotation.TransformVectorQuantity3D(localAxisX).GetNormalized();
+			instance.m_worldAxisY = worldRotation.TransformVectorQuantity3D(localAxisY).GetNormalized();
+
+			// WorldSize: 原始尺寸在原始轴上的投影 * 总缩放
+			Vec3 rawSize = rawBounds.m_maxs - rawBounds.m_mins;
+			instance.m_worldSize.x = fabsf(DotProduct3D(rawSize, localAxisX)) * totalScale;
+			instance.m_worldSize.y = fabsf(DotProduct3D(rawSize, localAxisY)) * totalScale;
+
 			instance.m_isDirty = true;
-			
+
 			// 通知Scene/GISystem标记对应的SurfaceCard为脏
 			if (m_scene)
 			{
@@ -137,7 +152,7 @@ void MeshObject::OnTransformChanged()
 			}
 		}
     }
-    
+
 	if (m_scene && IsStaticForGI())
 	{
 		m_scene->OnMeshObjectTransformChanged(m_id);
@@ -151,65 +166,70 @@ void MeshObject::InitializeCardInstances()
 		DebuggerPrintf("[MeshObject] Cannot initialize card instances: no mesh\n");
 		return;
 	}
-    
+
 	if (!m_mesh->m_hasCardTemplates)
 	{
 		DebuggerPrintf("[MeshObject] Cannot initialize card instances: mesh has no templates\n");
 		return;
 	}
-    
+
 	m_cardInstances.clear();
 	m_cardInstances.resize(m_mesh->m_cardTemplates.size());
-    
-	AABB3 localBounds = GetLocalBounds();
-	//AABB3 localBounds = GetLocalBoundsUntransformed();
+
+	// 使用原始mesh空间的bounds，这样GetLocalOrigin内部的计算是一致的
+	AABB3 rawBounds = m_mesh->GetAABB3Bounds();
+
+	// 完整的世界变换矩阵
 	Mat44 worldMatrix = m_cachedWorldMatrix;
-	
+
+	// 提取旋转部分（去掉缩放和平移）用于方向向量
+	Mat44 worldRotation = worldMatrix;
+	worldRotation.SetTranslation3D(Vec3(0, 0, 0));
+	worldRotation.SetIJK3D(
+		worldRotation.GetIBasis3D().GetNormalized(),
+		worldRotation.GetJBasis3D().GetNormalized(),
+		worldRotation.GetKBasis3D().GetNormalized()
+	);
+
+	// 总缩放 = mesh缩放 * SceneObject缩放
+	float totalScale = m_mesh->m_modelRelativeScale * m_scale;
+
 	for (size_t i = 0; i < m_cardInstances.size(); i++)
 	{
 		CardInstanceData& instance = m_cardInstances[i];
 		const SurfaceCardTemplate& templ = m_mesh->m_cardTemplates[i];
-		
+
 		// 设置身份
 		instance.m_meshObjectID = m_id;
 		instance.m_templateIndex = (uint32_t)i;
-		
-		// 计算世界变换
-		Vec3 localOrigin = templ.GetLocalOrigin(localBounds);
-		Vec3 localNormal = templ.GetLocalNormal();
-		Vec3 localAxisX = templ.GetLocalAxisX();
-		Vec3 localAxisY = templ.GetLocalAxisY();
-		Vec2 localSize = templ.m_localSize;
 
-		Vec3 translation = worldMatrix.GetTranslation3D();
-		instance.m_worldOrigin = localOrigin + translation;
-		//nstance.m_worldOrigin = worldMatrix.TransformPosition3D(localOrigin);
-		//instance.m_worldNormal = worldMatrix.TransformVectorQuantity3D(localNormal).GetNormalized();
-		instance.m_worldNormal = localNormal.GetNormalized();
-		
-		//instance.m_worldAxisX = worldAxisX_WithScale.GetNormalized();
-		instance.m_worldAxisX = localAxisX.GetNormalized();
-		//instance.m_worldAxisY = worldAxisY_WithScale.GetNormalized();
-		instance.m_worldAxisY = localAxisY.GetNormalized();
+		// 全部在原始mesh空间计算
+		Vec3 localOrigin = templ.GetLocalOrigin(rawBounds);  // 原始空间
+		Vec3 localNormal = templ.GetLocalNormal();           // 原始空间
+		Vec3 localAxisX = templ.GetLocalAxisX();             // 原始空间
+		Vec3 localAxisY = templ.GetLocalAxisY();             // 原始空间
 
-		Vec3 worldSize = localBounds.m_maxs - localBounds.m_mins;
-		//Vec3 worldAxisX_WithScale = worldMatrix.TransformVectorQuantity3D(localAxisX * localSize.x);
-		//Vec3 worldAxisX_WithScale = localAxisX * localSize.x;
-		//Vec3 worldAxisY_WithScale = worldMatrix.TransformVectorQuantity3D(localAxisY * localSize.y);
-		//Vec3 worldAxisY_WithScale = localAxisY * localSize.y;
-		
-		instance.m_worldSize.x = DotProduct3D(worldSize, instance.m_worldAxisX);
-		//instance.m_worldSize.x = worldAxisX_WithScale.GetLength();
-		instance.m_worldSize.y =  DotProduct3D(worldSize, instance.m_worldAxisY);
-		//instance.m_worldSize.y = worldAxisY_WithScale.GetLength();
-		
+		// 用完整worldMatrix变换位置到世界空间
+		instance.m_worldOrigin = worldMatrix.TransformPosition3D(localOrigin);
+
+		// 方向向量只需旋转
+		// 方向向量只需旋转（localNormal朝内，取反得到朝外的世界法线）
+		instance.m_worldNormal = -worldRotation.TransformVectorQuantity3D(localNormal).GetNormalized();
+		instance.m_worldAxisX = worldRotation.TransformVectorQuantity3D(localAxisX).GetNormalized();
+		instance.m_worldAxisY = worldRotation.TransformVectorQuantity3D(localAxisY).GetNormalized();
+
+		// WorldSize: 原始尺寸在原始轴上的投影 * 总缩放
+		Vec3 rawSize = rawBounds.m_maxs - rawBounds.m_mins;
+		instance.m_worldSize.x = fabsf(DotProduct3D(rawSize, localAxisX)) * totalScale;
+		instance.m_worldSize.y = fabsf(DotProduct3D(rawSize, localAxisY)) * totalScale;
+
 		// 初始化光照掩码和状态
 		memset(instance.m_lightMask, 0, sizeof(instance.m_lightMask));
 		instance.m_isDirty = true;
 		instance.m_lastUpdateFrame = 0;
 		instance.m_surfaceCardId = UINT32_MAX; // 稍后由Scene/GISystem分配
 	}
-    
+
 	DebuggerPrintf("[MeshObject] Initialized %zu card instances for object %u ('%s')\n",
 				   m_cardInstances.size(), m_id, m_name.c_str());
 }

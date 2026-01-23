@@ -36,14 +36,16 @@ public:
     void SetHeight(float height);
     void SetColor(Rgba8 color);
 
+    Rgba8 const GetColor() const;
+
     std::string GetText() const { return m_textSetting.m_text; }
 
 protected:
+    void UpdateTextVerts();
+    
     Canvas* m_canvas = nullptr;
     BitmapFont* m_font = nullptr;
     
     Vec2 m_position;
     TextSetting m_textSetting;
-    
-    void UpdateTextVerts();
 };

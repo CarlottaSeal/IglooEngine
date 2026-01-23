@@ -51,6 +51,8 @@ void DebugAddWorldWireCylinder(const Vec3& base, const Vec3& top,
 void DebugAddWorldWireSphere(const Vec3& center,
 	float radius, float duration, const Rgba8& startColor = Rgba8::WHITE,
 	const Rgba8& endColor = Rgba8::WHITE, DebugRenderMode mode = DebugRenderMode::USE_DEPTH);
+void DebugAddWorldWireAABB(const AABB3& box, float duration, const Rgba8& startColor = Rgba8::WHITE,
+	const Rgba8& endColor = Rgba8::WHITE, DebugRenderMode mode = DebugRenderMode::USE_DEPTH);
 void DebugAddWorldArrow(const Vec3& start, const Vec3& end,
 	float radius, float duration, const Rgba8& startColor = Rgba8::WHITE,
 	const Rgba8& endColor = Rgba8::WHITE, DebugRenderMode mode = DebugRenderMode::USE_DEPTH);

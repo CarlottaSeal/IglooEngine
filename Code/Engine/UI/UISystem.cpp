@@ -1,5 +1,6 @@
 ﻿#include "UISystem.h"
 #include "UIElement.h"
+#include "UIManager.h"
 #include "Engine/Core/EngineCommon.hpp"
 
 UISystem* g_theUISystem = nullptr;
@@ -15,6 +16,7 @@ UISystem::UISystem(UIConfig config)
 
 void UISystem::Startup()
 {
+    m_theUIManager = new UIManager(this);
     m_bitmapFont = m_renderer->CreateOrGetBitmapFont(("Data/Fonts/" + m_config.m_bitmapFontName).c_str());
     for (UIElement* uiElement : m_uiElements)
     {

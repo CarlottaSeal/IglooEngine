@@ -21,6 +21,8 @@ public:
 	float const GetWidth() const;
 	float const GetHeight() const;
 	Vec2 const GetBottomCenter() const;
+	Vec2 const GetBottomRight() const;
+	Vec2 const GetTopLeft() const;
 	Vec2 const GetNearestPoint(Vec2 const& uv) const;
 	Vec2 const GetPointAtUV(Vec2 const& uv) const;			//uv=(0.0) is at mins; uv=(1,1) is at maxs		
 	Vec2 const GetUVForPoint(Vec2 const& point) const;		//uv=(.5,.5) at the center; u or v outside [0,1] extrapolated

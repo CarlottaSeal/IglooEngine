@@ -10,8 +10,8 @@ struct GBufferData;
 
 struct TemporaryCaptureResources
 {
-	ID3D12Resource* m_tempTextures[4];      // 4个临时纹理
-	D3D12_CPU_DESCRIPTOR_HANDLE m_tempRtvs[4];  // 对应的 RTV 在dx12中管理->我不知道好不好
+	ID3D12Resource* m_tempTextures[SURFACE_CACHE_LAYER_CAPTURE_COUNT];      // 4个临时纹理
+	D3D12_CPU_DESCRIPTOR_HANDLE m_tempRtvs[SURFACE_CACHE_LAYER_CAPTURE_COUNT];  // 对应的 RTV 在dx12中管理->我不知道好不好
 	uint32_t maxResolution;               // 最大分辨率
 };
 
@@ -24,20 +24,12 @@ public:
 
     static constexpr uint32_t INVALID_TILE_INDEX = 0xFFFFFFFF;
     
-    void Initialize(ID3D12Device* device, uint32_t atlasSize, uint32_t tileSize, SurfaceCacheType type = SURFACE_CACHE_TYPE_PRIMARY);
+    void Initialize(ID3D12Device* device, uint32_t atlasSize, uint32_t tileSize);
     void Shutdown();
 	
-	ID3D12Resource* GetCurrentAtlasTexture() const;
-	ID3D12Resource* GetPreviousAtlasTexture() const;
-	ID3D12Resource* GetCurrentMetadataBuffer() const;
-	ID3D12Resource* GetPreviousMetadataBuffer() const;
-	ID3D12Resource* GetCurrentMetadataUploadBuffer() const;
-	ID3D12Resource* GetPreviousMetadataUploadBuffer() const;
-
-	int GetCurrentBufferIndex() const { return m_currentIndex; }
-	int GetPreviousBufferIndex() const { return 1 - m_currentIndex; }
-
-	void SwapBuffers() { m_currentIndex = 1 - m_currentIndex; }
+	ID3D12Resource* GetAtlasTexture() const;
+	ID3D12Resource* GetMetadataBuffer() const;
+	ID3D12Resource* GetMetadataUploadBuffer() const;
 
     const SurfaceCacheStats& GetStats() const { return m_stats; }
     void ResetStats() { m_stats = {}; }
@@ -51,15 +43,12 @@ private:
 	void ReleaseTemporaryCaptureResources();
 
 public:
-    SurfaceCacheType m_type;
-    int m_currentIndex = 0;
-	
 	TemporaryCaptureResources m_tempCapture;
-    ID3D12Resource* m_atlasTexture[SURFACE_CACHE_BUFFER_COUNT];
-    ID3D12Resource* m_cardMetadataBuffer[SURFACE_CACHE_BUFFER_COUNT];
-    ID3D12Resource* m_cardMetadataUploadBuffer[SURFACE_CACHE_BUFFER_COUNT]; // UPLOAD heap（CPU 写入的中转
+    ID3D12Resource* m_atlasTexture;
+    ID3D12Resource* m_cardMetadataBuffer;
+    ID3D12Resource* m_cardMetadataUploadBuffer; // UPLOAD heap（CPU 写入的中转
     
-    ID3D12Resource* m_tileAllocator[SURFACE_CACHE_BUFFER_COUNT];
+    ID3D12Resource* m_tileAllocator;
 
     uint32_t m_atlasSize = 0;
     uint32_t m_tileSize = 0;

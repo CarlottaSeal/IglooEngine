@@ -68,6 +68,9 @@
     <Filter Include="Scene\SDF">
       <UniqueIdentifier>{fdc08655-6674-46b1-a919-b612e820ec40}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Tool">
+      <UniqueIdentifier>{17b9fcd4-ab6f-4353-97ca-bab224ab833f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Math\Vec2.cpp">
@@ -355,14 +358,8 @@
     <ClCompile Include="Job\JobSystem.cpp">
       <Filter>Job</Filter>
     </ClCompile>
-    <ClCompile Include="Renderer\Cache\SurfaceCardGenerator.cpp">
-      <Filter>Renderer\Cache</Filter>
-    </ClCompile>
     <ClCompile Include="Math\IntVec4.cpp">
       <Filter>Math</Filter>
-    </ClCompile>
-    <ClCompile Include="Scene\SDF\SDFGenerator.cpp">
-      <Filter>Scene\SDF</Filter>
     </ClCompile>
     <ClCompile Include="Renderer\Cache\SurfaceCard.cpp">
       <Filter>Renderer\Cache</Filter>
@@ -371,6 +368,72 @@
       <Filter>Renderer</Filter>
     </ClCompile>
     <ClCompile Include="Renderer\RenderCommon.cpp">
+      <Filter>Renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="Math\Curve1D.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\Cache\CardBVH.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\Cache\RadianceCacheManager.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Canvas.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Checkbox.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Panel.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\ProgressBar.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Slider.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Sprite.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\Text.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\UIEvent.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\UIManager.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\UIScreen.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\Cache\ScreenProbeFinalGather.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\Cache\SurfaceRadiosityCache.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\HelperFunctionLib.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\ShaderIncludeHandler.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\UISpriteAtlas.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Tool\ParticleSystem.cpp">
+      <Filter>Tool</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\GIVisualization.cpp">
+      <Filter>Renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="Core\StaticmeshCache.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\Cache\CombineSurfaceCache.cpp">
       <Filter>Renderer</Filter>
     </ClCompile>
   </ItemGroup>
@@ -699,20 +762,11 @@
     <ClInclude Include="Job\JobSystem.h">
       <Filter>Job</Filter>
     </ClInclude>
-    <ClInclude Include="Renderer\Cache\SurfaceCardGenerator.h">
-      <Filter>Renderer\Cache</Filter>
-    </ClInclude>
     <ClInclude Include="Math\IntVec4.h">
       <Filter>Math</Filter>
     </ClInclude>
     <ClInclude Include="Scene\SDF\SDFCommon.h">
       <Filter>Scene\SDF</Filter>
-    </ClInclude>
-    <ClInclude Include="Scene\SDF\SDFGenerator.h">
-      <Filter>Scene\SDF</Filter>
-    </ClInclude>
-    <ClInclude Include="Renderer\Cache\SurfaceCacheCommon.h">
-      <Filter>Renderer\Cache</Filter>
     </ClInclude>
     <ClInclude Include="Renderer\Cache\SurfaceCard.h">
       <Filter>Renderer\Cache</Filter>
@@ -722,6 +776,69 @@
     </ClInclude>
     <ClInclude Include="Core\EngineConfig.h">
       <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Math\Curve1D.h" />
+    <ClInclude Include="Renderer\Cache\RadianceCacheManager.h" />
+    <ClInclude Include="Tool\ParticleSystem.h" />
+    <ClInclude Include="UI\Canvas.hpp">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\UIScreen.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\UISpriteAtlas.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\UIManager.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\UIEvent.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Text.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Sprite.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Slider.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\ProgressBar.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Panel.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\Cache\SurfaceRadiosityCache.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\GIVisualization.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Core\StaticmeshCache.h">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\ShaderIncludeHandler.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\Cache\ScreenProbeFinalGather.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\HelperFunctionLib.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\Cache\CombineSurfaceCache.h">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="UI\Checkbox.h">
+      <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\Cache\CardBVH.h">
+      <Filter>Renderer\Cache</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\Cache\CacheCommon.h">
+      <Filter>Renderer\Cache</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

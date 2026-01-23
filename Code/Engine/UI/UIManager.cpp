@@ -7,7 +7,7 @@ UIManager::UIManager(UISystem* uiSystem)
 
 UIManager::~UIManager()
 {
-    PopAllScreens();
+    m_screenStack.clear();
 }
 
 void UIManager::Update(float deltaSeconds)
@@ -30,7 +30,6 @@ void UIManager::Update(float deltaSeconds)
 
 void UIManager::Render() const
 {
-    // 从底层到顶层渲染所有屏幕
     for (auto* screen : m_screenStack)
     {
         if (screen)
@@ -57,7 +56,6 @@ void UIManager::PushScreen(UIScreen* screen)
         }
     }
     
-    // 添加新屏幕
     m_screenStack.push_back(screen);
     screen->OnEnter();
 }
@@ -69,22 +67,20 @@ void UIManager::PopScreen()
         return;
     }
     
-    // 退出当前屏幕
     UIScreen* topScreen = m_screenStack.back();
-    if (topScreen) {
-        topScreen->OnExit();
-        delete topScreen;
-    }
-    
     m_screenStack.pop_back();
     
-    // 恢复新的顶层屏幕
+    if (topScreen)
+    {
+        topScreen->OnExit();
+    }
+    
     if (!m_screenStack.empty())
     {
-        UIScreen* newTopScreen = m_screenStack.back();
-        if (newTopScreen)
+        UIScreen* newTop = m_screenStack.back();
+        if (newTop)
         {
-            newTopScreen->OnResume();
+            newTop->OnEnter();
         }
     }
 }
@@ -138,6 +134,10 @@ UIScreen* UIManager::GetScreenByType(UIScreenType type) const
 bool UIManager::HasScreenType(UIScreenType type) const
 {
     return GetScreenByType(type) != nullptr;
+}
+
+void UIManager::Reset()
+{
 }
 
 bool UIManager::IsInputBlocked() const

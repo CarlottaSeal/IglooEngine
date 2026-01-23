@@ -138,26 +138,55 @@ void Text::SetColor(Rgba8 color)
     }
 }
 
+Rgba8 const Text::GetColor() const
+{
+    return m_textSetting.m_color;
+}
 void Text::UpdateTextVerts()
 {
     m_textVerts.clear();
     
-    if (!m_font)
+    if (!m_font || m_textSetting.m_text.empty())
     {
         return;
     }
     
-    if (m_textSetting.m_text.empty())
-    {
-        return;
-    }
-    
+    std::vector<Vertex_PCU> tempVerts;
     m_font->AddVertsForText2D(
-        m_textVerts,
-        m_position,
+        tempVerts,
+        Vec2(0.0f, 0.0f),  
         m_textSetting.m_height,
         m_textSetting.m_text,
         m_textSetting.m_color,
-        1.0f  // aspect ratio TODO
+        1.0f
     );
+    
+    if (tempVerts.empty())
+    {
+        return;
+    }
+    
+    Vec2 textMins(999999.0f, 999999.0f);
+    Vec2 textMaxs(-999999.0f, -999999.0f);
+    
+    for (const auto& vert : tempVerts)
+    {
+        if (vert.m_position.x < textMins.x) textMins.x = vert.m_position.x;
+        if (vert.m_position.y < textMins.y) textMins.y = vert.m_position.y;
+        if (vert.m_position.x > textMaxs.x) textMaxs.x = vert.m_position.x;
+        if (vert.m_position.y > textMaxs.y) textMaxs.y = vert.m_position.y;
+    }
+    
+    Vec2 textSize = textMaxs - textMins;
+    
+    Vec2 alignmentOffset = -textSize * m_textSetting.m_alignment;
+    
+    m_textVerts.reserve(tempVerts.size());
+    for (const auto& vert : tempVerts)
+    {
+        Vertex_PCU newVert = vert;
+        newVert.m_position.x += m_position.x + alignmentOffset.x;
+        newVert.m_position.y += m_position.y + alignmentOffset.y;
+        m_textVerts.push_back(newVert);
+    }
 }

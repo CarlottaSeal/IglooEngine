@@ -92,7 +92,7 @@ void ProgressBar::Render() const
     
     if (!m_backgroundVerts.empty())
     {
-        renderer->BindTexture(nullptr);
+        //renderer->BindTexture(nullptr);
         renderer->DrawVertexArray((int)m_backgroundVerts.size(), m_backgroundVerts.data());
     }
     

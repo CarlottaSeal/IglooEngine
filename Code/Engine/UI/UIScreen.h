@@ -19,30 +19,30 @@ enum class UIScreenType
     CRAFTING_TABLE,
     OPTIONS,
     WORLD_SELECT,
-    SERVER_LIST
+    SERVER_LIST,
+    CUSTOM,
+    COUNT
 };
 
 class UIScreen
 {
 public:
-    UIScreen(UISystem* uiSystem, UIScreenType type, bool blocksInput = true);
+    UIScreen(UISystem* uiSystem, UIScreenType type,Camera& camera, bool blocksInput = true);
     virtual ~UIScreen();
+
+    virtual void OnEnter();     
+    virtual void OnExit();      
+    virtual void OnPause();     
+    virtual void OnResume();    
     
-    // 生命周期方法
-    virtual void OnEnter();     // 屏幕被激活时调用
-    virtual void OnExit();      // 屏幕被销毁时调用
-    virtual void OnPause();     // 屏幕被覆盖时调用（但不销毁）
-    virtual void OnResume();    // 屏幕重新激活时调用
+    virtual void Build() = 0;   
     
-    // 核心方法（子类必须实现）
-    virtual void Build() = 0;   // 构建 UI 元素
-    
-    // 可选重写的方法
     virtual void Update(float deltaSeconds);
     virtual void Render() const;
     virtual void HandleInput();
+
     
-    // 属性访问
+    
     UIScreenType GetType() const { return m_type; }
     bool BlocksInput() const { return m_blocksInput; }
     bool IsActive() const { return m_isActive; }
@@ -59,6 +59,6 @@ protected:
     bool m_blocksInput = true;  // 是否阻挡下层屏幕的输入
     bool m_isActive = false;
     
-    std::vector<UIElement*> m_elements;  // 该屏幕拥有的所有 UI 元素
+    //std::vector<UIElement*> m_elements; 
 };
 

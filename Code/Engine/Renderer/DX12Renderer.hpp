@@ -3,12 +3,20 @@
 #include <wrl/client.h>
 
 #include "GI/GBufferData.h"
-#include "Cache/SurfaceCacheCommon.h"
+#include "Cache/CacheCommon.h"
 
+class CombineSurfaceCache;
+class ScreenProbeFinalGather;
+class SurfaceRadiosity;
+class GIVisualization;
+class Window;
+class MeshObject;
 struct GPUCardBVHNode;
 struct SurfaceCardTemplate;
 struct CardInstanceData;
-class MeshObject;
+class BVH;
+class SDFTexture3D;
+
 using Microsoft::WRL::ComPtr;
 
 #include "Engine/Renderer/Camera.hpp"
@@ -60,7 +68,6 @@ using Microsoft::WRL::ComPtr;
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
-class Window;
 
 struct ID3D12Device;
 struct IDXGISwapChain3;
@@ -70,9 +77,6 @@ struct ID3D12Resource;
 struct ID3D12CommandAllocator;
 struct ID3D12GraphicsCommandList;
 struct ID3D12Fence;
-
-class BVH;
-class SDFTexture3D;
 
 class DX12Renderer
 {
@@ -91,7 +95,8 @@ public:
 	void ClearScreen();
 	void BeginCamera(const Camera& camera);
 	void EndCamera(const Camera& camera);
-
+	void BeginRenderPass(RenderMode renderMode, Rgba8 const& backBufferClearColor = Rgba8::TEAL);
+	
 	void SetViewport(const AABB2& normalizedViewport);
 	void SetModelConstants( Mat44 const& modelMatrix = Mat44(), Rgba8 const& modelColor = Rgba8::WHITE );
 	void SetLightConstants( Vec3 const& lightPosition, float ambient, Mat44 const& lightViewMatrix, Mat44 const& lightProjectionMatrix );
@@ -101,13 +106,18 @@ public:
 		std::vector<float>innerRadii, std::vector<float>outerRadii,
 		std::vector<float>innerDotThresholds, std::vector<float>outerDotThresholds);
 	void SetMaterialConstants(const Texture* diffuseTex, const Texture* normalTex, const Texture* specTex);
-	void SetComputeSurfaceCacheConstants(SurfaceCacheType type, size_t batchStart, int bindComputeSlot);
+	//void SetComputeSurfaceCacheConstants(SurfaceCacheType type, size_t batchStart, int bindComputeSlot);
 	
 	//Font & Texture & Image
 	BitmapFont*	CreateOrGetBitmapFont( const char* bitmapFontFilePathWithNoExtension );
 	Texture* CreateOrGetTextureFromFile(char const* imageFilePath);
 	Texture* CreateTextureFromFile(char const* imageFilePath);
 	Texture* CreateTextureFromImage(Image const& image);
+	SDFTexture3D* CreateSDFTextureFromData(const std::vector<Vertex_PCUTBN>& vertices,const std::vector<uint32_t>& indices,
+	   const BVH& bvh,const AABB3& bounds,int resolution);
+	SDFTexture3D* CreateSDFTextureFromData(
+		const std::vector<float>& data,int resolution);
+	std::vector<float> ReadbackSDF3DData(const SDFTexture3D* sdf);
 	void PushBackNewTextureManually(Texture* const tex);
 	//Texture* CreateTextureFromData(char const* name, IntVec2 dimensions, int bytesPerTexel, uint8_t* texelData);
 	Texture* GetTextureByFileName(char const* imageFilePath);
@@ -150,9 +160,33 @@ public:
 	void SetRasterizerMode(RasterizerMode rasterizerMode);
 	void SetSamplerMode(SamplerMode samplerMode);
 	void SetDepthMode(DepthMode depthMode);
+	
+	//Setter
+	void SetGISystem(GISystem* giSystem) { m_giSystem = giSystem; }
 
+	// GI Visualization 公共接口
+	void SetGIVisualizationEnabled(bool enabled) { m_vizEnabled = enabled; }
+	bool IsGIVisualizationEnabled() const { return m_vizEnabled; }
+	void ToggleGIVisualization() { m_vizEnabled = !m_vizEnabled; }
+	GIVisualizationParams& GetGIVisualizationParams() { return m_vizParams; }
+	bool RenderGIVisualizationImGuiPanel();  // 返回是否有变化
+
+private:
+	void WaitForPreviousFrame(); //wait until gpu is finished with command list
+	void WaitForComputeQueue();
+	void StartupComputeQueue();
+	void ShutdownComputeQueue();
+
+	//ImGui
+	void	ImGuiStartUp();
+	void	ImGuiBeginFrame();
+	void	ImGuiEndFrame();
+	void	ImGuiShutDown();
+
+	size_t GetConstantBufferSize(int cbSlot);
+
+	//Pass
 	//GeneralRender Pass
-	void BeginRenderPass(RenderMode renderMode, Rgba8 const& backBufferClearColor = Rgba8::TEAL);
 	void SetGraphicsStatesIfChanged();
 
 	//Forward Pass
@@ -163,7 +197,7 @@ public:
 
 	//GBuffer Pass
 	void CreateDepthSRV();
-	void CreateGBufferResources();
+	void CreateGBufferPassResources();
 	void BeginGBufferPass();
 	void ClearGBufferPassRTV();
 	void EndGBufferPass();
@@ -172,29 +206,27 @@ public:
 	//SDF
 	void CreateSDFGenerationRootSignature();
 	void CreateSDFGenerationPSO();
-	SDFTexture3D* GenerateSDFOnGPU(
-	   const std::vector<Vertex_PCUTBN>& vertices,
-	   const std::vector<uint32_t>& indices,
-	   const BVH& bvh,
-	   const AABB3& bounds,
-	   int resolution);
 	ID3D12Resource* CreateStructuredBuffer(
 		SDFTexture3D* sdfOwner,
 		const void* data,
 		size_t numElements,
 		size_t elementSize,
-		const wchar_t* debugName);
-	
+		const wchar_t* debugName, ID3D12GraphicsCommandList* commandList);
 	D3D12_GPU_DESCRIPTOR_HANDLE GetSRVHandle(uint32_t index);
-
-	//Compute Pass
-	//void CreateSurfaceCacheComputePSO();
+	
+	//Shadow map passs
+	void CreateShadowMapResources();
+	void RenderingShadowMapPass(); //暂时只有SunLight
+	void ShutdownShadowMapPass();
+	
+	//GlobalSDF Pass
+	void CreateGlobalSDFPassResources();
+	void RenderingGlobalSDFPass();
+	
 	void CreateComputeRootSignature();
 	
-	void CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache* cache, int bufferIndex);
-	//void ExtractGBufferToSurfaceCache();
-	void CompositeFinalImage();
-
+	void CreateSurfaceCacheDescriptorsAndTransitionStates(SurfaceCache* cache);
+	
 	//Card CapturePass
 	void BeginCardCapturePass();
 	void EndCardCapturePass();
@@ -202,7 +234,6 @@ public:
 	void UploadCardMetadataToGPU();
 	void CaptureDirtySurfaceCards(uint32_t maxCardsPerFrame);
 	void CaptureSingleCard(MeshObject* object, SurfaceCard* card, CardInstanceData* instance, const SurfaceCardTemplate& templ);
-	//void SetupCardCaptureCamera(SurfaceCard* card, CardInstanceData* instance, const SurfaceCardTemplate& templ);
 	void DrawObjectsForCardCapture(SurfaceCard* card);
 	void FinalizeCardCapture(SurfaceCard* card);
 	void CopyCardToAtlasLayer(ID3D12Resource* srcTexture,      // 临时纹理
@@ -214,18 +245,18 @@ public:
 				uint32_t height);                 // Card 高度
 
 	
-	void CreateCardCaptureResources();
+	void CreateCardCapturePassResources();
 	void CreateCardCapturePipelineStates();
 	void CreateCardCapturePSO(const IntVec2& resolution);
 
 	//SurfaceCache
 	void InitializeSurfaceCaches();
-	SurfaceCache* GetCurrentCache(SurfaceCacheType type);
-	SurfaceCache* GetPreviousCache(SurfaceCacheType type);
 
 	// GI Composite
-	void CreateCompositePSO();
-
+	void CreateCompositeResources();
+	void RenderingCompositePass();
+	void ShutdownCompositePass();
+	
 	//Surface 
 	void BindSurfaceCacheForCompute(SurfaceCache* cache);
 	void BindSurfaceCacheForGraphics(SurfaceCache* cache);
@@ -253,23 +284,25 @@ public:
 	ID3D12Resource* GetCardBVHIndexBuffer() const { return m_cardBVHIndexBuffer; }
 	uint32_t GetCardBVHNodeCount() const { return m_cardBVHNodeCount; }
 	uint32_t GetCardBVHIndexCount() const { return m_cardBVHIndexCount; }
-
 	void TransitionResource(ID3D12Resource* resource, D3D12_RESOURCE_STATES beforeState, D3D12_RESOURCE_STATES afterState);
 	D3D12_CPU_DESCRIPTOR_HANDLE GetCPUDescriptorHandle(ID3D12DescriptorHeap* heap, int index);
 	D3D12_GPU_DESCRIPTOR_HANDLE GetGPUDescriptorHandle(ID3D12DescriptorHeap* heap,int index);
-	
-	void SetGISystem(GISystem* giSystem) { m_giSystem = giSystem; }
-	
-private:
-   void WaitForPreviousFrame(); //wait until gpu is finished with command list
 
-	//ImGui
-	void	ImGuiStartUp();
-	void	ImGuiBeginFrame();
-	void	ImGuiEndFrame();
-	void	ImGuiShutDown();
+	//Combine SurfaceCache
+	void CreateCombineSurfaceCacheResources();
+	void RenderingCombineSurfaceCachePass();
+	
+	//SurfaceCacheRadiosity
+	void CreateSurfaceCacheRadiosityResources();
+	void RenderingSurfaceCacheRadiosityPass();
 
-	size_t GetConstantBufferSize(int cbSlot);
+	//ScreenProbeGather
+	void CreateScreenProbeGatherResources();
+	void RenderingScreenProbeGatherPass();
+
+	//GI Visuliazation
+	void CreateGIVisualizationResources();
+	void RenderingGIVisualizationPass(const CompositeConstants& compositeConsts);
 	
 protected:
 	RendererConfig m_config;
@@ -316,12 +349,13 @@ protected:
 
 	//ConstantBuffer* m_constantBuffers[NUM_CONSTANT_BUFFERS];
 	std::array<ConstantBuffer*, NUM_CONSTANT_BUFFERS> m_constantBuffers; //每个slot一个大buffer，包含多帧数据（更高效）
+	GeneralLightConstants m_lightConstant;
 	CameraConstants m_currentCam;
 	CameraConstants m_previousCam;
 	Camera m_camera;
 	int m_currentDrawIndex = 0;
 	int m_currentCaptureIndex = 0;
-    //bool m_isFirstFrame = true;
+	//bool m_isFirstFrame = true;
 
 	unsigned int VERTEX_RING_BUFFER_SIZE = 128 * 1024 * 1024; //128MB
 	unsigned int INDEX_RING_BUFFER_SIZE = 128 * 1024 * 1024; //128MB
@@ -358,23 +392,48 @@ protected:
 	RenderMode m_desiredRenderMode = RenderMode::FORWARD;
 	ActivePass m_currentActivePass = ActivePass::UNKNOWN;
 	bool m_hasBackBufferCleared = false;
+	//Shadow Map
+	ID3D12Resource* m_shadowMapTexture = nullptr;
+	ID3D12PipelineState* m_shadowMapPSO = nullptr;
+	Mat44 m_cachedLightWorldToCamera;
+	Mat44 m_cachedLightCameraToRender;
+	Mat44 m_cachedLightRenderToClip;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE m_shadowDsvHandle;
+
 	//SurfaceCaches
-	SurfaceCache m_surfaceCaches[SURFACE_CACHE_TYPE_COUNT];
+	SurfaceCache m_surfaceCache;
 	//GI
 	GISystem* m_giSystem = nullptr;
 	//GBuffer
 	GBufferData m_gBuffer;
 	std::map<int, ID3D12PipelineState*> m_gBufferPipelineStatesConfiguration; 
 	bool m_gBufferPassActive = false;
-	//ID3D12PipelineState* m_gBufferPSO = nullptr;
+
+	//Composite pass
 	ID3D12PipelineState* m_compositePSO = nullptr;
+	//ID3D12RootSignature* m_compositeRootSignature = nullptr;
+	
 	//Surface Cache
 	bool m_debugVisualizeSurfaceCache = false;
+	
 	// SDF
 	ID3D12PipelineState* m_sdfGenerationPSO = nullptr;
 	ID3D12RootSignature* m_sdfGenerationRootSignature = nullptr;
 	std::vector<SDFTexture3D*> m_loadedSDFs; 
 	int m_nextSDFDescriptorIndex = SDF_TEXTURE_SRV_BASE;
+	int m_nextSDFTextureIndex = 0;
+	ID3D12PipelineState* m_globalSDFGenerationPSO = nullptr;
+	ID3D12RootSignature* m_globalSDFGenerationRootSignature = nullptr;
+	// Global voxel scene sdf
+	ID3D12Resource* m_globalSDFTexture = nullptr;        // RG32_FLOAT, 3D (距离 + 实例索引)
+	ID3D12Resource* m_voxelVisibilityBuffer = nullptr;   // StructuredBuffer, 6方向
+	ID3D12Resource* m_voxelLightingTexture = nullptr;    // RGBA16_FLOAT, 3D × 6方向
+	ID3D12Resource* m_instanceInfoBuffer = nullptr;      // StructuredBuffer<MeshSDFInfoGPU>
+	ID3D12Resource* m_instanceInfoUploadBuffer = nullptr;
+	ID3D12PipelineState* m_buildGlobalSDFPSO = nullptr;
+	ID3D12PipelineState* m_buildVisibilityPSO = nullptr;
+	ID3D12PipelineState* m_injectLightingPSO = nullptr;
+	ID3D12RootSignature* m_globalSDFRootSignature = nullptr;
 
 	//Compute surface cache
 	//ID3D12PipelineState* m_surfaceCacheExtractPSO = nullptr;
@@ -383,7 +442,6 @@ protected:
 	//Card capture
 	ID3D12PipelineState* m_cardCapturePSO = nullptr;
 	std::map<uint64_t, ID3D12PipelineState*> m_cardCapturePSOConfiguration;
-	CardCaptureStats m_cardCaptureStats;
 	int m_currentCardUpdateIndex = 0;
 
 	//Radiance Cache
@@ -396,6 +454,23 @@ protected:
 
 	std::vector<ID3D12Resource*> m_currentFrameTempResources;
 	std::vector<ID3D12Resource*> m_previousFrameTempResources;
+
+	//Async Compute Queue
+	ID3D12CommandQueue* m_computeQueue = nullptr;
+	ID3D12CommandAllocator* m_computeAllocator = nullptr;
+	ID3D12GraphicsCommandList* m_computeCommandList = nullptr;
+	ID3D12Fence* m_computeFence = nullptr;
+	HANDLE m_computeFenceEvent = nullptr;
+	ConstantBuffer* m_computeConstantBuffer = nullptr; //暂时只用于sdf gen
+	uint64_t m_computeFenceValue = 0;
+
+	CombineSurfaceCache* m_combineSurfaceCache = nullptr;
+	SurfaceRadiosity* m_surfaceRadiosity = nullptr;
+	ScreenProbeFinalGather* m_screenProbeFinalGather = nullptr;
+	ScreenProbeConstants m_screenProbeConstants;
+	
+	GIVisualization* m_giVisualization = nullptr;
+	GIVisualizationParams m_vizParams;
+	bool m_vizEnabled = false;
 };
 #endif
-

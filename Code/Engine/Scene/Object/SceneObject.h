@@ -44,6 +44,7 @@ public:
     const Vec3& GetPosition() const { return m_position; }
     const float GetScale() const { return m_scale; }
     virtual const Mat44& GetWorldMatrix();
+    const Mat44 GetWorldMatrixWithoutScaling();
     
     void SetVisible(bool visible) { m_visible = visible; }
     bool IsVisible() const { return m_visible && m_active; }

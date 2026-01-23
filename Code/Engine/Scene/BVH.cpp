@@ -214,42 +214,42 @@ void BVH::QueryRecursive(const BVHNode* node, const AABB3& bounds, std::vector<i
 
 void BVH::FlattenRecursive(const BVHNode* node, std::vector<GPUBVHNode>& outNodes, std::vector<uint32_t>& outTriIndices, uint32_t& nodeIndex) const
 {
-	if (!node) return;
-
-	uint32_t currentIndex = nodeIndex++;
-
-	// 为当前节点分配空间
-	if (currentIndex >= outNodes.size())
-		outNodes.resize(currentIndex + 1);
-
-	GPUBVHNode& gpuNode = outNodes[currentIndex];
-	gpuNode.m_boundsMin = node->m_bounds.m_mins;
-	gpuNode.m_boundsMax = node->m_bounds.m_maxs;
-
-	if (node->IsLeaf())
-	{
-		// 叶子节点：记录三角形信息
-		gpuNode.m_leftFirst = static_cast<uint32_t>(outTriIndices.size());
-		gpuNode.m_triCount = static_cast<uint32_t>(node->m_triangleIndices.size());
-
-		// 添加三角形索引
-		for (int triIdx : node->m_triangleIndices)
-		{
-			outTriIndices.push_back(static_cast<uint32_t>(triIdx));
-		}
-	}
-	else
-	{
-		// 内部节点
-		gpuNode.m_triCount = 0;
-
-		// 左孩子紧跟当前节点
-		gpuNode.m_leftFirst = nodeIndex;
-
-		if (node->m_left)
-			FlattenRecursive(node->m_left.get(), outNodes, outTriIndices, nodeIndex);
-
-		if (node->m_right)
-			FlattenRecursive(node->m_right.get(), outNodes, outTriIndices, nodeIndex);
-	}
+    uint32_t currentIndex = nodeIndex++;
+    
+    if (currentIndex >= outNodes.size())
+        outNodes.resize(currentIndex + 1);
+    
+    //GPUBVHNode& gpuNode = outNodes[currentIndex];
+    outNodes[currentIndex].m_boundsMin = node->m_bounds.m_mins;
+    outNodes[currentIndex].m_boundsMax = node->m_bounds.m_maxs;
+    
+    if (node->IsLeaf())
+    {
+        outNodes[currentIndex].m_leftFirst = (uint32_t)outTriIndices.size();
+        outNodes[currentIndex].m_triCount = (uint32_t)node->m_triangleIndices.size();
+        outNodes[currentIndex].m_rightChild = 0xFFFFFFFF;  // 无效值
+        
+        for (int triIdx : node->m_triangleIndices)
+        {
+            outTriIndices.push_back((uint32_t)triIdx);
+        }
+    }
+    else
+    {
+        outNodes[currentIndex].m_triCount = 0;
+        outNodes[currentIndex].m_leftFirst = nodeIndex; 
+        
+        uint32_t rightChildIndex = 0xFFFFFFFF;
+        
+        if (node->m_left)
+            FlattenRecursive(node->m_left.get(), outNodes, outTriIndices, nodeIndex);
+        
+        if (node->m_right)
+        {
+            rightChildIndex = nodeIndex;
+            FlattenRecursive(node->m_right.get(), outNodes, outTriIndices, nodeIndex);
+        }
+        
+        outNodes[currentIndex].m_rightChild = rightChildIndex; 
+    }
 }

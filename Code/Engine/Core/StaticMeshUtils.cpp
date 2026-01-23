@@ -10,6 +10,8 @@
 #include "ThirdParty/stb/stb_image.h"
 
 #define CGLTF_IMPLEMENTATION
+#include <algorithm>
+
 #include "ThirdParty/cgltf/cgltf.h"
 //#include "ThirdParty/cgltf/cgltf_write.h"
 
@@ -28,21 +30,31 @@ bool LoadStaticMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned 
 
 bool LoadOBJMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int>& indices, std::string const& filePath, bool flipUV, std::string const& mtlPath)
 {
-    //UNUSED(flipUV)
     std::string readObj;
-    FileReadToString(readObj, filePath);
+    if (FileReadToString(readObj, filePath) < 0)
+    {
+        DebuggerPrintf("Warning: Cannot read OBJ file: %s\n", filePath.c_str());
+        return false;
+    }
+    
     Strings lines = SplitStringOnDelimiter(readObj, '\n');
 
-    std::map<std::string, Rgba8> kdMap;
-    if (mtlPath != "")
+    std::map<std::string, MtlInfo> materials;
+    Rgba8 currentColor = Rgba8::WHITE; 
+
+    if (!mtlPath.empty())
     {
-        LoadOBJMaterial(mtlPath, kdMap);
+        if (!LoadOBJMaterial(mtlPath, materials))
+        {
+            DebuggerPrintf("Warning: Failed to load MTL file: %s, using default materials\n", mtlPath.c_str());
+            // 不返回false，继续使用默认材质
+        }
     }
 
     std::vector<Vec3> positions;
     std::vector<Vec3> normals;
     std::vector<Vec2> texCoords;
-    Rgba8 currentColor = Rgba8::WHITE;
+    //Rgba8 currentColor = Rgba8::WHITE;
 
     bool hasUV = false;
     bool hasNormal = false;
@@ -103,10 +115,17 @@ bool LoadOBJMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int
             }
             else if (tokens[0] == "usemtl")
             {
-                if (tokens.size() >= 2)
+                if (tokens.size() >= 2 && !materials.empty())
                 {
-                    auto it = kdMap.find(tokens[1]);
-                    currentColor = (it != kdMap.end())? it->second : Rgba8::WHITE;
+                    auto it = materials.find(tokens[1]);
+                    if (it != materials.end())
+                    {
+                        currentColor = it->second.m_diffuseColor;
+                    }
+                    else
+                    {
+                        DebuggerPrintf("Warning: Material '%s' not found in MTL file\n", tokens[1].c_str());
+                    }
                 }
             }
             else if (tokens[0] == "f")
@@ -162,12 +181,19 @@ bool LoadOBJMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int
                 if (tokens.size() < 4) continue;
                 positions.emplace_back(Vec3(std::stof(tokens[1]), std::stof(tokens[2]), std::stof(tokens[3])));
             }
-            else if (tokens[0] == "usemtl") 
+            else if (tokens[0] == "usemtl")
             {
-                if (tokens.size() >= 2)
+                if (tokens.size() >= 2 && !materials.empty())
                 {
-                    auto it = kdMap.find(tokens[1]);
-                    currentColor = (it != kdMap.end()) ? it->second : Rgba8::WHITE;
+                    auto it = materials.find(tokens[1]);
+                    if (it != materials.end())
+                    {
+                        currentColor = it->second.m_diffuseColor;
+                    }
+                    else
+                    {
+                        DebuggerPrintf("Warning: Material '%s' not found in MTL file\n", tokens[1].c_str());
+                    }
                 }
             }
             else if (tokens[0] == "f")
@@ -652,6 +678,153 @@ Image* LoadImageDueToGLTFData(cgltf_data* in_data, GLBChannel channelType /*= GL
     
     cgltf_free(in_data);
     return img;
+}
+
+bool LoadOBJMaterial(std::string const& path, std::map<std::string, MtlInfo>& materialMap) noexcept
+{
+    materialMap.clear();
+    std::string rawMtlFile;
+    if (FileReadToString(rawMtlFile, path) < 0)
+    {
+        DebuggerPrintf("Warning: Cannot read MTL file: %s\n", path.c_str());
+        return false;
+    }
+    
+    // 获取MTL文件的目录路径（用于相对路径处理）
+    size_t lastSlash = path.find_last_of("/\\");
+    std::string mtlDirectory = (lastSlash != std::string::npos) 
+        ? path.substr(0, lastSlash) : ".";
+    
+    Strings mtlLines = SplitStringOnDelimiter(rawMtlFile, '\n');
+
+    std::string currentMtlName;
+    MtlInfo* currentMtl = nullptr;
+    
+    for (auto& line : mtlLines)
+    {
+        // 移除行尾的\r（Windows换行符）
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+            
+        Strings tokens = SplitStringOnDelimiter(line, ' ', true);
+        if (tokens.empty()) continue;
+
+        try
+        {
+            if (tokens[0] == "newmtl")
+            {
+                if (tokens.size() >= 2)
+                {
+                    currentMtlName = tokens[1];
+                    materialMap[currentMtlName] = MtlInfo();
+                    currentMtl = &materialMap[currentMtlName];
+                }
+            }
+            else if (currentMtl) // 确保有当前材质
+            {
+                if (tokens[0] == "Ka" && tokens.size() >= 4)
+                {
+                    currentMtl->m_ambientColor.r = DenormalizeByte(std::stof(tokens[1]));
+                    currentMtl->m_ambientColor.g = DenormalizeByte(std::stof(tokens[2]));
+                    currentMtl->m_ambientColor.b = DenormalizeByte(std::stof(tokens[3]));
+                }
+                else if (tokens[0] == "Kd" && tokens.size() >= 4)
+                {
+                    currentMtl->m_diffuseColor.r = DenormalizeByte(std::stof(tokens[1]));
+                    currentMtl->m_diffuseColor.g = DenormalizeByte(std::stof(tokens[2]));
+                    currentMtl->m_diffuseColor.b = DenormalizeByte(std::stof(tokens[3]));
+                }
+                else if (tokens[0] == "Ks" && tokens.size() >= 4)
+                {
+                    currentMtl->m_specularColor.r = DenormalizeByte(std::stof(tokens[1]));
+                    currentMtl->m_specularColor.g = DenormalizeByte(std::stof(tokens[2]));
+                    currentMtl->m_specularColor.b = DenormalizeByte(std::stof(tokens[3]));
+                }
+                else if (tokens[0] == "Ke" && tokens.size() >= 4)
+                {
+                    currentMtl->m_emissiveColor.r = DenormalizeByte(std::stof(tokens[1]));
+                    currentMtl->m_emissiveColor.g = DenormalizeByte(std::stof(tokens[2]));
+                    currentMtl->m_emissiveColor.b = DenormalizeByte(std::stof(tokens[3]));
+                }
+                else if (tokens[0] == "Ns" && tokens.size() >= 2)
+                {
+                    currentMtl->m_shininess = std::stof(tokens[1]);
+                }
+                else if ((tokens[0] == "d" || tokens[0] == "Tr") && tokens.size() >= 2)
+                {
+                    currentMtl->m_transparency = std::stof(tokens[1]);
+                }
+                else if (tokens[0] == "Ni" && tokens.size() >= 2)
+                {
+                    currentMtl->m_refractiveIndex = std::stof(tokens[1]);
+                }
+                else if (tokens[0] == "illum" && tokens.size() >= 2)
+                {
+                    currentMtl->m_illumModel = std::stoi(tokens[1]);
+                }
+                // 纹理贴图处理
+                else if (tokens[0] == "map_Kd" && tokens.size() >= 2)
+                {
+                    currentMtl->m_diffuseMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1)); // 处理带空格的路径
+                }
+                else if ((tokens[0] == "map_Bump" || tokens[0] == "bump") && tokens.size() >= 2)
+                {
+                    currentMtl->m_normalMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1));
+                }
+                else if (tokens[0] == "map_Ks" && tokens.size() >= 2)
+                {
+                    currentMtl->m_specularMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1));
+                }
+                else if (tokens[0] == "map_Ns" && tokens.size() >= 2)
+                {
+                    currentMtl->m_roughnessMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1));
+                }
+                else if (tokens[0] == "map_Ka" && tokens.size() >= 2)
+                {
+                    currentMtl->m_ambientMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1));
+                }
+                else if (tokens[0] == "map_d" && tokens.size() >= 2)
+                {
+                    currentMtl->m_opacityMap = ConstructTexturePath(mtlDirectory, 
+                        JoinStrings(tokens, 1));
+                }
+            }
+        }
+        catch (const std::exception& e)
+        {
+            UNUSED(e)
+            DebuggerPrintf("Warning: Error parsing MTL line: %s\n", line.c_str());
+            continue; // 跳过错误的行，继续解析
+        }
+    }
+    
+    return !materialMap.empty();
+}
+
+std::string ConstructTexturePath(const std::string& mtlDirectory, const std::string& texturePath)
+{
+    // 移除路径中的引号（如果有）
+    std::string cleanPath = texturePath;
+    if (!cleanPath.empty() && cleanPath.front() == '"')
+        cleanPath = cleanPath.substr(1);
+    if (!cleanPath.empty() && cleanPath.back() == '"')
+        cleanPath.pop_back();
+    
+    // 将反斜杠替换为正斜杠
+    std::replace(cleanPath.begin(), cleanPath.end(), '\\', '/');
+    
+    // 如果是绝对路径，直接返回
+    if (cleanPath.size() > 1 && cleanPath[1] == ':') // Windows绝对路径
+        return cleanPath;
+    if (!cleanPath.empty() && cleanPath[0] == '/') // Unix绝对路径
+        return cleanPath;
+    
+    return mtlDirectory + "/" + cleanPath;
 }
 
 
