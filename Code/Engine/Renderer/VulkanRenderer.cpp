@@ -69,6 +69,30 @@ void VulkanRenderer::Startup()
     CreateCommandBuffers();
     CreateSyncObjects();
 
+    // Create transfer command pool and fence for texture uploads
+    {
+        QueueFamilyIndices queueFamilyIndices = FindQueueFamilies(m_physicalDevice);
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
+
+        if (vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_transferCommandPool) != VK_SUCCESS)
+        {
+            ERROR_AND_DIE("Failed to create transfer command pool!");
+        }
+
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags = 0; // Not signaled initially
+
+        if (vkCreateFence(m_device, &fenceInfo, nullptr, &m_transferFence) != VK_SUCCESS)
+        {
+            ERROR_AND_DIE("Failed to create transfer fence!");
+        }
+    }
+
     // Create default resources
     SetDefaultTexture();
     CreateAndBindDefaultShader();
@@ -158,6 +182,18 @@ void VulkanRenderer::ShutDown()
         vkDestroySemaphore(m_device, m_frameData[i].imageAvailableSemaphore, nullptr);
         vkDestroyFence(m_device, m_frameData[i].inFlightFence, nullptr);
         vkDestroyCommandPool(m_device, m_frameData[i].commandPool, nullptr);
+    }
+
+    // Destroy transfer command pool and fence
+    if (m_transferFence != VK_NULL_HANDLE)
+    {
+        vkDestroyFence(m_device, m_transferFence, nullptr);
+        m_transferFence = VK_NULL_HANDLE;
+    }
+    if (m_transferCommandPool != VK_NULL_HANDLE)
+    {
+        vkDestroyCommandPool(m_device, m_transferCommandPool, nullptr);
+        m_transferCommandPool = VK_NULL_HANDLE;
     }
 
     for (size_t i = 0; i < m_uniformBuffers.size(); i++)
@@ -487,8 +523,6 @@ Texture* VulkanRenderer::CreateTextureFromImage(const Image& image, bool usingMi
 
 Texture* VulkanRenderer::CreateOrGetTextureFromFile(char const* imageFilePath, bool usingMipmaps)
 {
-    UNUSED(usingMipmaps);
-
     // Check if texture already exists
     Texture* existingTexture = GetTextureForFileName(imageFilePath);
     if (existingTexture)
@@ -496,11 +530,9 @@ Texture* VulkanRenderer::CreateOrGetTextureFromFile(char const* imageFilePath, b
         return existingTexture;
     }
 
-    // TODO: Implement proper texture loading with separate command pool and fence
-    // Current implementation causes Vulkan synchronization issues when loading during frame
-    // For now, return nullptr - debug text won't display but program won't crash
-    UNUSED(imageFilePath);
-    return nullptr;
+    // Create new texture using dedicated transfer command pool
+    Texture* newTexture = CreateTextureFromFile(imageFilePath, usingMipmaps);
+    return newTexture;
 }
 
 Texture* VulkanRenderer::CreateTextureFromData(char const* name, IntVec2 dimensions, int bytesPerTexel,
@@ -1588,11 +1620,11 @@ void VulkanRenderer::TransitionImageLayout(VkImage image, VkFormat format, VkIma
 {
     UNUSED(format);
 
-    // Begin single-time command buffer
+    // Use the dedicated transfer command pool
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = m_frameData[0].commandPool;
+    allocInfo.commandPool = m_transferCommandPool;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer;
@@ -1644,27 +1676,32 @@ void VulkanRenderer::TransitionImageLayout(VkImage image, VkFormat format, VkIma
 
     vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    // End and submit command buffer
+    // End and submit command buffer with fence
     vkEndCommandBuffer(commandBuffer);
+
+    // Reset fence before use
+    vkResetFences(m_device, 1, &m_transferFence);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
+    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_transferFence);
 
-    vkFreeCommandBuffers(m_device, m_frameData[0].commandPool, 1, &commandBuffer);
+    // Wait for fence instead of vkQueueWaitIdle
+    vkWaitForFences(m_device, 1, &m_transferFence, VK_TRUE, UINT64_MAX);
+
+    vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &commandBuffer);
 }
 
 void VulkanRenderer::CopyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height)
 {
-    // Begin single-time command buffer
+    // Use the dedicated transfer command pool
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = m_frameData[0].commandPool;
+    allocInfo.commandPool = m_transferCommandPool;
     allocInfo.commandBufferCount = 1;
 
     VkCommandBuffer commandBuffer;
@@ -1689,18 +1726,23 @@ void VulkanRenderer::CopyBufferToImage(VkBuffer buffer, VkImage image, uint32_t 
 
     vkCmdCopyBufferToImage(commandBuffer, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // End and submit command buffer
+    // End and submit command buffer with fence
     vkEndCommandBuffer(commandBuffer);
+
+    // Reset fence before use
+    vkResetFences(m_device, 1, &m_transferFence);
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
+    vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, m_transferFence);
 
-    vkFreeCommandBuffers(m_device, m_frameData[0].commandPool, 1, &commandBuffer);
+    // Wait for fence instead of vkQueueWaitIdle
+    vkWaitForFences(m_device, 1, &m_transferFence, VK_TRUE, UINT64_MAX);
+
+    vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &commandBuffer);
 }
 
 VkImageView VulkanRenderer::CreateImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags)

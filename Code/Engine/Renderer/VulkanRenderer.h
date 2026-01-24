@@ -270,6 +270,10 @@ private:
     VkBuffer m_stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory m_stagingBufferMemory = VK_NULL_HANDLE;
 
+    // Transfer command pool (for texture uploads, separate from frame command pools)
+    VkCommandPool m_transferCommandPool = VK_NULL_HANDLE;
+    VkFence m_transferFence = VK_NULL_HANDLE;
+
     // Resources
     std::vector<Texture*> m_loadedTextures;
     std::vector<BitmapFont*> m_loadedFonts;
