@@ -27,6 +27,7 @@ struct Mat44
 	static Mat44 const MakeXRotationDegrees(float rotationDegreesAboutX);
 	static Mat44 const MakeOrthoProjection(float left, float right, float bottom, float top, float zNear, float zFar);
 	static Mat44 const MakePerspectiveProjection(float fovYDegrees, float aspect, float zNear, float zFar);
+	static Mat44 const CreateLookAt(Vec3 const& eye, Vec3 const& target, Vec3 const& worldUp);
 
 	Vec2 const TransformVectorQuantity2D(Vec2 const& vectorQuantityXY) const;
 	Vec3 const TransformVectorQuantity3D(Vec3 const& vectorQuantityXYZ) const;
@@ -73,4 +74,6 @@ struct Mat44
 	void AppendScaleUniform3D(float uniformScaleXYZ);
 	void AppendScaleNonUniform2D(Vec2 const& nonUniformScaleXY);
 	void AppendScaleNonUniform3D(Vec3 const& nonUniformScaleXYZ);
+
+	Mat44 operator*(const Mat44& rhs) const;
 };

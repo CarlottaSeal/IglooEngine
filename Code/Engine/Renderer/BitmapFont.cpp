@@ -4,7 +4,6 @@
 #include "Engine/Core/VertexUtils.hpp"
 #include "Engine/Core/EngineCommon.hpp"
 #include "Engine/Core/StringUtils.hpp"
-#include "Game/Gamecommon.hpp"
 
 BitmapFont::BitmapFont(char const* fontFilePathNameWithNoExtension, Texture& fontTexture)
     :m_fontFilePathNameWithNoExtension(fontFilePathNameWithNoExtension)

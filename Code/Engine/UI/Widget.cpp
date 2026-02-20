@@ -1,5 +1,6 @@
 #include "Widget.h"
 
+#include "Canvas.hpp"
 #include "Engine/Core/EngineCommon.hpp"
 #include "Engine/Core/VertexUtils.hpp"
 #include "Engine/Input/InputSystem.hpp"
@@ -49,6 +50,39 @@ Widget::~Widget()
 {
 }
 
+Widget::Widget(Canvas* canvas, AABB2 const& bounds, std::string const& name)
+    : m_name(name)
+{
+    m_bound = bounds;
+    m_type = WIDGET;
+    InitializeComponentMode(canvas);
+}
+
+void Widget::StartUp()
+{
+    UIElement::StartUp();
+    for (auto* child : m_children)
+        {
+        if (child) {
+            child->StartUp();
+        }
+    }
+}
+
+void Widget::ShutDown()
+{
+    UIElement::ShutDown();
+    for (auto* child : m_children)
+    {
+        if (child)
+        {
+            child->ShutDown();
+            delete child;
+        }
+    }
+    m_children.clear();
+}
+
 void Widget::Update()
 {
     if (m_isEnabled)
@@ -71,7 +105,7 @@ void Widget::Render() const
         g_theUISystem->GetRenderer()->SetRasterizerMode(RasterizerMode::SOLID_CULL_NONE);
         g_theUISystem->GetRenderer()->SetDepthMode(DepthMode::DISABLED);
         g_theUISystem->GetRenderer()->BindShader(nullptr);
-        g_theUISystem->GetRenderer()->BindTexture(nullptr); //TODO: button texture pictures~
+        g_theUISystem->GetRenderer()->BindTexture(nullptr);
         g_theUISystem->GetRenderer()->DrawVertexArray(m_verts);
         g_theUISystem->GetRenderer()->BindTexture(&g_theUISystem->GetBitmapFont()->GetTexture());
         g_theUISystem->GetRenderer()->DrawVertexArray(m_textVerts);
@@ -85,15 +119,29 @@ void Widget::Render() const
 
 void Widget::SetEnabled(bool enabled)
 {
+    bool wasEnabled = m_isEnabled;
     m_isEnabled = enabled;
+    
     if (enabled)
     {
         m_isInteractive = false;
-        g_theUISystem->QueueEnableInputNextFrame(this); // 延迟一帧启用交互
+        g_theUISystem->QueueEnableInputNextFrame(this);
+        
+        // 触发启用事件（新增）
+        if (!wasEnabled)
+        {
+            m_onEnabledUIEvent.Invoke();
+        }
     }
     else
     {
         m_isInteractive = false;
+        
+        // 触发禁用事件（新增）
+        if (wasEnabled)
+        {
+            m_onDisabledUIEvent.Invoke();
+        }
     }
 }
 
@@ -160,12 +208,16 @@ void Widget::OnClick()
     }
     else
     {
+        // 1. 触发原有的 EventSystem（向后兼容）
         if (m_onClickEvent != "")
         {
-			EventArgs args;
-			args.SetValue("value", m_onClickEvent);
-			g_theEventSystem->FireEvent(m_onClickEvent, args);
-        }        
+            EventArgs args;
+            args.SetValue("value", m_onClickEvent);
+            g_theEventSystem->FireEvent(m_onClickEvent, args);
+        }
+        
+        // 2. 触发新的 UIEvent（新功能）
+        m_onClickUIEvent.Invoke();  
     }
 }
 
@@ -180,6 +232,54 @@ void Widget::UpdateIfClicked()
     }
 }
 
+size_t Widget::OnClickEvent(UICallbackFunctionPointer const& callback)
+{
+    return m_onClickUIEvent.AddListener(callback);
+}
+
+size_t Widget::OnEnabledEvent(UICallbackFunctionPointer const& callback)
+{
+    return m_onEnabledUIEvent.AddListener(callback);
+}
+
+size_t Widget::OnDisabledEvent(UICallbackFunctionPointer const& callback)
+{
+    return m_onDisabledUIEvent.AddListener(callback);
+}
+
 void Widget::Build()
 {
+}
+
+void Widget::AddChildWidget(UIElement* child)
+{
+    if (child)
+    {
+        AddChild(*child);
+        child->SetParent(this);
+    }
+}
+
+void Widget::RemoveChildWidget(UIElement* child)
+{
+    if (child)
+    {
+        RemoveChild(child);
+        child->SetParent(nullptr);
+    }
+}
+
+void Widget::InitializeComponentMode(Canvas* canvas)
+{
+    m_isStandaloneMode = false;
+    m_parentCanvas = canvas;
+    
+    // 从父 Canvas 获取 Camera 引用
+    if (m_parentCanvas)
+    {
+        m_renderCamera = *m_parentCanvas->GetCamera();
+        
+        // 自动添加到 Canvas
+        m_parentCanvas->AddElementToCanvas(this);
+    }
 }

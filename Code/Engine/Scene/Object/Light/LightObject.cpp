@@ -20,6 +20,7 @@ LightObject::LightObject(uint32_t id, const std::string& name, LightObjectType l
     {
         m_ambience = ambience;
         m_lightColor = lightColor;
+        m_originalAlpha = lightColor.a;
         m_innerRadius = innerRadius;
         m_outerRadius = outerRadius;
         m_innerDotThresholds = -1.f;
@@ -29,6 +30,8 @@ LightObject::LightObject(uint32_t id, const std::string& name, LightObjectType l
     if (lightType == LIGHT_SPOT)
     {
         m_ambience = ambience;
+        m_lightColor = lightColor;
+        m_originalAlpha = lightColor.a;
         m_spotForward = spotForward;
         m_innerRadius = innerRadius;
         m_outerRadius = outerRadius;

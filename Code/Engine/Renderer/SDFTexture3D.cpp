@@ -7,6 +7,8 @@
 #include <d3dcompiler.h>
 #include <dxgi.h>
 
+#include "DX12Renderer.hpp"
+
 //Link some libraries
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")

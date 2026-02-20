@@ -10,7 +10,6 @@ enum JobType: uint32_t
     JOB_TYPE_COUNT
 };
 
-// Job ---------------------------------
 class Job
 {
 public:
@@ -27,7 +26,6 @@ public:
     uint32_t m_jobType = 0;  
 };
 
-// Worker Thread ---------------------------------
 class JobSystem;
 
 class JobWorkerThread
@@ -50,7 +48,6 @@ private:
     bool m_isQuitting = false;
 };
 
-// Job System ---------------------------------
 struct JobSystemConfig
 {
     int m_numWorkerThreads;

@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 
+#include "IntVec3.h"
 #include "RandomNumberGenerator.hpp"
 
 constexpr float PI = 3.1415926535897932384626433832795f;
@@ -143,6 +144,11 @@ float GetDistanceXYSquared3D(Vec3 const& positionA, Vec3 const& positionB)
 int GetTaxicabDistance2D(IntVec2 const& pointA, IntVec2 const& pointB)
 {
 	return abs(pointA.x - pointB.x) + abs(pointA.y - pointB.y);
+}
+
+int GetTaxicabDistance3D(IntVec3 const& pointA, IntVec3 const& pointB)
+{
+	return abs(pointA.x - pointB.x) + abs(pointA.y - pointB.y) + abs(pointA.z - pointB.z);
 }
 
 float GetProjectedLength2D(Vec2 const& vectorToProject, Vec2 const& vectorToProjectOnto)

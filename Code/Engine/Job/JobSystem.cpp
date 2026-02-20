@@ -38,57 +38,69 @@ void JobWorkerThread::ThreadMain()
     {
         Job* job = nullptr;
 
-		{
-			std::unique_lock<std::mutex> lk(m_jobSystem->m_jobQueueMutex);
-			m_jobSystem->m_workAvailable.wait(lk, [this] {
-				return m_jobSystem->m_isQuitting || m_isQuitting || !m_jobSystem->m_pendingJobs.empty();
-				});
-			if (m_jobSystem->m_isQuitting || m_isQuitting)
-				break;
-
-			// 找到我能干的 job，移出 pending，放到 executing
-			for (auto it = m_jobSystem->m_pendingJobs.begin(); it != m_jobSystem->m_pendingJobs.end(); ++it)
-			{
-				if (CanExecuteJob(*it))
-				{
-					job = *it;
-					m_jobSystem->m_pendingJobs.erase(it);
-					m_jobSystem->m_executingJobs.push_back(job);
-					break;
-				}
-			}
-		}
-
-		if (!job)
-		{
-			// dont sleep with lock!
-			//std::this_thread::sleep_for(std::chrono::milliseconds(1));
-			std::this_thread::yield();
-			continue;
-		}
-
-		//no lock!
-		try 
         {
-			job->Execute();
+            std::unique_lock<std::mutex> lk(m_jobSystem->m_jobQueueMutex);
 
-		}
-		catch (...) 
+            // ✅ 等待直到有job或退出
+            m_jobSystem->m_workAvailable.wait(lk, [this] {
+                if (m_jobSystem->m_isQuitting || m_isQuitting)
+                    return true;
+
+                // ✅ 检查是否有我能执行的job
+                for (Job* j : m_jobSystem->m_pendingJobs)
+                {
+                    if (CanExecuteJob(j))
+                        return true;
+                }
+                return false;
+                });
+
+            if (m_jobSystem->m_isQuitting || m_isQuitting)
+                break;
+
+            // 找到我能干的 job
+            for (auto it = m_jobSystem->m_pendingJobs.begin();
+                it != m_jobSystem->m_pendingJobs.end(); ++it)
+            {
+                if (CanExecuteJob(*it))
+                {
+                    job = *it;
+                    m_jobSystem->m_pendingJobs.erase(it);
+                    m_jobSystem->m_executingJobs.push_back(job);
+                    break;
+                }
+            }
+        }
+
+        // ✅ 移除 yield 和 continue，如果没找到job也不会到这里
+        // 因为wait只有在有合适的job时才返回
+
+        if (!job)  // 理论上不会发生，但保险起见
+            continue;
+
+        // 执行job（无锁）
+        try
         {
-		}
-		{
-			std::lock_guard<std::mutex> lk(m_jobSystem->m_jobQueueMutex);
-			auto it = std::find(m_jobSystem->m_executingJobs.begin(), m_jobSystem->m_executingJobs.end(), job);
-			if (it != m_jobSystem->m_executingJobs.end())
-			{
-				m_jobSystem->m_executingJobs.erase(it);
-				m_jobSystem->m_completedJobs.push_back(job);
-			}
-		}
-		// m_jobSystem->m_workAvailable.notify_all(); 
-	}
-	//g_theDevConsole->AddLine(Rgba8::CYAN,
-	//	Stringf("Thread %d: Executing job", m_threadID));
+            job->Execute();
+        }
+        catch (...)
+        {
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(m_jobSystem->m_jobQueueMutex);
+            auto it = std::find(m_jobSystem->m_executingJobs.begin(),
+                m_jobSystem->m_executingJobs.end(), job);
+            if (it != m_jobSystem->m_executingJobs.end())
+            {
+                m_jobSystem->m_executingJobs.erase(it);
+                m_jobSystem->m_completedJobs.push_back(job);
+            }
+        }
+
+        // ✅ 唤醒其他可能在等待的线程（job完成可能解锁依赖）
+        m_jobSystem->m_workAvailable.notify_all();
+    }
 }
 
 bool JobWorkerThread::CanExecuteJob(Job* job)

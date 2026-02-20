@@ -231,14 +231,16 @@ Frustum Camera::GetFrustum() const
 
 void Camera::UpdateFrustum()
 {
-	// 简单直接的方法：构建 ViewProjection = Projection * View
+	// 完整变换链: World → Camera → Render → Clip
+	// viewProj = Projection * CameraToRender * WorldToCamera
 	Mat44 view = GetWorldToCameraTransform();
+	Mat44 cameraToRender = GetCameraToRenderTransform();
 	Mat44 proj = GetProjectionMatrix();
 
-	// 对于列主序矩阵，Append实现的是右乘
-	// 结果: viewProj = proj * view
+	// Append 实现右乘: A.Append(B) → A = A * B
 	Mat44 viewProj = proj;
-    viewProj.Append(proj);  
+	viewProj.Append(cameraToRender);  // proj * cameraToRender
+	viewProj.Append(view);            // proj * cameraToRender * view
 
 	// 直接从ViewProjection矩阵提取frustum平面
 	m_frustum = Frustum::FromViewProjectionMatrix(viewProj, this);

@@ -19,7 +19,6 @@ struct cgltf_material;
 
 bool LoadStaticMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int>& indices, std::string const& filePath, bool flipUV = false, std::string const& mtlPath = "");
 bool LoadOBJMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int>& indices, std::string const& filePath, bool flipUV = false, std::string const& mtlPath = "");
-bool LoadOBJMaterial(std::string const& path, std::map<std::string, Rgba8>& outMap) noexcept;
 void ComputeMissingNormals(std::vector<Vertex_PCUTBN>& verts);
 void ComputeMissingUVs(std::vector<Vertex_PCUTBN>& verts, bool flipUV = false);
 void ComputeMissingTangentsBitangents(std::vector<Vertex_PCUTBN>& verts);
@@ -29,6 +28,10 @@ void ComputeTangentsBitangentsIndexed(std::vector<Vertex_PCUTBN>& verts, std::ve
 bool LoadGLBMeshFile(std::vector<Vertex_PCUTBN>& verts, std::vector<unsigned int>& indices, std::string const& path, bool flipUV = false);
 cgltf_data* LoadGLTFDataFromFile(const std::string& path);
 Image* LoadImageDueToGLTFData(cgltf_data* data, GLBChannel channelType = GLBChannel::Albedo, std::string glbPath = "");
+
+bool LoadOBJMaterial(std::string const& path, std::map<std::string, Rgba8>& outMap) noexcept;
+bool LoadOBJMaterial(std::string const& path, std::map<std::string, MtlInfo>& materialMap) noexcept;
+std::string ConstructTexturePath(const std::string& mtlDirectory, const std::string& texturePath);
 
 struct VertexKey
 {

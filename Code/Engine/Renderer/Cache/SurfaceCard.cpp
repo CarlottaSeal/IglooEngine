@@ -2,11 +2,6 @@
 
 #include "Engine/Math/MathUtils.hpp"
 
-// ========================================
-// SurfaceCardTemplate 实现
-// 坐标系：+X=东，+Y=北，+Z=上
-// ========================================
-
 Vec3 SurfaceCardTemplate::GetLocalNormal() const //改为朝向模型内部
 {
 	switch (m_direction)
@@ -26,7 +21,7 @@ Vec3 SurfaceCardTemplate::GetLocalAxisX() const
 	switch (m_direction)
 	{
 	case 0: return Vec3(0, 1, 0);   // +X面: 北方向
-	case 1: return Vec3(0, -1, 0);  // -X面: 南方向（保持一致性）⚠
+	case 1: return Vec3(0, -1, 0);  // -X面: 南方向
 	case 2: return Vec3(1, 0, 0);   // +Y面: 东方向
 	case 3: return Vec3(-1, 0, 0);  // -Y面: 西方向 
 	case 4: return Vec3(1, 0, 0);   // +Z面: 东方向

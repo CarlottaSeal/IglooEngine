@@ -43,3 +43,18 @@ int FileReadToString(std::string& outString, const std::string& fileName)
 
 	return size;
 }
+
+bool FileWriteFromBuffer(const std::vector<uint8_t>& buffer, const std::string& fileName)
+{
+	FILE* file = nullptr;
+	errno_t err = fopen_s(&file, fileName.c_str(), "wb");
+	if (err != 0 || file == nullptr)
+	{
+		return false;
+	}
+
+	size_t bytesWritten = fwrite(buffer.data(), 1, buffer.size(), file);
+	fclose(file);
+
+	return bytesWritten == buffer.size();
+}

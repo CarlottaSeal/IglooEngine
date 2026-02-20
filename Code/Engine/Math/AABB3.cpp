@@ -36,6 +36,11 @@ float AABB3::GetVolume() const
 	return (m_maxs.x - m_mins.x) * (m_maxs.y - m_mins.y) * (m_maxs.z - m_mins.z);
 }
 
+Vec3 AABB3::GetCenter() const
+{
+	return (m_mins + m_maxs)*0.5f;
+}
+
 std::vector<Vec3> AABB3::GetCorners() const
 {
 	std::vector<Vec3> corners;
@@ -73,4 +78,10 @@ void AABB3::StretchToIncludeAABB(const AABB3& other)
 {
 	StretchToIncludePoint(other.m_mins);
 	StretchToIncludePoint(other.m_maxs);
+}
+
+void AABB3::Translate(const Vec3& translation)
+{
+	m_mins += translation;
+	m_maxs += translation;
 }

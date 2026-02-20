@@ -22,8 +22,8 @@ struct SurfaceCardMetadata
 	float m_padding3;
  
 	float m_worldSizeX, m_worldSizeY;
-	uint8_t m_direction;         // 0-5
-	uint8_t m_padding4[1];
+	uint32_t  m_direction;         // 0-5
+	uint32_t  m_globalCardID;
  
 	uint32_t m_lightMask[4];     // 支持128个lights
 };
@@ -49,6 +49,7 @@ enum SurfaceCacheLayerType
     SURFACE_CACHE_LAYER_NORMAL,
     SURFACE_CACHE_LAYER_MATERIAL,
     SURFACE_CACHE_LAYER_DIRECT_LIGHT,
+    SURFACE_CACHE_LAYER_COMBINED_LIGHT,
     SURFACE_CACHE_LAYER_COUNT
 };
 

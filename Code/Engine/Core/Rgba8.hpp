@@ -35,6 +35,10 @@ public:
 	{
 		return (r == other.r) && (g == other.g) && (b == other.b) && (a == other.a);
 	}
+	bool operator!=(const Rgba8& other) const
+	{
+		return (r != other.r) | (g != other.g) | (b != other.b) | (a != other.a);
+	}
 };
 
 Rgba8 InterpolateRgba8(Rgba8 start, Rgba8 end, float fractionOfEnd);

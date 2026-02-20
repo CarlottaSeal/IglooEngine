@@ -15,6 +15,7 @@ enum LightObjectType
 class LightObject : public SceneObject
 {
     friend class Scene;
+    friend class DX12Renderer;
     
 public:
     LightObject(uint32_t id, const std::string& name, LightObjectType lightType, Vec3 position, Rgba8 sunColor = Rgba8::WHITE, Vec3 sunDirection = Vec3(),
@@ -32,6 +33,7 @@ public:
     
     LightObjectType GetLightType() const { return m_lightType; }
     int GetGeneralLightID() const { return m_generalLightID; }
+    float GetOuterRadius() const { return m_outerRadius; }
     
 protected:
     virtual void OnTransformChanged() override;
@@ -39,7 +41,7 @@ protected:
     
 protected:
     LightObjectType m_lightType;
-    int m_generalLightID;
+    int m_generalLightID = -1;  // -1 表示未分配（方向光或尚未注册）
     Vec3 m_sunDirection;
     Rgba8 m_sunColor;
     Rgba8 m_lightColor;
@@ -50,6 +52,7 @@ protected:
     float m_outerRadius;
     float m_innerDotThresholds = 30.0f;
     float m_outerDotThresholds = 45.0f;
+    unsigned char m_originalAlpha = 255;
 
     //std::vector<uint32_t> m_affectedTiles;
     std::vector<uint32_t> m_affectedCards;

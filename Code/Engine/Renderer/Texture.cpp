@@ -36,4 +36,5 @@ Texture::~Texture()
 	DX_SAFE_RELEASE(m_dx12Texture);
 #endif
 
+	// Note: Vulkan resources are cleaned up by VulkanRenderer
 }

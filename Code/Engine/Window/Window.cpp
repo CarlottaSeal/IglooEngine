@@ -17,9 +17,14 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 	InputSystem* input = Window::s_mainWindow->m_config.m_inputSystem;
 
 	extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-	if (ImGui_ImplWin32_WndProcHandler(windowHandle, wmMessageCode, wParam, lParam))
+	ImGui_ImplWin32_WndProcHandler(windowHandle, wmMessageCode, wParam, lParam);
+	// Note: we always fall through so WM_KEYDOWN/WM_KEYUP reach the game InputSystem.
+	// ImGui uses its own IO state; game keys (V, M, etc.) must not be swallowed.
+
+	// Forward Wintab messages to tablet input
+	if (input && input->GetTablet().HandleMessage(windowHandle, wmMessageCode, wParam, lParam))
 	{
-		return true;
+		return 0;
 	}
 
 	switch (wmMessageCode)
@@ -34,45 +39,41 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 
 	case WM_CHAR:
 	{
-		EventArgs args;
-		args.SetValue("CharCode", Stringf("%d", (unsigned char)wParam));
-		FireEvent("CharInput", args);
-		
+		if (input && !input->ShouldIgnoreKeyboardInput())
+		{
+			EventArgs args;
+			args.SetValue("CharCode", Stringf("%d", (unsigned char)wParam));
+			FireEvent("CharInput", args);
+		}
 		break;
 	}
-
 	// Raw physical keyboard "key-was-just-depressed" event (case-insensitive, not translated)
 	case WM_KEYDOWN:
 	{
-		unsigned char asKey = (unsigned char)wParam;
-
-		//input->HandleKeyPressed(asKey);
-
-		EventArgs args;
-		args.SetValue("KeyCode", Stringf("%d", asKey));
-		FireEvent("KeyPressed", args);
-
+		if (input && !input->ShouldIgnoreKeyboardInput())
+		{
+			unsigned char asKey = (unsigned char)wParam;
+			EventArgs args;
+			args.SetValue("KeyCode", Stringf("%d", asKey));
+			FireEvent("KeyPressed", args);
+		}
 		break;
 	}
-
 	// Raw physical keyboard "key-was-just-released" event (case-insensitive, not translated)
 	case WM_KEYUP:
 	{
-
-		unsigned char asKey = (unsigned char)wParam;
-		//input->HandleKeyReleased(asKey);
-		// #SD1ToDo: Tell the App (or InputSystem later) about this key-released event...
-
-		EventArgs args;
-		args.SetValue("KeyCode", Stringf("%d", asKey));
-		FireEvent("KeyReleased", args);
-
+		if (input && !input->ShouldIgnoreKeyboardInput())
+		{
+			unsigned char asKey = (unsigned char)wParam;
+			EventArgs args;
+			args.SetValue("KeyCode", Stringf("%d", asKey));
+			FireEvent("KeyReleased", args);
+		}
 		break;
 	}
-
 	case WM_LBUTTONDOWN:
 	{
-		if (input)
+		if (input && !input->ShouldIgnoreMouseInput())
 		{
 			input->HandleKeyPressed(KEYCODE_LEFT_MOUSE);
 		}
@@ -81,7 +82,7 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 
 	case WM_LBUTTONUP:
 	{
-		if (input)
+		if (input && !input->ShouldIgnoreMouseInput())
 		{
 			input->HandleKeyReleased(KEYCODE_LEFT_MOUSE);
 		}
@@ -90,7 +91,7 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 
 	case WM_RBUTTONDOWN:
 	{
-		if (input)
+		if (input && !input->ShouldIgnoreMouseInput())
 		{
 			input->HandleKeyPressed(KEYCODE_RIGHT_MOUSE);
 		}
@@ -99,13 +100,26 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 
 	case WM_RBUTTONUP:
 	{
-		if (input)
+		if (input && !input->ShouldIgnoreMouseInput())
 		{
 			input->HandleKeyReleased(KEYCODE_RIGHT_MOUSE);
 		}
 		return 0;
 	}
-
+	case WM_MOUSEWHEEL:
+		{
+			if (input)
+			{
+				// ImGui 会处理它需要的滚轮输入
+				// 但我们仍然可以记录滚轮 delta 供游戏使用
+				if (!input->ShouldIgnoreMouseInput())
+				{
+					float wheelDelta = GET_WHEEL_DELTA_WPARAM(wParam) / (float)WHEEL_DELTA;
+					input->AddMouseWheelDelta(wheelDelta);
+				}
+			}
+			return 0;
+		}
 		//Alt+Enter
 	case WM_SYSKEYDOWN:
 		{
@@ -120,7 +134,6 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 			break;
 		}
 	}
-
 	// Send back to Windows any unhandled/unconsumed messages we want other apps to see (e.g. play/pause in music apps, etc.)
 	return DefWindowProc(windowHandle, wmMessageCode, wParam, lParam);
 }
@@ -146,6 +159,13 @@ void Window::Startup()
 {
 	//CreateOSWindow(applicationInstanceHandle, m_config.m_aspectRatio);
 	CreateOSWindow();
+
+	// Initialize tablet input if InputSystem is available
+	if (m_config.m_inputSystem)
+	{
+		bool tabletFound = m_config.m_inputSystem->GetTablet().Startup(m_windowHandle);
+		(void)tabletFound; // OK if no tablet detected
+	}
 }
 
 void Window::BeginFrame()
@@ -159,6 +179,10 @@ void Window::EndFrame()
 
 void Window::Shutdown()
 {
+	if (m_config.m_inputSystem)
+	{
+		m_config.m_inputSystem->GetTablet().Shutdown();
+	}
 }
 
 void Window::ToggleFullscreen()

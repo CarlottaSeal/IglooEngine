@@ -16,7 +16,8 @@ class BitmapFont
 	friend class Renderer; // Only the Renderer can create new BitmapFont objects!
 	friend class DX11Renderer;
 	friend class DX12Renderer;
-	
+	friend class VulkanRenderer;
+
 private:
 	BitmapFont(char const* fontFilePathNameWithNoExtension, Texture& fontTexture);
 

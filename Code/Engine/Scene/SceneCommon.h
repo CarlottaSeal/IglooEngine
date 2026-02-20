@@ -6,6 +6,8 @@
 #include "Engine/Math/AABB3.hpp"
 #include "Engine/Math/Mat44.hpp"
 
+constexpr int MAX_MESH_COUNT = 128;
+
 struct SurfaceCard;
 
 static std::vector<float> GetCommonScales()
@@ -16,7 +18,6 @@ static std::vector<float> GetCommonScales()
 struct GIObjectEntry
 {
     uint32_t m_objectID;
-    uint32_t m_sdfSRVIndex;
     Mat44 m_worldTransform;
     AABB3 m_worldBounds;
     //std::vector<SurfaceCard> m_cardInstances;

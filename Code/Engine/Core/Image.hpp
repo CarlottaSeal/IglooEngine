@@ -10,6 +10,7 @@ class Image
 	friend class Renderer;
 	friend class DX11Renderer;
 	friend class DX12Renderer;
+	friend class VulkanRenderer;
 
 public:
 	Image();

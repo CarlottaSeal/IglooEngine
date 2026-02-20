@@ -70,6 +70,13 @@ void UIElement::SetInteractive(bool isInteractive)
 
 bool UIElement::IsEnabled()
 {
+    if (!this)
+        return false;
+    return m_isEnabled&&m_isInteractive;
+}
+
+bool UIElement::IsEnabled() const
+{
     return m_isEnabled&&m_isInteractive;
 }
 
