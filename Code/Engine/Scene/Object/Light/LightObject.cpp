@@ -97,9 +97,8 @@ AABB3 LightObject::GetWorldBounds() const
 
 void LightObject::OnTransformChanged()
 {
-    UpdateAffectedCards();
-    //m_hasMoved = true;
-    //m_shadowMapDirty = true;
+    SceneObject::OnTransformChanged(); // sets m_worldMatrixDirty so Scene::Update detects the move
+    // UpdateAffectedCards is called by Scene::Update with throttling
 }
 
 void LightObject::OnCreate(Scene* scene)

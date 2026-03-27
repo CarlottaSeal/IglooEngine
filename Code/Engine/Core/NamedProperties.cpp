@@ -22,9 +22,7 @@ NamedProperties& NamedProperties::operator=(NamedProperties const& copyFrom)
 	return *this;
 }
 
-//-----------------------------------------------------------------------------------------------
 // String SetValue: always stored as std::string internally
-//-----------------------------------------------------------------------------------------------
 void NamedProperties::SetValue(std::string const& keyName, std::string const& value)
 {
 	HashedCaseInsensitiveString hcisKey(keyName);
@@ -36,9 +34,6 @@ void NamedProperties::SetValue(std::string const& keyName, char const* value)
 	SetValue(keyName, std::string(value));
 }
 
-//-----------------------------------------------------------------------------------------------
-// String GetValue
-//-----------------------------------------------------------------------------------------------
 std::string NamedProperties::GetValue(std::string const& keyName, std::string const& defaultValue) const
 {
 	HashedCaseInsensitiveString hcisKey(keyName);
@@ -58,9 +53,7 @@ std::string NamedProperties::GetValue(std::string const& keyName, char const* de
 	return GetValue(keyName, std::string(defaultValue));
 }
 
-//-----------------------------------------------------------------------------------------------
 // Primitive type GetValue: tries exact type match first, then string conversion fallback
-//-----------------------------------------------------------------------------------------------
 bool NamedProperties::GetValue(std::string const& keyName, bool defaultValue) const
 {
 	HashedCaseInsensitiveString hcisKey(keyName);
@@ -116,9 +109,7 @@ float NamedProperties::GetValue(std::string const& keyName, float defaultValue) 
 	return defaultValue;
 }
 
-//-----------------------------------------------------------------------------------------------
 // Engine type GetValue: exact type match + string conversion via SetFromText
-//-----------------------------------------------------------------------------------------------
 Rgba8 NamedProperties::GetValue(std::string const& keyName, Rgba8 const& defaultValue) const
 {
 	HashedCaseInsensitiveString hcisKey(keyName);
@@ -182,7 +173,7 @@ IntVec2 NamedProperties::GetValue(std::string const& keyName, IntVec2 const& def
 	return defaultValue;
 }
 
-//-----------------------------------------------------------------------------------------------
+
 void NamedProperties::PopulateFromXmlElementAttributes(XmlElement const& element)
 {
 	const XmlAttribute* attribute = element.FirstAttribute();

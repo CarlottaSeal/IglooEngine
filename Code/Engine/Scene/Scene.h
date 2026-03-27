@@ -149,6 +149,7 @@ public:
     Rgba8 m_sunColor = Rgba8(90,90,90,255);
     bool m_sunDirectionDirty = true; // dirty flag for shadow map update
     bool m_pointLightDirty = false;  // dirty flag for point light changes (triggers UpdateDirectLightPass)
+    bool m_pointLightShadowDirty = false; // per-frame: shadow maps must track moving lights
     bool m_suppressCaptureDirty = false; // internal: suppress adding to m_dirtyCardIDs during light updates
 
     void SetSunDirection(const Vec3& dir) { m_sunDirection = dir; m_sunDirectionDirty = true; }

@@ -7,6 +7,9 @@
     <Filter Include="Core">
       <UniqueIdentifier>{83168e6c-b289-d732-cc78-427b51f93153}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Core\Event">
+      <UniqueIdentifier>{a1f2c3d4-e5f6-7890-abcd-ef1234567890}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Input">
       <UniqueIdentifier>{324118a6-721d-d6b8-a9b9-f4e327df2bf5}</UniqueIdentifier>
     </Filter>
@@ -126,8 +129,8 @@
     <ClCompile Include="Core\ErrorWarningAssert.cpp">
       <Filter>Core</Filter>
     </ClCompile>
-    <ClCompile Include="Core\EventSystem.cpp">
-      <Filter>Core</Filter>
+    <ClCompile Include="Core\Event\EventSystem.cpp">
+      <Filter>Core\Event</Filter>
     </ClCompile>
     <ClCompile Include="Core\BufferParser.cpp">
       <Filter>Core</Filter>
@@ -178,6 +181,9 @@
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="Core\Vertex_PCUTBN.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
+    <ClCompile Include="Core\Vertex_Font.cpp">
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="Core\XmlUtils.cpp">
@@ -280,6 +286,9 @@
       <Filter>Math</Filter>
     </ClCompile>
     <ClCompile Include="Renderer\BitmapFont.cpp">
+      <Filter>Renderer</Filter>
+    </ClCompile>
+    <ClCompile Include="Renderer\BMFont.cpp">
       <Filter>Renderer</Filter>
     </ClCompile>
     <ClCompile Include="Renderer\Cache\CardBVH.cpp">
@@ -545,6 +554,9 @@
     <ClInclude Include="Core\EventSystem.hpp">
       <Filter>Core</Filter>
     </ClInclude>
+    <ClInclude Include="Core\Event\EventSystem.hpp">
+      <Filter>Core\Event</Filter>
+    </ClInclude>
     <ClInclude Include="Core\BufferParser.hpp">
       <Filter>Core</Filter>
     </ClInclude>
@@ -594,6 +606,9 @@
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="Core\Vertex_PCUTBN.hpp">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Core\Vertex_Font.hpp">
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="Core\XmlUtils.hpp">
@@ -696,6 +711,9 @@
       <Filter>Math</Filter>
     </ClInclude>
     <ClInclude Include="Renderer\BitmapFont.hpp">
+      <Filter>Renderer</Filter>
+    </ClInclude>
+    <ClInclude Include="Renderer\BMFont.hpp">
       <Filter>Renderer</Filter>
     </ClInclude>
     <ClInclude Include="Renderer\Cache\CardBVH.h">

@@ -2,6 +2,7 @@
 #include "Engine/Renderer/DX11Renderer.hpp"
 #include "Engine/Renderer/Camera.hpp"
 #include "Engine/Renderer/BitmapFont.hpp"
+#include "Engine/Renderer/BMFont.hpp"
 #include "Engine/Renderer/Renderer.hpp"
 #include "Engine/Renderer/Shader.hpp"
 #include "Engine/Renderer/VertexBuffer.hpp"
@@ -232,6 +233,32 @@ void Renderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
 #endif
 }
 
+void Renderer::DrawVertexArray(const std::vector<Vertex_Font>& verts)
+{
+#ifdef ENGINE_DX11_RENDERER
+	m_dx11Renderer->DrawVertexArray(verts);
+#endif
+#ifdef ENGINE_DX12_RENDERER
+	UNUSED(verts);
+#endif
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(verts);
+#endif
+}
+
+void Renderer::DrawVertexArray(int numVerts, const Vertex_Font* verts)
+{
+#ifdef ENGINE_DX11_RENDERER
+	m_dx11Renderer->DrawVertexArray(numVerts, verts);
+#endif
+#ifdef ENGINE_DX12_RENDERER
+	UNUSED(numVerts); UNUSED(verts);
+#endif
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(numVerts); UNUSED(verts);
+#endif
+}
+
 void Renderer::DrawVertexIndexArray(int numVerts, const Vertex_PCUTBN* verts, int numIndices, const unsigned int* indices)
 {
 	#ifdef ENGINE_DX11_RENDERER
@@ -444,6 +471,49 @@ BitmapFont* Renderer::CreateOrGetBitmapFont(const char* bitmapFontFilePathWithNo
 	#endif
 #ifdef ENGINE_VULKAN_RENDERER
 	return m_vulkanRenderer->CreateOrGetBitmapFont(bitmapFontFilePathWithNoExtension);
+#endif
+}
+
+BitmapFont* Renderer::CreateOrGetProportionalFont(const char* bitmapFontFilePathWithNoExtension)
+{
+#ifdef ENGINE_DX11_RENDERER
+	return m_dx11Renderer->CreateOrGetProportionalFont(bitmapFontFilePathWithNoExtension);
+#endif
+#ifdef ENGINE_DX12_RENDERER
+	UNUSED(bitmapFontFilePathWithNoExtension);
+	return nullptr;
+#endif
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(bitmapFontFilePathWithNoExtension);
+	return nullptr;
+#endif
+}
+
+BMFont* Renderer::CreateOrGetBMFont(const char* fntFilePath)
+{
+#ifdef ENGINE_DX11_RENDERER
+	return m_dx11Renderer->CreateOrGetBMFont(fntFilePath);
+#endif
+#ifdef ENGINE_DX12_RENDERER
+	UNUSED(fntFilePath);
+	return nullptr;
+#endif
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(fntFilePath);
+	return nullptr;
+#endif
+}
+
+void Renderer::SetFontConstants(float sdfThreshold, float sdfSmoothRange, float time, float weight)
+{
+#ifdef ENGINE_DX11_RENDERER
+	m_dx11Renderer->SetFontConstants(sdfThreshold, sdfSmoothRange, time, weight);
+#endif
+#ifdef ENGINE_DX12_RENDERER
+	UNUSED(sdfThreshold); UNUSED(sdfSmoothRange); UNUSED(time); UNUSED(weight);
+#endif
+#ifdef ENGINE_VULKAN_RENDERER
+	UNUSED(sdfThreshold); UNUSED(sdfSmoothRange); UNUSED(time); UNUSED(weight);
 #endif
 }
 

@@ -8,9 +8,7 @@
 #include <string>
 #include <memory>
 
-//-----------------------------------------------------------------------------------------------
 // Type-erased base for storing arbitrary property values
-//-----------------------------------------------------------------------------------------------
 class NamedPropertyBase
 {
 public:
@@ -31,11 +29,7 @@ public:
 	}
 };
 
-//-----------------------------------------------------------------------------------------------
-// NamedProperties: strongly-typed mixed-type key-value container
-// Superset of NamedStrings - all NamedStrings operations work here too
-//-----------------------------------------------------------------------------------------------
-class NamedProperties
+class NamedProperties // strongly-typed mixed-type key-value container;Superset of NamedStrings - all NamedStrings operations work here too
 {
 public:
 	NamedProperties() = default;
@@ -45,9 +39,6 @@ public:
 	NamedProperties& operator=(NamedProperties&& moveFrom) = default;
 	~NamedProperties() = default;
 
-	//-----------------------------------------------------------------------------------------------
-	// Explicit overloads for string-related types (NamedStrings backward compat)
-	//-----------------------------------------------------------------------------------------------
 	void SetValue(std::string const& keyName, std::string const& value);
 	void SetValue(std::string const& keyName, char const* value);
 
@@ -60,9 +51,7 @@ public:
 	Vec2        GetValue(std::string const& keyName, Vec2 const& defaultValue) const;
 	IntVec2     GetValue(std::string const& keyName, IntVec2 const& defaultValue) const;
 
-	//-----------------------------------------------------------------------------------------------
 	// Template versions for arbitrary types (game-specific types, nested NamedProperties, etc.)
-	//-----------------------------------------------------------------------------------------------
 	template<typename T> void SetValue(std::string const& keyName, T const& value);
 	template<typename T> T    GetValue(std::string const& keyName, T const& defaultValue) const;
 
@@ -77,9 +66,6 @@ private:
 	std::map<HashedCaseInsensitiveString, std::unique_ptr<NamedPropertyBase>> m_properties;
 };
 
-//-----------------------------------------------------------------------------------------------
-// Template implementations
-//-----------------------------------------------------------------------------------------------
 template<typename T>
 void NamedProperties::SetValue(std::string const& keyName, T const& value)
 {

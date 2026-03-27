@@ -754,7 +754,8 @@ bool GIVisualization::RenderImGuiPanel(GIVisualizationParams& params)
         "ScreenProbe: MeshSDF Trace",
         "ScreenProbe: Radiance Oct",
         "ScreenProbe: Radiance Filtered",
-        "MeshSDF: Normal"
+        "MeshSDF: Normal",
+        "Probe AO"
     };
     
     int currentMode = static_cast<int>(params.Mode);

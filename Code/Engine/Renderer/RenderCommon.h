@@ -64,7 +64,16 @@ enum class VertexType
 {
     VERTEX_PCU,
     VERTEX_PCUTBN,
+    VERTEX_FONT,
     COUNT
+};
+
+struct FontConstants
+{
+    float SDFThreshold;		// alpha threshold for SDF edge
+    float SDFSmoothRange;	// smoothstep range for anti-aliasing
+    float Time;				// for animated effects
+    float Weight;			// global weight adjustment
 };
 
 #ifdef ENGINE_DX11_RENDERER
@@ -73,6 +82,7 @@ static const int k_cameraConstantsSlot = 2;
 static const int k_modelConstantsSlot = 3;
 static const int k_generalLightConstantsSlot = 4;
 static const int k_shadowConstantsSlot = 6;
+static const int k_fontConstantsSlot = 7;
 #endif
 #ifdef ENGINE_DX12_RENDERER
 static const int k_perFrameConstantsSlot = 0;
@@ -702,8 +712,11 @@ enum class GIVisualizationMode : uint32_t
     
     // SDF (1种) - Fullscreen Compute
     MeshSDF_Normal,
-    
-    COUNT  // = 16
+
+    // AO (1种) - Fullscreen Compute
+    ProbeAO,
+
+    COUNT  // = 17
 };
 
 struct GIVisualizationParams
@@ -737,7 +750,8 @@ inline const char* GetVisualizationModeName(GIVisualizationMode mode)
         case GIVisualizationMode::ScreenProbe_RadianceFiltered: return "ScreenProbe: Radiance Filtered";
         
         case GIVisualizationMode::MeshSDF_Normal:             return "MeshSDF: Normal";
-        
+        case GIVisualizationMode::ProbeAO:                    return "Probe AO";
+
         default: return "Unknown";
     }
 }

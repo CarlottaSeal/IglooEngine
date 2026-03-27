@@ -33,3 +33,16 @@ private:
 };
 
 typedef HashedCaseInsensitiveString HCIString;
+
+// std::hash specialization so HCIS works as unordered_map key
+namespace std
+{
+template<>
+struct hash<HashedCaseInsensitiveString>
+{
+	size_t operator()(HashedCaseInsensitiveString const& key) const
+	{
+		return static_cast<size_t>(key.GetHash());
+	}
+};
+}

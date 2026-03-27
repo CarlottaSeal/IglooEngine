@@ -4014,7 +4014,14 @@ void DX12Renderer::BeginCardCapturePass()
         return;
     }
 
-	// Render point light cube shadow maps every frame (before UpdateDirectLightPass which samples them)
+	// Mark shadow maps dirty when any point light moved (before Execute so it renders this frame)
+	if (m_giSystem->m_scene->m_pointLightShadowDirty)
+	{
+		m_giSystem->m_scene->m_pointLightShadowDirty = false;
+		m_pointLightShadowPass->MarkDirty();
+	}
+
+	// Render point light cube shadow maps (renders if dirty, otherwise skips)
 	m_pointLightShadowPass->Execute(m_commandList, m_constantBuffers[k_shadowConstantsSlot],
 		this, m_giSystem->m_scene);
 
@@ -4058,19 +4065,16 @@ void DX12Renderer::BeginCardCapturePass()
 		UpdateDirectLightPass();
 	}
 
-	// Point light changed: only need to update DirectLight layer (not full card re-capture)
+	// Point light changed: full GI update (throttled in Scene::Update).
+	// Composite pass handles smooth per-frame direct lighting via constant buffer.
+	// Throttled GI update: card metadata + DirectLight surface cache re-shade
+	// (shadow maps already handled above, every frame)
 	if (m_giSystem->m_scene->m_pointLightDirty)
 	{
 		m_giSystem->m_scene->m_pointLightDirty = false;
-		m_pointLightShadowPass->MarkDirty(); // Re-render cube shadow maps
-		DebuggerPrintf("[PointLight] Light changed, updating DirectLight layer\n");
 
-		// Rebuild CPU metadata with updated lightMask and upload to GPU
 		m_giSystem->UpdateCardMetadata();
 		UploadCardMetadataToGPU();
-
-		// UploadCardMetadataToGPU leaves metadata in PIXEL_SHADER_RESOURCE,
-		// UpdateDirectLightPass expects COMMON
 		TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 			D3D12_RESOURCE_STATE_COMMON);
@@ -5137,7 +5141,8 @@ void DX12Renderer::UpdateDirectLightPass()
 	m_commandList->SetComputeRoot32BitConstants(0, 4, params, 0);
 
 	// Root 1: GeneralLightConstants (b4) - reuse existing
-	D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress = m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress();
+	D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress = m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_generalLightConstantsSlot]->m_offset;
 	m_commandList->SetComputeRootConstantBufferView(1, lightCBAddress);
 
 	// Root 2: ShadowConstants (b5) - includes point shadow sampling data
@@ -5670,6 +5675,26 @@ void DX12Renderer::ImGuiStartUp()
 	ImGui_ImplDX12_Init(m_device, FRAME_BUFFER_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM, m_imguiSrvDescHeap,
 	                    m_imguiSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
 	                    m_imguiSrvDescHeap->GetGPUDescriptorHandleForHeapStart());
+
+	// Load default font explicitly, then merge CJK glyphs for Japanese/Chinese brush names.
+	io.Fonts->AddFontDefault();
+	{
+		ImFontConfig mergeConfig;
+		mergeConfig.MergeMode = true;
+		mergeConfig.PixelSnapH = true;
+		static char const* const cjkFonts[] = {
+			"C:\\Windows\\Fonts\\msgothic.ttc",
+			"C:\\Windows\\Fonts\\meiryo.ttc",
+			"C:\\Windows\\Fonts\\msyh.ttc",
+		};
+		for (char const* fontPath : cjkFonts)
+		{
+			if (io.Fonts->AddFontFromFileTTF(fontPath, 13.0f, &mergeConfig, io.Fonts->GetGlyphRangesJapanese()))
+			{
+				break;
+			}
+		}
+	}
 
 	unsigned char* pixels;
 	int width, height;

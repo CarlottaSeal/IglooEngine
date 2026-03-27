@@ -70,6 +70,7 @@ void Scene::InitializeBoundsAndMeshSDF()
 
 void Scene::Update(float deltaTime)
 {
+    m_currentFrame++;
     bool anyLightMoved = false;
 
     for (auto* object : m_allObjects)
@@ -90,14 +91,17 @@ void Scene::Update(float deltaTime)
         else if (object->GetType() == OBJECT_LIGHT)
         {
             anyLightMoved = true;
-            auto* light = static_cast<LightObject*>(object);
+            m_pointLightShadowDirty = true; // shadows must re-render every frame
 
-            // Don't mark cards as capture-dirty for lighting-only changes.
-            // UpdateDirectLightPass will efficiently update just the DirectLight layer.
-            m_suppressCaptureDirty = true;
-            light->OnTransformChanged();
-            m_suppressCaptureDirty = false;
-            m_pointLightDirty = true;
+            // Expensive GI work (cards + metadata + DirectLightPass) throttled
+            if (m_currentFrame % 10 == 0)
+            {
+                auto* light = static_cast<LightObject*>(object);
+                m_suppressCaptureDirty = true;
+                light->UpdateAffectedCards();
+                m_suppressCaptureDirty = false;
+                m_pointLightDirty = true;
+            }
 
             object->ClearMoveFlag();
         }
