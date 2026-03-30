@@ -33,6 +33,9 @@
 #include "ThirdParty/ImGui/implot.h"
 #include "ThirdParty/ImGui/imgui_impl_dx12.h"
 #include "ThirdParty/ImGui/imgui_impl_win32.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "ThirdParty/stb/stb_image_write.h"
 #include "ThirdParty/stb/stb_image.h"
 
 // #include <wrl/client.h>
@@ -564,6 +567,103 @@ void DX12Renderer::EndFrame()
 
 	if (m_giSystem)
 		m_giSystem->EndFrame();
+}
+
+void DX12Renderer::CaptureScreenshot(const std::string& filePath)
+{
+	// Wait for GPU to finish current frame
+	const UINT idx = (m_frameIndex == 0) ? FRAME_BUFFER_COUNT - 1 : m_frameIndex - 1;
+
+	D3D12_RESOURCE_DESC desc = m_renderTargets[idx]->GetDesc();
+	UINT width = (UINT)desc.Width;
+	UINT height = (UINT)desc.Height;
+	UINT rowPitch = (width * 4 + 255) & ~255; // 4 bytes per pixel, aligned to 256
+
+	// Create readback buffer
+	D3D12_HEAP_PROPERTIES heapProps = {};
+	heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bufDesc = {};
+	bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufDesc.Width = (UINT64)rowPitch * height;
+	bufDesc.Height = 1;
+	bufDesc.DepthOrArraySize = 1;
+	bufDesc.MipLevels = 1;
+	bufDesc.SampleDesc.Count = 1;
+	bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	ID3D12Resource* readbackBuffer = nullptr;
+	HRESULT hr = m_device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+		IID_PPV_ARGS(&readbackBuffer));
+	if (FAILED(hr))
+	{
+		DebuggerPrintf("[Screenshot] Failed to create readback buffer\n");
+		return;
+	}
+
+	// Copy render target to readback buffer
+	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_renderTargets[idx],
+		D3D12_RESOURCE_STATE_PRESENT,
+		D3D12_RESOURCE_STATE_COPY_SOURCE);
+	m_commandList->ResourceBarrier(1, &barrier);
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+	footprint.Footprint.Width = width;
+	footprint.Footprint.Height = height;
+	footprint.Footprint.Depth = 1;
+	footprint.Footprint.RowPitch = rowPitch;
+	footprint.Footprint.Format = desc.Format;
+
+	CD3DX12_TEXTURE_COPY_LOCATION dst(readbackBuffer, footprint);
+	CD3DX12_TEXTURE_COPY_LOCATION src(m_renderTargets[idx], 0);
+	m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_renderTargets[idx],
+		D3D12_RESOURCE_STATE_COPY_SOURCE,
+		D3D12_RESOURCE_STATE_PRESENT);
+	m_commandList->ResourceBarrier(1, &barrier);
+
+	// Execute and wait
+	m_commandList->Close();
+	ID3D12CommandList* lists[] = { m_commandList };
+	m_commandQueue->ExecuteCommandLists(1, lists);
+
+	m_fenceValue[m_frameIndex]++;
+	m_commandQueue->Signal(m_fence[m_frameIndex], m_fenceValue[m_frameIndex]);
+	m_fence[m_frameIndex]->SetEventOnCompletion(m_fenceValue[m_frameIndex], m_fenceEvent);
+	WaitForSingleObject(m_fenceEvent, INFINITE);
+
+	m_commandList->Reset(m_commandAllocator[m_frameIndex], m_pipelineStateObject);
+
+	// Map and save
+	void* mappedData = nullptr;
+	hr = readbackBuffer->Map(0, nullptr, &mappedData);
+	if (SUCCEEDED(hr))
+	{
+		// Copy to contiguous buffer (remove row pitch padding)
+		std::vector<unsigned char> pixels(width * height * 4);
+		for (UINT y = 0; y < height; y++)
+		{
+			memcpy(pixels.data() + y * width * 4,
+				(unsigned char*)mappedData + y * rowPitch,
+				width * 4);
+		}
+		readbackBuffer->Unmap(0, nullptr);
+
+		stbi_write_png(filePath.c_str(), (int)width, (int)height, 4,
+			pixels.data(), (int)(width * 4));
+
+		DebuggerPrintf("[Screenshot] Saved %ux%u to %s\n", width, height, filePath.c_str());
+	}
+	else
+	{
+		DebuggerPrintf("[Screenshot] Failed to map readback buffer\n");
+	}
+
+	DX_SAFE_RELEASE(readbackBuffer);
 }
 
 void DX12Renderer::ShutDown()

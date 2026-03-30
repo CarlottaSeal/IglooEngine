@@ -398,8 +398,8 @@ std::vector<uint32_t> Scene::RegisterLightInfluence(uint32_t lightID, const AABB
                 }
             }
 
-            DebuggerPrintf("[Scene]   Light %u affects card %u of object %u\n",
-                          lightID, cardID, objectID);
+            //DebuggerPrintf("[Scene]   Light %u affects card %u of object %u\n",
+            //              lightID, cardID, objectID);
 
             m_cardToLightObjects[cardID].push_back(lightID);
             affectedCards.push_back(cardID);

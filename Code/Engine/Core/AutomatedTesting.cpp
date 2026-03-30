@@ -1,6 +1,10 @@
 #include "AutomatedTesting.hpp"
 #include "Engine/Core/Clock.hpp"
 #include "Engine/Core/ErrorWarningAssert.hpp"
+#include "Engine/Renderer/Renderer.hpp"
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 
 #include <vector>
 #include <string>
@@ -8,6 +12,11 @@
 #include <cstdlib>
 #include <fstream>
 #include <algorithm>
+
+#ifdef ENGINE_DX12_RENDERER
+#include "Engine/Renderer/DX12Renderer.hpp"
+extern Renderer* g_theRenderer;
+#endif
 
 //--------------------------------------------------------------
 // Internal state (file-scoped, same pattern as DebugRenderSystem)
@@ -20,10 +29,16 @@ namespace
 	bool   s_benchmarkMode    = false;
 	int    s_benchmarkMaxFrames = 600;
 	int    s_frameCount       = 0;
-	int    s_warmupFrames     = 60;    // skip initial frames (GI convergence, shader compilation)
+	int    s_warmupFrames     = 60;
 	bool   s_shouldQuit       = false;
 	std::string s_outputPath  = "benchmark_results.json";
 	std::vector<float> s_fpsLog;
+
+	// Screenshot
+	bool   s_screenshotMode   = false;
+	int    s_screenshotFrame  = -1;      // -1 = use warmup + 10 as default
+	std::string s_screenshotDir = "Screenshots";
+	bool   s_screenshotTaken  = false;
 }
 
 //--------------------------------------------------------------
@@ -88,36 +103,63 @@ void AutomatedTestingStartup(const char* commandLine)
 		s_warmupFrames = ParseIntAfterArg(commandLine, "--warmup", 60);
 	}
 
+	if (FindArg(commandLine, "--screenshot"))
+	{
+		s_screenshotMode = true;
+		s_isActive = true;
+		s_screenshotDir = ParseStringAfterArg(commandLine, "--screenshot", "Screenshots");
+		s_screenshotFrame = ParseIntAfterArg(commandLine, "--screenshot-frame", -1);
+	}
+
 	if (s_isActive)
 	{
-		DebuggerPrintf("[AutoTest] Active: benchmark=%d frames=%d warmup=%d output=%s\n",
+		DebuggerPrintf("[AutoTest] Active: benchmark=%d frames=%d warmup=%d screenshot=%d output=%s\n",
 			s_benchmarkMode ? 1 : 0,
 			s_benchmarkMaxFrames,
 			s_warmupFrames,
+			s_screenshotMode ? 1 : 0,
 			s_outputPath.c_str());
 	}
 }
 
 void AutomatedTestingEndFrame()
 {
-	if (!s_benchmarkMode)
+	if (!s_isActive)
 		return;
 
 	s_frameCount++;
 
-	float fps = (float)Clock::GetSystemClock().GetFrameRate();
-
-	// Skip warmup frames (GI convergence, shader compilation, first-frame hitches)
-	if (s_frameCount > s_warmupFrames)
+	// Benchmark: record FPS
+	if (s_benchmarkMode)
 	{
-		s_fpsLog.push_back(fps);
+		float fps = (float)Clock::GetSystemClock().GetFrameRate();
+		if (s_frameCount > s_warmupFrames)
+			s_fpsLog.push_back(fps);
+
+		if (s_frameCount >= s_benchmarkMaxFrames + s_warmupFrames)
+			s_shouldQuit = true;
 	}
 
-	// Check if we've collected enough frames
-	if (s_frameCount >= s_benchmarkMaxFrames + s_warmupFrames)
+	// Screenshot: capture at the right frame
+#ifdef ENGINE_DX12_RENDERER
+	if (s_screenshotMode && !s_screenshotTaken)
 	{
-		s_shouldQuit = true;
+		int captureFrame = (s_screenshotFrame > 0) ? s_screenshotFrame : (s_warmupFrames + 10);
+		if (s_frameCount == captureFrame)
+		{
+			// Create output directory
+			CreateDirectoryA(s_screenshotDir.c_str(), NULL);
+
+			std::string filePath = s_screenshotDir + "/screenshot.png";
+			g_theRenderer->GetSubRenderer()->CaptureScreenshot(filePath);
+			s_screenshotTaken = true;
+
+			// If no benchmark mode, quit after screenshot
+			if (!s_benchmarkMode)
+				s_shouldQuit = true;
+		}
 	}
+#endif
 }
 
 bool AutomatedTestingShouldQuit()
@@ -132,6 +174,10 @@ bool AutomatedTestingIsActive()
 
 void AutomatedTestingShutdown()
 {
+	// Reset screenshot state
+	s_screenshotMode = false;
+	s_screenshotTaken = false;
+
 	if (!s_benchmarkMode || s_fpsLog.empty())
 		return;
 

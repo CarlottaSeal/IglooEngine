@@ -15,10 +15,11 @@
 //--------------------------------------------------------------
 
 // Call once at startup with the raw command line string.
-// Parses: --benchmark <frames> --output <path>
+// Parses: --benchmark <frames> --output <path> --screenshot <dir> --warmup <frames>
 void AutomatedTestingStartup(const char* commandLine);
 
 // Call once per frame after Render/EndFrame. Records FPS, increments frame counter.
+// Triggers screenshot capture at configured frames.
 void AutomatedTestingEndFrame();
 
 // Returns true when the test run is complete and the app should quit.

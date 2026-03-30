@@ -91,6 +91,7 @@ public:
 	void ShutDown();
 	void BeginFrame();
 	void EndFrame();
+	void CaptureScreenshot(const std::string& filePath);
 
 	//Camera & screen
 	void ClearScreen(const Rgba8& clearColor);
