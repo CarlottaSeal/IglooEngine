@@ -71,6 +71,12 @@ void InputSystem::Startup()
 			}
 		}
 	}
+	// Initialize tablet (Wintab) – needs HWND from the window
+	if (g_theWindow)
+	{
+		m_tablet.Startup(g_theWindow->GetHwnd());
+	}
+
 	g_theEventSystem->SubscribeEventCallBackFunction("KeyPressed", OnKeyPressed);
 	g_theEventSystem->SubscribeEventCallBackFunction("KeyReleased", OnKeyReleased);
 }
@@ -278,5 +284,24 @@ bool InputSystem::ShouldIgnoreKeyboardInput() const
 		return false;
 	}
 	return ImGui::GetIO().WantCaptureKeyboard;
+}
+
+float InputSystem::GetTabletPressure() const
+{
+	if (m_tablet.IsConnected() && m_tablet.IsPenInRange())
+	{
+		return m_tablet.GetPressure();
+	}
+	return 1.0f; // fallback: full pressure for mouse
+}
+
+bool InputSystem::IsTabletConnected() const
+{
+	return m_tablet.IsConnected();
+}
+
+bool InputSystem::IsPenInRange() const
+{
+	return m_tablet.IsPenInRange();
 }
 

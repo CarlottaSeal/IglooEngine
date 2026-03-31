@@ -8,7 +8,6 @@
 
 struct AABB2;
 class Renderer;
-//class DX12Renderer;
 class BitmapFont;
 class Timer;
 class Camera;
@@ -30,18 +29,12 @@ struct DevConsoleConfig
 	int m_linesOnScreen = 40;
 	int m_masCommandHistory = 128;
 	bool m_startOpen = false;
-//
-//#ifdef ENGINE_DX12_RENDERER
-//	DX12Renderer* m_defaultDX12Renderer;
-//#endif
 };
 
 struct DevConsoleLine
 {
 	Rgba8 m_color;
 	std::string m_text;
-	//int m_frameNumberPrinted;
-	//double m_timePrinted;
 };
 
 class DevConsole
@@ -58,6 +51,9 @@ public:
 	void Execute(std::string const& consoleCommandText);
 	void AddLine(Rgba8 const& color, std::string const& text);
 	void Render(AABB2 const& bounds, Renderer* rendererOverride = nullptr) const;
+
+	void ExecuteXmlCommandScriptNode(XmlElement const& commandScriptXmlElement);
+	void ExecuteXmlCommandScriptFile(std::string const& commandScriptXmlFilePathName);
 
 	DevConsoleMode GetMode() const;
 	void SetMode(DevConsoleMode mode);
@@ -85,17 +81,17 @@ protected:
 protected:
 	DevConsoleConfig m_config;
 	mutable std::recursive_mutex m_mutex;
-	
+
 	DevConsoleMode m_mode = DevConsoleMode::HIDDEN;
 	std::vector<DevConsoleLine> m_lines;
 	int m_frameNumber = 0;
 
 	std::string m_fontPath;
 
-	std::string m_inputText; //Our current line of input text
-	int m_insertionPointPos = 0; //Index of the insertion point in our current input text
-	bool m_insertionPointVisible = true; //True if our insertion point is currently in the visible phase of blinking.
-	Timer* m_insertionPointBlinkTimer; //Timer for controlling insertion point visibility
-	std::vector<std::string> m_commandHistory; //History of all commands executed.
-	int m_historyIndex = -1; //Our current index in our history of commands as we are scrolling.
+	std::string m_inputText;
+	int m_insertionPointPos = 0;
+	bool m_insertionPointVisible = true;
+	Timer* m_insertionPointBlinkTimer;
+	std::vector<std::string> m_commandHistory;
+	int m_historyIndex = -1;
 };

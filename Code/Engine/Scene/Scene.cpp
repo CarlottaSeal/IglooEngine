@@ -51,10 +51,26 @@ void Scene::InitializeBoundsAndMeshSDF()
 {
     UpdateSceneBounds();
     BuildMeshSDFInfos();
+
+    // Sort mesh objects by mesh pointer (primary) then material for instanced batching
+    std::sort(m_meshObjects.begin(), m_meshObjects.end(),
+        [](const MeshObject* a, const MeshObject* b)
+        {
+            const auto* meshA = a->GetMesh();
+            const auto* meshB = b->GetMesh();
+            if (meshA != meshB)
+                return meshA < meshB;
+            if (meshA->m_diffuseTexture != meshB->m_diffuseTexture)
+                return meshA->m_diffuseTexture < meshB->m_diffuseTexture;
+            if (meshA->m_normalTexture != meshB->m_normalTexture)
+                return meshA->m_normalTexture < meshB->m_normalTexture;
+            return meshA->m_specularTexture < meshB->m_specularTexture;
+        });
 }
 
 void Scene::Update(float deltaTime)
 {
+    m_currentFrame++;
     bool anyLightMoved = false;
 
     for (auto* object : m_allObjects)
@@ -75,12 +91,17 @@ void Scene::Update(float deltaTime)
         else if (object->GetType() == OBJECT_LIGHT)
         {
             anyLightMoved = true;
-            auto* light = static_cast<LightObject*>(object);
+            m_pointLightShadowDirty = true; // shadows must re-render every frame
 
-            for (uint32_t cardID : light->m_affectedCards)
-                MarkCardDirty(cardID);
-
-            light->OnTransformChanged();
+            // Expensive GI work (cards + metadata + DirectLightPass) throttled
+            if (m_currentFrame % 10 == 0)
+            {
+                auto* light = static_cast<LightObject*>(object);
+                m_suppressCaptureDirty = true;
+                light->UpdateAffectedCards();
+                m_suppressCaptureDirty = false;
+                m_pointLightDirty = true;
+            }
 
             object->ClearMoveFlag();
         }
@@ -363,18 +384,23 @@ std::vector<uint32_t> Scene::RegisterLightInfluence(uint32_t lightID, const AABB
             instance->m_lightMask[wordIndex] |= (1u << bitIndex);
             
             instance->m_isDirty = true;
-            
+
             card->m_pendingUpdate = true;
-            
-            auto it = std::find(m_dirtyCardIDs.begin(), m_dirtyCardIDs.end(), cardID);
-            if (it == m_dirtyCardIDs.end())
+
+            // Only add to capture-dirty list if not suppressed (e.g. light-only changes
+            // use UpdateDirectLightPass instead of full CardCapture)
+            if (!m_suppressCaptureDirty)
             {
-                m_dirtyCardIDs.push_back(cardID);
+                auto it = std::find(m_dirtyCardIDs.begin(), m_dirtyCardIDs.end(), cardID);
+                if (it == m_dirtyCardIDs.end())
+                {
+                    m_dirtyCardIDs.push_back(cardID);
+                }
             }
-            
-            DebuggerPrintf("[Scene]   Light %u affects card %u of object %u\n",
-                          lightID, cardID, objectID);
-            
+
+            //DebuggerPrintf("[Scene]   Light %u affects card %u of object %u\n",
+            //              lightID, cardID, objectID);
+
             m_cardToLightObjects[cardID].push_back(lightID);
             affectedCards.push_back(cardID);
         }

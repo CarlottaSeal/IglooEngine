@@ -131,34 +131,36 @@ void GIVisualization::CreateRootSignatures()
         uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0,
                       D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE, 0);
         
-        CD3DX12_ROOT_PARAMETER1 rootParams[3];
+        CD3DX12_ROOT_PARAMETER1 rootParams[5];
         rootParams[0].InitAsConstantBufferView(0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_SHADER_VISIBILITY_ALL);
         rootParams[1].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_ALL);
         rootParams[2].InitAsDescriptorTable(1, &uavRange, D3D12_SHADER_VISIBILITY_ALL);
-        
+        rootParams[3].InitAsConstantBufferView(4, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_SHADER_VISIBILITY_ALL); // b4: GeneralLightConstants
+        rootParams[4].InitAsConstantBufferView(5, 0, D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE, D3D12_SHADER_VISIBILITY_ALL); // b5: ShadowConstants
+
         D3D12_STATIC_SAMPLER_DESC samplers[3] = {};
-        
+
         samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         samplers[0].AddressU = samplers[0].AddressV = samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         samplers[0].ShaderRegister = 0;
         samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        
+
         samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samplers[1].AddressU = samplers[1].AddressV = samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
         samplers[1].ShaderRegister = 1;
         samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        
+
         samplers[2].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
         samplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         samplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
         samplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        samplers[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;  // 与 Composite 一致
+        samplers[2].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
         samplers[2].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
         samplers[2].ShaderRegister = 2;
         samplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        
+
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc;
-        rootSigDesc.Init_1_1(3, rootParams, 3, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        rootSigDesc.Init_1_1(5, rootParams, 3, samplers, D3D12_ROOT_SIGNATURE_FLAG_NONE);
         
         ID3DBlob* signature = nullptr;
         ID3DBlob* error = nullptr;
@@ -448,14 +450,16 @@ void GIVisualization::CreateSurfaceCacheResources()
     }
 }
 
-void GIVisualization::Execute(ID3D12GraphicsCommandList* cmdList, 
+void GIVisualization::Execute(ID3D12GraphicsCommandList* cmdList,
                                ConstantBuffer* constantBuffer,
                                const GIVisualizationParams& params,
                                const CompositeConstants& compositeConsts,
                                const ScreenProbeConstants& screenProbeConsts,
                                const CameraConstants& cameraConsts,
                                SurfaceCache* surfaceCache,
-                               uint32_t activeCardCount)
+                               uint32_t activeCardCount,
+                               D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress,
+                               D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress)
 {
     //// 调试：前10帧每帧打印，之后每60帧打印一次
     //static int frameCount = 0;
@@ -494,7 +498,7 @@ void GIVisualization::Execute(ID3D12GraphicsCommandList* cmdList,
             DebuggerPrintf("[GIVisualization] -> Fullscreen mode, will Dispatch\n");
         }*/
         
-        ExecuteFullscreenCompute(cmdList, constantBuffer, params, compositeConsts, screenProbeConsts);
+        ExecuteFullscreenCompute(cmdList, constantBuffer, params, compositeConsts, screenProbeConsts, lightCBAddress, shadowCBAddress);
     }
 }
 
@@ -502,7 +506,9 @@ void GIVisualization::ExecuteFullscreenCompute(ID3D12GraphicsCommandList* cmdLis
                                                 ConstantBuffer* constantBuffer,
                                                 const GIVisualizationParams& params,
                                                 const CompositeConstants& compositeConsts,
-                                                const ScreenProbeConstants& screenProbeConsts)
+                                                const ScreenProbeConstants& screenProbeConsts,
+                                                D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress,
+                                                D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress)
 {
     if (!m_fullscreenPSO)
     {
@@ -550,7 +556,11 @@ void GIVisualization::ExecuteFullscreenCompute(ID3D12GraphicsCommandList* cmdLis
     constants.ProbeGridHeight = screenProbeConsts.ProbeGridHeight;
     constants.ProbeSpacing = screenProbeConsts.ProbeSpacing;
     constants.OctahedronSize = screenProbeConsts.OctahedronSize;
-    
+    constants.OctahedronWidth = screenProbeConsts.OctahedronWidth;
+    constants.OctahedronHeight = screenProbeConsts.OctahedronHeight;
+    constants.Padding5 = 0;
+    constants.Padding6 = 0;
+
     constants.DirectIntensity = compositeConsts.DirectIntensity;
     constants.IndirectIntensity = compositeConsts.IndirectIntensity;
     constants.AOStrength = compositeConsts.AOStrength;
@@ -587,6 +597,10 @@ void GIVisualization::ExecuteFullscreenCompute(ID3D12GraphicsCommandList* cmdLis
     cmdList->SetComputeRootConstantBufferView(0, constantBuffer->GetDX12ConstantBuffer()->GetGPUVirtualAddress());
     cmdList->SetComputeRootDescriptorTable(1, GetGPUHandle(0));
     cmdList->SetComputeRootDescriptorTable(2, GetGPUHandle(VIZ_OUTPUT_UAV));
+    if (lightCBAddress)
+        cmdList->SetComputeRootConstantBufferView(3, lightCBAddress);
+    if (shadowCBAddress)
+        cmdList->SetComputeRootConstantBufferView(4, shadowCBAddress);
     
     uint32_t groupsX = (m_screenWidth + 7) / 8;
     uint32_t groupsY = (m_screenHeight + 7) / 8;
@@ -706,7 +720,7 @@ bool GIVisualization::RenderImGuiPanel(GIVisualizationParams& params)
 {
     bool changed = false;
     
-    ImGui::Begin("GI Visualization", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Begin("Rendering", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     
     // 状态显示
     ImGui::Text("Status: %s", m_initialized ? "Initialized" : "NOT INITIALIZED");
@@ -740,7 +754,8 @@ bool GIVisualization::RenderImGuiPanel(GIVisualizationParams& params)
         "ScreenProbe: MeshSDF Trace",
         "ScreenProbe: Radiance Oct",
         "ScreenProbe: Radiance Filtered",
-        "MeshSDF: Normal"
+        "MeshSDF: Normal",
+        "Probe AO"
     };
     
     int currentMode = static_cast<int>(params.Mode);

@@ -6,6 +6,8 @@
 #include "Cache/CacheCommon.h"
 
 class CombineSurfaceCache;
+class DirectionalShadowPass;
+class PointLightShadowPass;
 class ScreenProbeFinalGather;
 class SurfaceRadiosity;
 class GIVisualization;
@@ -89,6 +91,7 @@ public:
 	void ShutDown();
 	void BeginFrame();
 	void EndFrame();
+	void CaptureScreenshot(const std::string& filePath);
 
 	//Camera & screen
 	void ClearScreen(const Rgba8& clearColor);
@@ -113,6 +116,7 @@ public:
 	Texture* CreateOrGetTextureFromFile(char const* imageFilePath);
 	Texture* CreateTextureFromFile(char const* imageFilePath);
 	Texture* CreateTextureFromImage(Image const& image);
+	void UpdateTextureFromImage(Texture* texture, Image const& image);
 	SDFTexture3D* CreateSDFTextureFromData(const std::vector<Vertex_PCUTBN>& vertices,const std::vector<uint32_t>& indices,
 	   const BVH& bvh,const AABB3& bounds,int resolution);
 	SDFTexture3D* CreateSDFTextureFromData(
@@ -163,13 +167,27 @@ public:
 	
 	//Setter
 	void SetGISystem(GISystem* giSystem) { m_giSystem = giSystem; }
+	const Camera& GetCurrentCamera() const { return m_camera; }
 
-	// GI Visualization 公共接口
+	// GI Visualization
 	void SetGIVisualizationEnabled(bool enabled) { m_vizEnabled = enabled; }
 	bool IsGIVisualizationEnabled() const { return m_vizEnabled; }
 	void ToggleGIVisualization() { m_vizEnabled = !m_vizEnabled; }
 	GIVisualizationParams& GetGIVisualizationParams() { return m_vizParams; }
-	bool RenderGIVisualizationImGuiPanel();  // 返回是否有变化
+	bool RenderGIVisualizationImGuiPanel(); 
+
+	// Register an engine texture for display in ImGui (returns ImTextureID as void*)
+	void* RegisterTextureForImGui(Texture* texture, int slot);
+
+	// Instanced drawing for GBuffer pass
+	void ResetInstanceData();
+	uint32_t AppendInstanceData(const Mat44& worldMatrix, const Rgba8& color);
+	void DrawIndexedInstancedBatch(VertexBuffer* vbo, IndexBuffer* ibo,
+		int indexCount, uint32_t startInstance, uint32_t instanceCount);
+
+	// Accessors for shadow pass instanced batching
+	uint32_t GetInstanceDataCount() const { return m_instanceDataCount; }
+	D3D12_GPU_VIRTUAL_ADDRESS GetInstanceBufferGPUAddress() const;
 
 private:
 	void WaitForPreviousFrame(); //wait until gpu is finished with command list
@@ -214,10 +232,9 @@ private:
 		const wchar_t* debugName, ID3D12GraphicsCommandList* commandList);
 	D3D12_GPU_DESCRIPTOR_HANDLE GetSRVHandle(uint32_t index);
 	
-	//Shadow map passs
-	void CreateShadowMapResources();
-	void RenderingShadowMapPass(); //暂时只有SunLight
-	void ShutdownShadowMapPass();
+	//Shadow passes
+	void CreateShadowPassResources();
+	void ShutdownShadowPasses();
 	
 	//GlobalSDF Pass
 	void CreateGlobalSDFPassResources();
@@ -262,17 +279,6 @@ private:
 	void BindSurfaceCacheForGraphics(SurfaceCache* cache);
 	void VisualizeSurfaceCache();
 
-	//Radiance Cache
-	void InitializeRadianceCache();
-	RadianceCache* GetRadianceCache() { return &m_radianceCache; }
-	const RadianceCache* GetRadianceCache() const { return &m_radianceCache; }
-	void CreateRadianceCacheResources();
-	void CreateRadianceCacheUpdatePSO();
-	void BeginRadianceCachePass();
-	void EndRadianceCachePass();
-	void BindRadianceCacheForCompute(RadianceCache* cache);
-	void BindRadianceCacheForGraphics(RadianceCache* cache);
-
 	void UploadBufferData(ID3D12Resource* dstBuffer,const void* srcData,uint32_t dataSize);
 
 	// Card BVH
@@ -295,6 +301,11 @@ private:
 	//SurfaceCacheRadiosity
 	void CreateSurfaceCacheRadiosityResources();
 	void RenderingSurfaceCacheRadiosityPass();
+
+	//DirectLight Update (when sun changes)
+	void CreateDirectLightUpdateResources();
+	void UpdateDirectLightPass();
+	void ShutdownDirectLightUpdatePass();
 
 	//ScreenProbeGather
 	void CreateScreenProbeGatherResources();
@@ -392,13 +403,9 @@ protected:
 	RenderMode m_desiredRenderMode = RenderMode::FORWARD;
 	ActivePass m_currentActivePass = ActivePass::UNKNOWN;
 	bool m_hasBackBufferCleared = false;
-	//Shadow Map
-	ID3D12Resource* m_shadowMapTexture = nullptr;
-	ID3D12PipelineState* m_shadowMapPSO = nullptr;
-	Mat44 m_cachedLightWorldToCamera;
-	Mat44 m_cachedLightCameraToRender;
-	Mat44 m_cachedLightRenderToClip;
-	CD3DX12_CPU_DESCRIPTOR_HANDLE m_shadowDsvHandle;
+	//Shadow Passes
+	DirectionalShadowPass* m_directionalShadowPass = nullptr;
+	PointLightShadowPass* m_pointLightShadowPass = nullptr;
 
 	//SurfaceCaches
 	SurfaceCache m_surfaceCache;
@@ -444,9 +451,6 @@ protected:
 	std::map<uint64_t, ID3D12PipelineState*> m_cardCapturePSOConfiguration;
 	int m_currentCardUpdateIndex = 0;
 
-	//Radiance Cache
-	ID3D12PipelineState* m_radianceCacheUpdatePSO = nullptr;
-	RadianceCache m_radianceCache;
 	ID3D12Resource* m_cardBVHNodeBuffer = nullptr;
 	ID3D12Resource* m_cardBVHIndexBuffer = nullptr;
 	uint32_t m_cardBVHNodeCount = 0;
@@ -466,11 +470,23 @@ protected:
 
 	CombineSurfaceCache* m_combineSurfaceCache = nullptr;
 	SurfaceRadiosity* m_surfaceRadiosity = nullptr;
+	int m_radiositySettleFrames = 0;
+	bool m_radiosityConverged = false;
+
+	// DirectLight Update Pass
+	ID3D12PipelineState* m_directLightUpdatePSO = nullptr;
+	ID3D12RootSignature* m_directLightUpdateRootSignature = nullptr;
 	ScreenProbeFinalGather* m_screenProbeFinalGather = nullptr;
 	ScreenProbeConstants m_screenProbeConstants;
 	
 	GIVisualization* m_giVisualization = nullptr;
 	GIVisualizationParams m_vizParams;
 	bool m_vizEnabled = false;
+
+	// Instance data buffer for GBuffer instanced drawing
+	static constexpr uint32_t MAX_GBUFFER_INSTANCES = 512;
+	ID3D12Resource* m_instanceDataBuffer[FRAME_BUFFER_COUNT] = {};
+	uint8_t* m_instanceDataMappedPtr[FRAME_BUFFER_COUNT] = {};
+	uint32_t m_instanceDataCount = 0;
 };
 #endif

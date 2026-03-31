@@ -39,7 +39,12 @@ struct VisualizationConstants
     uint32_t ProbeGridHeight;
     uint32_t ProbeSpacing;
     uint32_t OctahedronSize;
-    
+
+    uint32_t OctahedronWidth;
+    uint32_t OctahedronHeight;
+    uint32_t Padding5;
+    uint32_t Padding6;
+
     float DirectIntensity;
     float IndirectIntensity;
     float AOStrength;
@@ -85,14 +90,16 @@ public:
                     uint32_t screenWidth, uint32_t screenHeight);
     void Shutdown();
     
-    void Execute(ID3D12GraphicsCommandList* cmdList, 
+    void Execute(ID3D12GraphicsCommandList* cmdList,
                  ConstantBuffer* constantBuffer,
                  const GIVisualizationParams& params,
                  const CompositeConstants& compositeConsts,
                  const ScreenProbeConstants& screenProbeConsts,
                  const CameraConstants& cameraConsts,
                  SurfaceCache* surfaceCache,
-                 uint32_t activeCardCount);
+                 uint32_t activeCardCount,
+                 D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress = 0,
+                 D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress = 0);
     
     // Fullscreen Compute 模式需要调用此方法将结果复制到目标
     // targetCurrentState: 目标当前的资源状态（默认 RENDER_TARGET）
@@ -117,7 +124,9 @@ private:
                                    ConstantBuffer* constantBuffer,
                                    const GIVisualizationParams& params,
                                    const CompositeConstants& compositeConsts,
-                                   const ScreenProbeConstants& screenProbeConsts);
+                                   const ScreenProbeConstants& screenProbeConsts,
+                                   D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress,
+                                   D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress);
     
     void ExecuteSurfaceCacheVisualize(ID3D12GraphicsCommandList* cmdList,
                                        ConstantBuffer* constantBuffer,

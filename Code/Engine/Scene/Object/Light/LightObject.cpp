@@ -20,6 +20,7 @@ LightObject::LightObject(uint32_t id, const std::string& name, LightObjectType l
     {
         m_ambience = ambience;
         m_lightColor = lightColor;
+        m_originalAlpha = lightColor.a;
         m_innerRadius = innerRadius;
         m_outerRadius = outerRadius;
         m_innerDotThresholds = -1.f;
@@ -29,7 +30,8 @@ LightObject::LightObject(uint32_t id, const std::string& name, LightObjectType l
     if (lightType == LIGHT_SPOT)
     {
         m_ambience = ambience;
-        m_lightColor = lightColor;  // 修复：LIGHT_SPOT 也需要设置 lightColor
+        m_lightColor = lightColor;
+        m_originalAlpha = lightColor.a;
         m_spotForward = spotForward;
         m_innerRadius = innerRadius;
         m_outerRadius = outerRadius;
@@ -95,9 +97,8 @@ AABB3 LightObject::GetWorldBounds() const
 
 void LightObject::OnTransformChanged()
 {
-    UpdateAffectedCards();
-    //m_hasMoved = true;
-    //m_shadowMapDirty = true;
+    SceneObject::OnTransformChanged(); // sets m_worldMatrixDirty so Scene::Update detects the move
+    // UpdateAffectedCards is called by Scene::Update with throttling
 }
 
 void LightObject::OnCreate(Scene* scene)

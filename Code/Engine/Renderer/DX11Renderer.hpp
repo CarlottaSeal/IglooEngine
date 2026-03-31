@@ -7,6 +7,7 @@
 #include "Engine/Core/Rgba8.hpp"
 #include "Engine/Core/Vertex_PCU.hpp"
 #include "Engine/Core/Vertex_PCUTBN.hpp"
+#include "Engine/Core/Vertex_Font.hpp"
 #include "Engine/Math/AABB2.hpp"
 #include "Engine/Math/IntVec2.hpp"
 #include <vector>
@@ -15,6 +16,7 @@
 
 class Window;
 class BitmapFont;
+class BMFont;
 class Image;
 class Texture;
 class Shader;
@@ -73,6 +75,8 @@ public:
 	void DrawVertexArray(int numVerts, const Vertex_PCU* verts);
 	void DrawVertexArray(const std::vector<Vertex_PCUTBN>& verts);
 	void DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts);
+	void DrawVertexArray(const std::vector<Vertex_Font>& verts);
+	void DrawVertexArray(int numVerts, const Vertex_Font* verts);
 	void DrawVertexIndexArray(const std::vector<Vertex_PCUTBN>& verts, const std::vector<unsigned int>& indices);
 	void DrawVertexIndexArray(const std::vector<Vertex_PCUTBN>& verts, const std::vector<unsigned int>& indices, VertexBuffer* vbo, IndexBuffer* ibo);
 	void DrawVertexIndexArray(int numVerts, const Vertex_PCUTBN* verts, int numIndices, const unsigned int* indices);
@@ -88,8 +92,9 @@ public:
 	void BindTexture(const Texture* texture, int slot = 0);
 
 	BitmapFont* CreateOrGetBitmapFont(const char* bitmapFontFilePathWithNoExtension);
-	//BitmapFont* CreateBitmapFontFromData()
-	//BitmapFont* GetBitmapFontFromFileName(const char* imageFilePath);
+	BitmapFont* CreateOrGetProportionalFont(const char* bitmapFontFilePathWithNoExtension);
+	BMFont* CreateOrGetBMFont(const char* fntFilePath);
+	void SetFontConstants(float sdfThreshold = 0.5f, float sdfSmoothRange = 0.05f, float time = 0.f, float weight = 0.f);
 
 	//Shader Related Functions
 	Shader* CreateShader(char const* shaderName, char const* shaderSource, VertexType vertexType = VertexType::VERTEX_PCU);
@@ -165,6 +170,7 @@ private:
 	std::vector<Texture*> m_loadedTextures;
 
 	std::vector<BitmapFont*> m_loadedFonts;
+	std::vector<BMFont*> m_loadedBMFonts;
 
 	//Create variables to store DirectX state
 	ID3D11Device* m_device = nullptr;
@@ -179,6 +185,7 @@ private:
 	//Vertex Buffer variable
 	VertexBuffer* m_immediateVBO = nullptr;
 	VertexBuffer* m_immediateVBOForVertex_PCUTBN = nullptr;
+	VertexBuffer* m_immediateVBOForVertex_Font = nullptr;
 
 	//Index Buffer variable
 	IndexBuffer* m_immediateIBO = nullptr;
@@ -194,6 +201,7 @@ private:
 #endif
 	ConstantBuffer* m_shadowCBO = nullptr;
 	ConstantBuffer* m_perFrameCBO = nullptr;
+	ConstantBuffer* m_fontCBO = nullptr;
 
 	//State-related variables
 	ID3D11BlendState* m_blendState = nullptr;

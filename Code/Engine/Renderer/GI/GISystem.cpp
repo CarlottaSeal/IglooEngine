@@ -6,7 +6,6 @@
 #include "Engine/Renderer/DX11Renderer.hpp"
 #include "Engine/Renderer/VulkanRenderer.h"
 #include "Engine/Renderer/Cache/CardBVH.h"
-#include "Engine/Renderer/Cache/RadianceCacheManager.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
 #include "Engine/Scene/Scene.h"
 #include "Engine/Scene/Object/Mesh/MeshObject.h"
@@ -18,8 +17,6 @@ GISystem::GISystem(const GIConfig& config)
 	: m_config(config)
 {
 	InitializeAtlasFreeList();
-
-	m_radianceCacheManager = new RadianceCacheManager(); 
 }
 
 GISystem::~GISystem()
@@ -28,25 +25,14 @@ GISystem::~GISystem()
 
 void GISystem::Startup()
 {
-#ifdef ENGINE_DX12_RENDERER 
+#ifdef ENGINE_DX12_RENDERER
 	InitializeDXR(m_config.m_renderer->GetSubRenderer()->m_device);
-
-	if (m_radianceCacheManager && m_config.m_renderer)
-	{
-		DX12Renderer* renderer = m_config.m_renderer->GetSubRenderer();
-		RadianceCache* cache = renderer->GetRadianceCache();
-        
-		m_radianceCacheManager->Initialize(cache, m_scene);
-	}
-	
 	m_initialized = true;
 #endif
 }
 
 void GISystem::Shutdown()
 {
-	delete m_radianceCacheManager;
-	m_radianceCacheManager = nullptr;
 	delete m_cardBVH;
 	m_cardBVH = nullptr;
 }
@@ -192,6 +178,19 @@ void GISystem::CleanDirtyCards()
 	m_dirtyCards.clear();
 }
 
+void GISystem::MarkAllCardsDirty()
+{
+	m_dirtyCards.clear();
+	if (m_scene)
+	{
+		for (const auto& pair : m_scene->m_cardIDToCardPtr)
+		{
+			m_dirtyCards.push_back(pair.first);
+		}
+		DebuggerPrintf("[GISystem] Marked %zu cards dirty for sun direction change\n", m_dirtyCards.size());
+	}
+}
+
 Vec3 GISystem::ReconstructWorldPosCPU(Vec2 screenPos, float depth, float screenWidth, float screenHeight, const Mat44& viewProjInverse)
 {
 	// 归一化到 [0,1]
@@ -213,6 +212,7 @@ Vec3 GISystem::ReconstructWorldPosCPU(Vec2 screenPos, float depth, float screenW
 
 void GISystem::UpdateCardMetadata()
 {
+	m_cardMetadataCPU.clear();
 	for (auto& [objectID, entry] : m_scene->m_giRegistry)
     {
         MeshObject* obj = static_cast<MeshObject*>(m_scene->GetSceneObject(objectID));

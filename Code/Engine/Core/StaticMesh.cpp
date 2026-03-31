@@ -490,6 +490,9 @@ AABB3 StaticMesh::GetScaledBounds(float scale) const //Transformed 版本
 
 AABB3 StaticMesh::GetTransformedAABB3Bounds() const
 {
+	if (m_transformedBoundsCached)
+		return m_cachedTransformedBounds;
+
 	AABB3 box;
 
 	if (m_verts.empty())
@@ -502,11 +505,16 @@ AABB3 StaticMesh::GetTransformedAABB3Bounds() const
 		box.StretchToIncludePoint(vert.m_position);
 	}
 
+	m_cachedTransformedBounds = box;
+	m_transformedBoundsCached = true;
 	return box;
 }
 
 AABB3 StaticMesh::GetTransformedAABB3BoundsWithoutAxisTransform() const
 {
+	if (m_untransformedBoundsCached)
+		return m_cachedUntransformedBounds;
+
 	AABB3 box;
 
 	if (m_verts.empty())
@@ -519,6 +527,8 @@ AABB3 StaticMesh::GetTransformedAABB3BoundsWithoutAxisTransform() const
 		box.StretchToIncludePoint(vert.m_position);
 	}
 
+	m_cachedUntransformedBounds = box;
+	m_untransformedBoundsCached = true;
 	return box;
 }
 

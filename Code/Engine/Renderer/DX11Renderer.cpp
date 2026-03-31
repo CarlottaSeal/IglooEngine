@@ -3,6 +3,7 @@
 
 #include "Engine/Renderer/Camera.hpp"
 #include "Engine/Renderer/BitmapFont.hpp"
+#include "Engine/Renderer/BMFont.hpp"
 #include "Engine/Renderer/Renderer.hpp"
 //#include "Engine/Renderer/RenderCommon.h"
 #include "Engine/Renderer/Shader.hpp"
@@ -99,6 +100,7 @@ void DX11Renderer::Startup()
 	//Create vertex buffer big enough
 	m_immediateVBO = CreateVertexBuffer(sizeof(Vertex_PCU), sizeof(Vertex_PCU));
 	m_immediateVBOForVertex_PCUTBN = CreateVertexBuffer(sizeof(Vertex_PCUTBN), sizeof(Vertex_PCUTBN));
+	m_immediateVBOForVertex_Font = CreateVertexBuffer(sizeof(Vertex_Font), sizeof(Vertex_Font));
 	m_immediateIBO = CreateIndexBuffer(sizeof(unsigned int), sizeof(unsigned int));
 
 	//Create a constant buffer large enough to fit the structure contents.
@@ -113,6 +115,7 @@ void DX11Renderer::Startup()
 #endif
 	m_shadowCBO = CreateConstantBuffer(sizeof(Mat44)); //TODO: 有明显问题
 	m_perFrameCBO = CreateConstantBuffer(sizeof(PerFrameConstants));
+	m_fontCBO = CreateConstantBuffer(sizeof(FontConstants));
 
 	CreateRasterizerStates();
 	SetRasterizerMode(m_desiredRasterizerMode);
@@ -340,6 +343,7 @@ void DX11Renderer::ImGuiShutdown()
 {
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyPlatformWindows();
 	ImGui::DestroyContext();
 }
 
@@ -478,6 +482,21 @@ void DX11Renderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
 	unsigned int vertexBufferSize = numVerts * sizeof(Vertex_PCUTBN);
 	CopyCPUToGPU(verts, vertexBufferSize, m_immediateVBOForVertex_PCUTBN);
 	DrawVertexBuffer(m_immediateVBOForVertex_PCUTBN, numVerts);
+}
+
+void DX11Renderer::DrawVertexArray(const std::vector<Vertex_Font>& verts)
+{
+	DrawVertexArray(static_cast<int>(verts.size()), verts.data());
+}
+
+void DX11Renderer::DrawVertexArray(int numVerts, const Vertex_Font* verts)
+{
+	if (numVerts == 0 || verts == nullptr)
+		return;
+
+	unsigned int vertexBufferSize = numVerts * sizeof(Vertex_Font);
+	CopyCPUToGPU(verts, vertexBufferSize, m_immediateVBOForVertex_Font);
+	DrawVertexBuffer(m_immediateVBOForVertex_Font, numVerts);
 }
 
 void DX11Renderer::DrawVertexIndexArray(int numVerts, const Vertex_PCUTBN* verts, int numIndices, const unsigned int* indices)
@@ -786,6 +805,45 @@ BitmapFont* DX11Renderer::CreateOrGetBitmapFont(const char* bitmapFontFilePathWi
 	return bitmapFont;
 }
 
+BitmapFont* DX11Renderer::CreateOrGetProportionalFont(const char* bitmapFontFilePathWithNoExtension)
+{
+	std::string fontTextureFilePath = std::string(bitmapFontFilePathWithNoExtension) + ".png";
+	Texture* bitmapTexture = CreateOrGetTextureFromFile(fontTextureFilePath.c_str());
+	if (!bitmapTexture)
+		return nullptr;
+
+	BitmapFont* bitmapFont = new BitmapFont(bitmapFontFilePathWithNoExtension, *bitmapTexture, true);
+	m_loadedFonts.push_back(bitmapFont);
+	return bitmapFont;
+}
+
+BMFont* DX11Renderer::CreateOrGetBMFont(const char* fntFilePath)
+{
+	// Check cache
+	for (BMFont* font : m_loadedBMFonts)
+	{
+		if (font->m_fntFilePath == fntFilePath)
+			return font;
+	}
+
+	// Need a Renderer* to pass to BMFont - get it from the global
+	extern Renderer* g_theRenderer;
+	BMFont* font = new BMFont(fntFilePath, g_theRenderer);
+	m_loadedBMFonts.push_back(font);
+	return font;
+}
+
+void DX11Renderer::SetFontConstants(float sdfThreshold, float sdfSmoothRange, float time, float weight)
+{
+	FontConstants fc;
+	fc.SDFThreshold = sdfThreshold;
+	fc.SDFSmoothRange = sdfSmoothRange;
+	fc.Time = time;
+	fc.Weight = weight;
+	CopyCPUToGPU(&fc, sizeof(fc), m_fontCBO);
+	BindConstantBuffer(k_fontConstantsSlot, m_fontCBO);
+}
+
 Shader* DX11Renderer::CreateShader(char const* shaderName, char const* shaderSource, VertexType vertexType)
 {
 	std::vector<unsigned char> shaderByteCodeForVertex;
@@ -851,6 +909,30 @@ Shader* DX11Renderer::CreateShader(char const* shaderName, char const* shaderSou
 		if (FAILED(hr))
 		{
 			ERROR_AND_DIE("Fail to create a inputlayout for VERTEX_PCUTBN");
+		}
+	}
+	if (vertexType == VertexType::VERTEX_FONT)
+	{
+		D3D11_INPUT_ELEMENT_DESC inputElementDesc[] =
+		{
+			{"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"TEXCOORD", 3, DXGI_FORMAT_R32_SINT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+			{"TEXCOORD", 4, DXGI_FORMAT_R32_FLOAT, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0},
+		};
+		UINT numElements = ARRAYSIZE(inputElementDesc);
+		hr = m_device->CreateInputLayout(
+			inputElementDesc, numElements,
+			shaderByteCodeForVertex.data(),
+			shaderByteCodeForVertex.size(),
+			&inputLayout
+		);
+		if (FAILED(hr))
+		{
+			ERROR_AND_DIE("Fail to create a inputlayout for VERTEX_FONT");
 		}
 	}
 

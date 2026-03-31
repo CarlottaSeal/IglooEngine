@@ -10,7 +10,6 @@
 #include "VertexBuffer.hpp"
 #include "SDFTexture3D.h"
 #include "ShaderIncludeHandler.h"
-#include "Cache/RadianceCacheManager.h"
 #include "Cache/SurfaceCard.h"
 #include "Engine/Renderer/BitmapFont.hpp"
 #include "Engine/Renderer/Texture.hpp"
@@ -25,6 +24,8 @@
 #include "Cache/CardBVH.h"
 #include "Cache/ScreenProbeFinalGather.h"
 #include "Cache/CombineSurfaceCache.h"
+#include "Cache/DirectionalShadowPass.h"
+#include "Cache/PointLightShadowPass.h"
 #include "Cache/SurfaceRadiosityCache.h"
 #include "GI/GISystem.h"
 
@@ -32,6 +33,9 @@
 #include "ThirdParty/ImGui/implot.h"
 #include "ThirdParty/ImGui/imgui_impl_dx12.h"
 #include "ThirdParty/ImGui/imgui_impl_win32.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "ThirdParty/stb/stb_image_write.h"
 #include "ThirdParty/stb/stb_image.h"
 
 // #include <wrl/client.h>
@@ -76,7 +80,7 @@ void DX12Renderer::Startup()
 	debugController->EnableDebugLayer();
 	Microsoft::WRL::ComPtr<ID3D12Debug1> debugController1;
 	if (SUCCEEDED(debugController.As(&debugController1))) {
-		debugController1->SetEnableGPUBasedValidation(TRUE);
+		debugController1->SetEnableGPUBasedValidation(FALSE);  // TODO: re-enable after instancing is verified
 	}
 #endif
 
@@ -252,7 +256,7 @@ void DX12Renderer::Startup()
 
 	// create a depth stencil descriptor heap so we can get a pointer to the depth stencil buffer
 	D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-	dsvHeapDesc.NumDescriptors = 1 + SHADOW_MAP_DSV_COUNT;
+	dsvHeapDesc.NumDescriptors = 1 + SHADOW_MAP_DSV_COUNT + POINT_SHADOW_DSV_COUNT;
 	dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
 	dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 	hr = m_device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&m_dsvDescHeap));
@@ -360,8 +364,8 @@ void DX12Renderer::Startup()
 	{
 		StartupComputeQueue();
 
-		CreateShadowMapResources();
-		
+		CreateShadowPassResources();
+
 		CreateCardCapturePassResources();
 		CreateCardCapturePipelineStates();
 
@@ -370,8 +374,6 @@ void DX12Renderer::Startup()
 		CreateDepthSRV();
 		
 		CreateComputeRootSignature();
-		
-		CreateRadianceCacheResources();
 		CreateCompositeResources();
 
 		CreateSDFGenerationRootSignature();
@@ -379,13 +381,39 @@ void DX12Renderer::Startup()
 		
 		CreateGlobalSDFPassResources();
 
-		CreateRadianceCacheUpdatePSO();
-		CreateRadianceCacheResources();
-
 		CreateCombineSurfaceCacheResources();
 		CreateSurfaceCacheRadiosityResources();
+		CreateDirectLightUpdateResources();
 		CreateScreenProbeGatherResources();
 		CreateGIVisualizationResources();
+	}
+
+	// Create triple-buffered instance data upload buffers
+	{
+		D3D12_HEAP_PROPERTIES heapProps = {};
+		heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+		D3D12_RESOURCE_DESC bufferDesc = {};
+		bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufferDesc.Width = MAX_GBUFFER_INSTANCES * sizeof(InstanceData);
+		bufferDesc.Height = 1;
+		bufferDesc.DepthOrArraySize = 1;
+		bufferDesc.MipLevels = 1;
+		bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+		bufferDesc.SampleDesc.Count = 1;
+		bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+		for (int i = 0; i < FRAME_BUFFER_COUNT; ++i)
+		{
+			hr = m_device->CreateCommittedResource(
+				&heapProps, D3D12_HEAP_FLAG_NONE,
+				&bufferDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+				nullptr, IID_PPV_ARGS(&m_instanceDataBuffer[i]));
+			GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create instance data buffer");
+
+			D3D12_RANGE readRange = { 0, 0 };
+			m_instanceDataBuffer[i]->Map(0, &readRange, reinterpret_cast<void**>(&m_instanceDataMappedPtr[i]));
+		}
 	}
 
 	ImGuiStartUp();
@@ -407,8 +435,8 @@ void DX12Renderer::BeginFrame()
 		m_constantBuffers[i]->ResetOffset();
 	}
 
-	m_radianceCache.BeginFrame();
-	g_theGISystem->BeginFrame(m_frameIndex);
+	if (g_theGISystem)
+		g_theGISystem->BeginFrame(m_frameIndex);
 
 	m_commandList->SetGraphicsRootSignature(m_graphicsRootSignature);
 	
@@ -446,8 +474,50 @@ void DX12Renderer::EndFrame()
 	//m_currentActivePass = ActivePass::UNKNOWN;
 	m_forwardPassActive = false;
 
+	// Dump debug layer messages before Close
+#ifdef ENGINE_DEBUG_RENDER
+	{
+		Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+		if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&infoQueue))))
+		{
+			UINT64 msgCount = infoQueue->GetNumStoredMessages();
+			for (UINT64 i = 0; i < msgCount; ++i)
+			{
+				SIZE_T msgLen = 0;
+				infoQueue->GetMessage(i, nullptr, &msgLen);
+				D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(msgLen);
+				infoQueue->GetMessage(i, msg, &msgLen);
+				DebuggerPrintf("[D3D12 MSG %d] Category=%d Severity=%d ID=%d: %s\n",
+					(int)i, msg->Category, msg->Severity, msg->ID, msg->pDescription);
+				free(msg);
+			}
+			infoQueue->ClearStoredMessages();
+		}
+	}
+#endif
+
 	HRESULT hr = m_commandList->Close();
-	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12: Failed to Close CommandList");
+	if (!SUCCEEDED(hr))
+	{
+		// Dump any additional messages after Close failure
+#ifdef ENGINE_DEBUG_RENDER
+		Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+		if (SUCCEEDED(m_device->QueryInterface(IID_PPV_ARGS(&infoQueue))))
+		{
+			UINT64 msgCount = infoQueue->GetNumStoredMessages();
+			for (UINT64 i = 0; i < msgCount; ++i)
+			{
+				SIZE_T msgLen = 0;
+				infoQueue->GetMessage(i, nullptr, &msgLen);
+				D3D12_MESSAGE* msg = (D3D12_MESSAGE*)malloc(msgLen);
+				infoQueue->GetMessage(i, msg, &msgLen);
+				DebuggerPrintf("[D3D12 CLOSE ERR %d] %s\n", (int)i, msg->pDescription);
+				free(msg);
+			}
+		}
+#endif
+		GUARANTEE_OR_DIE(false, Stringf("D3D12: Failed to Close CommandList, HRESULT=0x%08X", (unsigned)hr).c_str());
+	}
 
 	ID3D12CommandList* listsToExecute[] = { m_commandList };
 	m_commandQueue->ExecuteCommandLists(1, listsToExecute);
@@ -460,8 +530,6 @@ void DX12Renderer::EndFrame()
 	hr = m_swapChain->Present(1, 0);
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12: Present failed");
 
-	m_radianceCache.EndFrame(); //TODO: meishayong
-	
 	m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
 	if (m_fence[m_frameIndex]->GetCompletedValue() < m_fenceValue[m_frameIndex])
@@ -501,6 +569,103 @@ void DX12Renderer::EndFrame()
 		m_giSystem->EndFrame();
 }
 
+void DX12Renderer::CaptureScreenshot(const std::string& filePath)
+{
+	// Wait for GPU to finish current frame
+	const UINT idx = (m_frameIndex == 0) ? FRAME_BUFFER_COUNT - 1 : m_frameIndex - 1;
+
+	D3D12_RESOURCE_DESC desc = m_renderTargets[idx]->GetDesc();
+	UINT width = (UINT)desc.Width;
+	UINT height = (UINT)desc.Height;
+	UINT rowPitch = (width * 4 + 255) & ~255; // 4 bytes per pixel, aligned to 256
+
+	// Create readback buffer
+	D3D12_HEAP_PROPERTIES heapProps = {};
+	heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bufDesc = {};
+	bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bufDesc.Width = (UINT64)rowPitch * height;
+	bufDesc.Height = 1;
+	bufDesc.DepthOrArraySize = 1;
+	bufDesc.MipLevels = 1;
+	bufDesc.SampleDesc.Count = 1;
+	bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	ID3D12Resource* readbackBuffer = nullptr;
+	HRESULT hr = m_device->CreateCommittedResource(
+		&heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+		IID_PPV_ARGS(&readbackBuffer));
+	if (FAILED(hr))
+	{
+		DebuggerPrintf("[Screenshot] Failed to create readback buffer\n");
+		return;
+	}
+
+	// Copy render target to readback buffer
+	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_renderTargets[idx],
+		D3D12_RESOURCE_STATE_PRESENT,
+		D3D12_RESOURCE_STATE_COPY_SOURCE);
+	m_commandList->ResourceBarrier(1, &barrier);
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+	footprint.Footprint.Width = width;
+	footprint.Footprint.Height = height;
+	footprint.Footprint.Depth = 1;
+	footprint.Footprint.RowPitch = rowPitch;
+	footprint.Footprint.Format = desc.Format;
+
+	CD3DX12_TEXTURE_COPY_LOCATION dst(readbackBuffer, footprint);
+	CD3DX12_TEXTURE_COPY_LOCATION src(m_renderTargets[idx], 0);
+	m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+		m_renderTargets[idx],
+		D3D12_RESOURCE_STATE_COPY_SOURCE,
+		D3D12_RESOURCE_STATE_PRESENT);
+	m_commandList->ResourceBarrier(1, &barrier);
+
+	// Execute and wait
+	m_commandList->Close();
+	ID3D12CommandList* lists[] = { m_commandList };
+	m_commandQueue->ExecuteCommandLists(1, lists);
+
+	m_fenceValue[m_frameIndex]++;
+	m_commandQueue->Signal(m_fence[m_frameIndex], m_fenceValue[m_frameIndex]);
+	m_fence[m_frameIndex]->SetEventOnCompletion(m_fenceValue[m_frameIndex], m_fenceEvent);
+	WaitForSingleObject(m_fenceEvent, INFINITE);
+
+	m_commandList->Reset(m_commandAllocator[m_frameIndex], m_pipelineStateObject);
+
+	// Map and save
+	void* mappedData = nullptr;
+	hr = readbackBuffer->Map(0, nullptr, &mappedData);
+	if (SUCCEEDED(hr))
+	{
+		// Copy to contiguous buffer (remove row pitch padding)
+		std::vector<unsigned char> pixels(width * height * 4);
+		for (UINT y = 0; y < height; y++)
+		{
+			memcpy(pixels.data() + y * width * 4,
+				(unsigned char*)mappedData + y * rowPitch,
+				width * 4);
+		}
+		readbackBuffer->Unmap(0, nullptr);
+
+		stbi_write_png(filePath.c_str(), (int)width, (int)height, 4,
+			pixels.data(), (int)(width * 4));
+
+		DebuggerPrintf("[Screenshot] Saved %ux%u to %s\n", width, height, filePath.c_str());
+	}
+	else
+	{
+		DebuggerPrintf("[Screenshot] Failed to map readback buffer\n");
+	}
+
+	DX_SAFE_RELEASE(readbackBuffer);
+}
+
 void DX12Renderer::ShutDown()
 {
 	if (m_giSystem)
@@ -514,22 +679,35 @@ void DX12Renderer::ShutDown()
 	}
 	ImGuiShutDown();
 
-	m_surfaceRadiosity->Shutdown();
-	m_screenProbeFinalGather->Shutdown();
-	m_combineSurfaceCache->Shutdown();
-	m_giVisualization->Shutdown();
-	delete m_surfaceRadiosity;
-	m_surfaceRadiosity = nullptr;
-	delete m_screenProbeFinalGather;
-	m_screenProbeFinalGather = nullptr;
-	delete m_combineSurfaceCache;
-	m_combineSurfaceCache = nullptr;
-	delete m_giVisualization;
-	m_giVisualization = nullptr;
+	if (m_surfaceRadiosity)
+	{
+		m_surfaceRadiosity->Shutdown();
+		delete m_surfaceRadiosity;
+		m_surfaceRadiosity = nullptr;
+	}
+	if (m_screenProbeFinalGather)
+	{
+		m_screenProbeFinalGather->Shutdown();
+		delete m_screenProbeFinalGather;
+		m_screenProbeFinalGather = nullptr;
+	}
+	if (m_combineSurfaceCache)
+	{
+		m_combineSurfaceCache->Shutdown();
+		delete m_combineSurfaceCache;
+		m_combineSurfaceCache = nullptr;
+	}
+	if (m_giVisualization)
+	{
+		m_giVisualization->Shutdown();
+		delete m_giVisualization;
+		m_giVisualization = nullptr;
+	}
 	
 	ShutdownComputeQueue();
-	ShutdownShadowMapPass();
-	
+	ShutdownShadowPasses();
+	ShutdownDirectLightUpdatePass();
+
 	m_surfaceCache.Shutdown();
 	
 	for (BitmapFont* font : m_loadedFonts)
@@ -577,11 +755,8 @@ void DX12Renderer::ShutDown()
 	DX_SAFE_RELEASE(m_gBuffer.m_worldPos);
 	DX_SAFE_RELEASE(m_gBuffer.m_material);
 	
-	m_radianceCache.Shutdown();
-    
 	DX_SAFE_RELEASE(m_cardBVHNodeBuffer);
 	DX_SAFE_RELEASE(m_cardBVHIndexBuffer);
-	DX_SAFE_RELEASE(m_radianceCacheUpdatePSO);
 
 	for (auto& pair : m_pipelineStatesConfiguration)
 	{
@@ -615,8 +790,18 @@ void DX12Renderer::ShutDown()
 	DX_SAFE_RELEASE(m_injectLightingPSO);
 	DX_SAFE_RELEASE(m_globalSDFRootSignature);
 
+	for (int i = 0; i < FRAME_BUFFER_COUNT; ++i)
+	{
+		if (m_instanceDataBuffer[i])
+		{
+			m_instanceDataBuffer[i]->Unmap(0, nullptr);
+			m_instanceDataMappedPtr[i] = nullptr;
+		}
+		DX_SAFE_RELEASE(m_instanceDataBuffer[i]);
+	}
+
 	DX_SAFE_RELEASE(m_swapChain);
-	
+
 	for (int i = 0; i < FRAME_BUFFER_COUNT; i++)
 	{
 		DX_SAFE_RELEASE(m_renderTargets[i]);
@@ -668,14 +853,11 @@ void DX12Renderer::ClearScreen(Rgba8 const& clearColor)
 	//{
 	//BeginForwardPass();
 	//ClearForwardPassRTV(clearColor);
-	UNUSED(clearColor); //TODO
+	if (m_currentRenderMode != RenderMode::GI)
+	{
+		BeginRenderPass(RenderMode::FORWARD, clearColor);
+	}
 	m_commandList->ClearDepthStencilView(m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-
-	//}
-	//if (m_currentRenderMode == RenderMode::GI)
-	//{
-	//	BeginGBufferPass(clearColor);
-	//}
 }
 
 void DX12Renderer::ClearScreen()
@@ -686,8 +868,14 @@ void DX12Renderer::ClearScreen()
 void DX12Renderer::BeginCamera(Camera const& camera)
 {
 	m_camera = camera;
-	m_previousCam = m_currentCam;
-	//CameraConstants cam;
+
+	// 只在透视相机（主相机）时保存 previous，跳过 UI 的正交相机
+	float projTest = m_currentCam.RenderToClipTransform.m_values[0];
+	if (projTest > 0.1f)
+	{
+		memcpy(&m_previousCam, &m_currentCam, sizeof(CameraConstants));
+	}
+
 	m_currentCam.WorldToCameraTransform = camera.GetWorldToCameraTransform();
 	m_currentCam.CameraToRenderTransform = camera.GetCameraToRenderTransform();
 	m_currentCam.RenderToClipTransform = camera.GetRenderToClipTransform();
@@ -1002,6 +1190,47 @@ void DX12Renderer::DrawIndexedVertexBuffer(VertexBuffer* vbo, IndexBuffer* ibo, 
 	BindIndexBuffer(ibo);
 	m_commandList->DrawIndexedInstanced(indexCount, 1, indexOffset, 0, 0);
 
+	m_currentDrawIndex++;
+}
+
+void DX12Renderer::ResetInstanceData()
+{
+	m_instanceDataCount = 0;
+}
+
+uint32_t DX12Renderer::AppendInstanceData(const Mat44& worldMatrix, const Rgba8& color)
+{
+	GUARANTEE_OR_DIE(m_instanceDataCount < MAX_GBUFFER_INSTANCES, "Instance data buffer overflow");
+
+	uint32_t index = m_instanceDataCount++;
+	InstanceData* dst = reinterpret_cast<InstanceData*>(m_instanceDataMappedPtr[m_frameIndex]) + index;
+	dst->ModelToWorldTransform = worldMatrix;
+	color.GetAsFloats(dst->ModelColor);
+
+	return index;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS DX12Renderer::GetInstanceBufferGPUAddress() const
+{
+	return m_instanceDataBuffer[m_frameIndex]->GetGPUVirtualAddress();
+}
+
+void DX12Renderer::DrawIndexedInstancedBatch(VertexBuffer* vbo, IndexBuffer* ibo,
+	int indexCount, uint32_t startInstance, uint32_t instanceCount)
+{
+	SetGraphicsStatesIfChanged();
+	BindVertexBuffer(vbo);
+	BindIndexBuffer(ibo);
+
+	// Bind instance data as root SRV at slot 30 (t243)
+	m_commandList->SetGraphicsRootShaderResourceView(30,
+		m_instanceDataBuffer[m_frameIndex]->GetGPUVirtualAddress());
+
+	// Pass instance offset as root constant at slot 31 (b21)
+	// SV_InstanceID always starts at 0 per draw call
+	m_commandList->SetGraphicsRoot32BitConstant(31, startInstance, 0);
+
+	m_commandList->DrawIndexedInstanced(indexCount, instanceCount, 0, 0, 0);
 	m_currentDrawIndex++;
 }
 
@@ -1369,6 +1598,39 @@ Texture* DX12Renderer::CreateTextureFromImage(Image const& image)
 	return newTexture;
 }
 
+void DX12Renderer::UpdateTextureFromImage(Texture* texture, Image const& image)
+{
+	if (texture == nullptr || texture->m_dx12Texture == nullptr)
+	{
+		return;
+	}
+
+	IntVec2 dims = image.GetDimensions();
+
+	// Transition to COPY_DEST state
+	CD3DX12_RESOURCE_BARRIER barrierToCopy = CD3DX12_RESOURCE_BARRIER::Transition(
+		texture->m_dx12Texture,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_COPY_DEST);
+	m_commandList->ResourceBarrier(1, &barrierToCopy);
+
+	// Upload image data directly (no vertical flip - caller handles UV flip instead)
+	D3D12_SUBRESOURCE_DATA textureData = {};
+	textureData.pData = image.GetRawData();
+	textureData.RowPitch = dims.x * 4; // 4 bytes per pixel
+	textureData.SlicePitch = dims.x * dims.y * 4;
+
+	// Upload using existing upload heap
+	UpdateSubresources(m_commandList, texture->m_dx12Texture, texture->m_textureBufferUploadHeap, 0, 0, 1, &textureData);
+
+	// Transition back to PIXEL_SHADER_RESOURCE state
+	CD3DX12_RESOURCE_BARRIER barrierToShader = CD3DX12_RESOURCE_BARRIER::Transition(
+		texture->m_dx12Texture,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	m_commandList->ResourceBarrier(1, &barrierToShader);
+}
+
 void DX12Renderer::PushBackNewTextureManually(Texture* const tex)
 {
 	m_loadedTextures.push_back(tex);
@@ -1597,7 +1859,14 @@ void DX12Renderer::SetGraphicsStatesIfChanged()
 		psoDesc.RTVFormats[3] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	}
 	HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
-	GUARANTEE_OR_DIE(SUCCEEDED(hr), "D3D12 Cannot Create Graphics Pipeline State!");
+	if (FAILED(hr))
+	{
+		char msg[512];
+		snprintf(msg, sizeof(msg),
+			"D3D12 Cannot Create Graphics Pipeline State! HRESULT=0x%08X, Shader=%s, RenderMode=%d",
+			(unsigned)hr, m_desiredShader->m_config.m_name.c_str(), (int)m_currentRenderMode);
+		GUARANTEE_OR_DIE(false, msg);
+	}
 	std::wstring debugName = L"PSO_" 
     + std::wstring(m_desiredShader->m_config.m_name.begin(), m_desiredShader->m_config.m_name.end())
     + L"_Rs" + std::to_wstring((int)m_desiredRasterizerMode)
@@ -1802,7 +2071,7 @@ void DX12Renderer::CreateGBufferPassResources()
 	ID3DBlob* vs = nullptr;
 	ID3DBlob* ps = nullptr;
 
-	CompileShaderToByteCode(&vs, "GBufferVS", m_gBufferShaderSource, cfg.m_vertexEntryPoint.c_str(), "vs_5_0");  //TODO: æ”¹GBuffer
+	CompileShaderToByteCode(&vs, "GBufferVS", m_gBufferShaderSource, cfg.m_vertexEntryPoint.c_str(), "vs_5_1");
 	CompileShaderToByteCode(&ps, "GBufferPS", m_gBufferShaderSource, cfg.m_pixelEntryPoint.c_str(), "ps_5_1");
 
 	static D3D12_INPUT_ELEMENT_DESC kPCUTBN[] = {
@@ -1884,8 +2153,7 @@ void DX12Renderer::EndGBufferPass()
 {
 	BeginCardCapturePass();
 	EndCardCapturePass();
-	 //BeginRadianceCachePass();
-	
+
 	RenderingGlobalSDFPass();
 	
 	RenderingSurfaceCacheRadiosityPass();
@@ -1940,7 +2208,6 @@ CD3DX12_RESOURCE_BARRIER::Transition(
 	// m_commandList->ResourceBarrier(1, &barrier);
 
 	m_gBufferPassActive = false;
-	m_radianceCache.SwapBuffers();
 }
 
 void DX12Renderer::UnbindGBufferPassRT()
@@ -2110,7 +2377,7 @@ SDFTexture3D* DX12Renderer::CreateSDFTextureFromData(const std::vector<Vertex_PC
     texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     texDesc.Width = resolution;
     texDesc.Height = resolution;
-    texDesc.DepthOrArraySize = resolution;
+    texDesc.DepthOrArraySize = (UINT16)resolution;
     texDesc.MipLevels = 1;
     texDesc.Format = DXGI_FORMAT_R32_FLOAT;
     texDesc.SampleDesc.Count = 1;
@@ -2176,56 +2443,89 @@ SDFTexture3D* DX12Renderer::CreateSDFTextureFromData(const std::vector<Vertex_PC
     );
     m_computeCommandList->SetComputeRootDescriptorTable(1, gpuUavHandle);
     
-    // 6. 设置常量缓冲区
+    // 6. 先提交buffer上传 + UAV transition命令
+    m_computeCommandList->Close();
+    {
+        ID3D12CommandList* uploadLists[] = { m_computeCommandList };
+        m_computeQueue->ExecuteCommandLists(1, uploadLists);
+        m_computeFenceValue++;
+        m_computeQueue->Signal(m_computeFence, m_computeFenceValue);
+        WaitForComputeQueue();
+    }
+
+    // 7. Z-slice分片Dispatch，每次只提交1层Z thread groups，避免TDR超时
+    int numGroups = (resolution + 7) / 8;
+
     SDFGenerationConstants constants;
     constants.BoundsMin = bounds.m_mins;
     constants.Resolution = resolution;
     constants.BoundsMax = bounds.m_maxs;
     constants.NumTriangles = (uint32_t)(indices.size() / 3);
-	constants.NumVertices = static_cast<uint32_t>(vertices.size());
-	constants.NumBVHNodes = static_cast<uint32_t>(bvhNodes.size());
+    constants.NumVertices = static_cast<uint32_t>(vertices.size());
+    constants.NumBVHNodes = static_cast<uint32_t>(bvhNodes.size());
 
-	m_computeConstantBuffer->AppendData(&constants, sizeof(SDFGenerationConstants), 0);
-	D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress = 
-		m_computeConstantBuffer->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-		+ m_computeConstantBuffer->m_offset;
-	m_computeCommandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
-	// m_constantBuffers[k_sdfGenerationConstantsSlot]->AppendData(&constants, sizeof(SDFGenerationConstants), m_currentDrawIndex);
-	// D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress = m_constantBuffers[k_sdfGenerationConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
-	// + m_constantBuffers[k_sdfGenerationConstantsSlot]->m_offset;
- //    m_computeCommandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
-    
-    // 7. Dispatch
-    int numGroups = (resolution + 7) / 8;
-    m_computeCommandList->Dispatch(numGroups, numGroups, numGroups);
-    
-    DebuggerPrintf("[DX12] Dispatched SDF generation: %dx%dx%d groups\n", 
-                   numGroups, numGroups, numGroups);
-    
-    // 8. UAV Barrier
-    CD3DX12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(sdf->m_sdfTexture3D);
-    m_computeCommandList->ResourceBarrier(1, &uavBarrier);
-    
-    // 9. 转换到SRV状态
-    auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
-        sdf->m_sdfTexture3D,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-    );
-    m_computeCommandList->ResourceBarrier(1, &toSRV);
-    
-    // 关键：提交到Async Compute Queue
-    // 10. Close CommandList
-    m_computeCommandList->Close();
-    // 11. 提交到Compute Queue（异步执行，不阻塞！）
-    ID3D12CommandList* computeLists[] = { m_computeCommandList };
-    m_computeQueue->ExecuteCommandLists(1, computeLists);
-    // 12. Signal Fence（不等待完成）
-    m_computeFenceValue++;
-    m_computeQueue->Signal(m_computeFence, m_computeFenceValue);
-    
-    DebuggerPrintf("[DX12] SDF generation submitted to Async Compute Queue (fence=%llu)\n", 
-                   m_computeFenceValue);
+    D3D12_GPU_VIRTUAL_ADDRESS constantsBufferAddress =
+        m_computeConstantBuffer->m_dx12ConstantBuffer->GetGPUVirtualAddress();
+
+    for (int z = 0; z < numGroups; z++)
+    {
+        m_computeAllocator->Reset();
+        m_computeCommandList->Reset(m_computeAllocator, nullptr);
+
+        // 重新设置Pipeline（Reset后状态丢失）
+        m_computeCommandList->SetPipelineState(m_sdfGenerationPSO);
+        m_computeCommandList->SetComputeRootSignature(m_sdfGenerationRootSignature);
+        ID3D12DescriptorHeap* sliceHeaps[] = { m_cbvSrvDescHeap };
+        m_computeCommandList->SetDescriptorHeaps(1, sliceHeaps);
+
+        // 绑定SRVs (t0-t3)
+        CD3DX12_GPU_DESCRIPTOR_HANDLE sliceSrvHandle(
+            m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+            SDF_GEN_VERTEX_SRV, m_scuDescriptorSize);
+        m_computeCommandList->SetComputeRootDescriptorTable(0, sliceSrvHandle);
+
+        // 绑定UAV (u0)
+        CD3DX12_GPU_DESCRIPTOR_HANDLE sliceUavHandle(
+            m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+            SDF_GEN_OUTPUT_UAV, m_scuDescriptorSize);
+        m_computeCommandList->SetComputeRootDescriptorTable(1, sliceUavHandle);
+
+        // 更新常量：设置当前Z偏移
+        constants.ZSliceOffset = z * 8;
+        memcpy(m_computeConstantBuffer->m_mappedPtr, &constants, sizeof(SDFGenerationConstants));
+        m_computeCommandList->SetComputeRootConstantBufferView(2, constantsBufferAddress);
+
+        // Dispatch单层Z（numGroups × numGroups × 1）
+        m_computeCommandList->Dispatch(numGroups, numGroups, 1);
+
+        // 最后一层：加UAV barrier + 转换到SRV状态
+        if (z == numGroups - 1)
+        {
+            CD3DX12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(sdf->m_sdfTexture3D);
+            m_computeCommandList->ResourceBarrier(1, &uavBarrier);
+
+            auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+                sdf->m_sdfTexture3D,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            m_computeCommandList->ResourceBarrier(1, &toSRV);
+        }
+
+        m_computeCommandList->Close();
+        ID3D12CommandList* computeLists[] = { m_computeCommandList };
+        m_computeQueue->ExecuteCommandLists(1, computeLists);
+        m_computeFenceValue++;
+        m_computeQueue->Signal(m_computeFence, m_computeFenceValue);
+
+        // 非最后一层：等待完成后再提交下一层
+        if (z < numGroups - 1)
+        {
+            WaitForComputeQueue();
+        }
+    }
+
+    DebuggerPrintf("[DX12] SDF generation: dispatched %d Z-slices to Async Compute Queue (fence=%llu)\n",
+                   numGroups, m_computeFenceValue);
     // 注意：这些temp buffers不能立即释放，因为Compute Queue还在使用, createStructuredBuffer时储存到tempBuffers里了
     // 创建最终的SRV
     if (m_nextSDFDescriptorIndex >= SDF_TEXTURE_SRV_BASE + MAX_SDF_TEXTURE_COUNT)
@@ -2556,10 +2856,11 @@ std::vector<float> DX12Renderer::ReadbackSDF3DData(const SDFTexture3D* sdf)
         ERROR_RECOVERABLE("Failed to create readback buffer");
         return result;
     }
+    WaitForComputeQueue();
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = resource;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     commandList->ResourceBarrier(1, &barrier);
@@ -2573,7 +2874,7 @@ std::vector<float> DX12Renderer::ReadbackSDF3DData(const SDFTexture3D* sdf)
     dstLocation.PlacedFootprint = layout;
     commandList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     commandList->ResourceBarrier(1, &barrier);
     hr = commandList->Close();
     if (FAILED(hr))
@@ -2637,252 +2938,31 @@ std::vector<float> DX12Renderer::ReadbackSDF3DData(const SDFTexture3D* sdf)
     return result;
 }
 
-void DX12Renderer::CreateShadowMapResources()
+void DX12Renderer::CreateShadowPassResources()
 {
-	D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = SHADOW_MAP_SIZE;
-    desc.Height = SHADOW_MAP_SIZE;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.Format = DXGI_FORMAT_R32_TYPELESS;  // 同时支持 DSV 和 SRV
-    desc.SampleDesc.Count = 1;
-    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+	m_directionalShadowPass = new DirectionalShadowPass();
+	m_directionalShadowPass->Initialize(m_device, m_graphicsRootSignature,
+		m_cbvSrvDescHeap, m_dsvDescHeap, m_scuDescriptorSize);
 
-    D3D12_CLEAR_VALUE clearValue = {};
-    clearValue.Format = DXGI_FORMAT_D32_FLOAT;
-    clearValue.DepthStencil.Depth = 1.0f;
-
-    CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_DEFAULT);
-    
-    HRESULT hr = m_device->CreateCommittedResource(
-        &heapProps,
-        D3D12_HEAP_FLAG_NONE,
-        &desc,
-        //D3D12_RESOURCE_STATE_DEPTH_WRITE, //最好初始状态是srv
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        &clearValue,
-        IID_PPV_ARGS(&m_shadowMapTexture)
-    );
-    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create shadow map texture!");
-    m_shadowMapTexture->SetName(L"ShadowMapTexture");
-	//dsv creating
-	D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-	dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
-	dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-	dsvDesc.Texture2D.MipSlice = 0;
-	UINT dsvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-	// 第 2 个槽位（索引 1）
-	CD3DX12_CPU_DESCRIPTOR_HANDLE shadowDsvHandle(
-		m_dsvDescHeap->GetCPUDescriptorHandleForHeapStart(),
-		1,  // 索引 1（第 2 个）
-		dsvDescriptorSize
-	);
-	m_device->CreateDepthStencilView(m_shadowMapTexture, &dsvDesc, shadowDsvHandle);
-	m_shadowDsvHandle = shadowDsvHandle;
-    // 创建 SRV（用于后续采样）
-    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srvDesc.Texture2D.MipLevels = 1;
-    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
-        m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
-        SHADOW_MAP_SRV,
-        m_scuDescriptorSize
-    );
-    m_device->CreateShaderResourceView(m_shadowMapTexture, &srvDesc, srvHandle);
-	//PSO
-	std::string shaderSource;
-    FileReadToString(shaderSource, "Data/Shaders/Shadow.hlsl");
-    ID3DBlob* vs = nullptr;
-    CompileShaderToByteCode(&vs, "ShadowVS", shaderSource.c_str(), "VertexMain", "vs_5_0");
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        // 其他属性不需要，但为了兼容VBO，保留完整 layout
-        { "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "BITANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, D3D12_APPEND_ALIGNED_ELEMENT, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-    };
-    psoDesc.InputLayout = { inputLayout, _countof(inputLayout) };
-    psoDesc.pRootSignature = m_graphicsRootSignature;
-    psoDesc.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-    psoDesc.PS = { nullptr, 0 };  // 无 PS！
-    
-    psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    // Use FRONT culling - renders back faces to shadow map
-    // This prevents light leaking through thin geometry (necks, edges)
-    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_FRONT;
-    // 硬件 depth bias - 比 shader bias 更稳定，不会闪烁
-    psoDesc.RasterizerState.DepthBias = 5000;           // 固定偏移
-    psoDesc.RasterizerState.DepthBiasClamp = 0.005f;    // 最大偏移限制
-    psoDesc.RasterizerState.SlopeScaledDepthBias = 2.0f; // 斜率缩放偏移
-    
-    psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
-    
-    psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
-    psoDesc.DepthStencilState.DepthEnable = TRUE;
-    psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    
-    psoDesc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    psoDesc.SampleMask = UINT_MAX;
-    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    psoDesc.NumRenderTargets = 0;  // 无 RTV！
-    psoDesc.SampleDesc.Count = 1;
-	hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_shadowMapPSO));
-    GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create Shadow Map PSO!");
-    
-    m_shadowMapPSO->SetName(L"ShadowMapPSO");
-    vs->Release();
-
-	//TransitionResource(m_shadowMapTexture, D3D12_RESOURCE_STATE_DEPTH_WRITE
-	//	, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	m_pointLightShadowPass = new PointLightShadowPass();
+	m_pointLightShadowPass->Initialize(m_device, m_graphicsRootSignature,
+		m_cbvSrvDescHeap, m_dsvDescHeap, m_scuDescriptorSize);
 }
 
-void DX12Renderer::RenderingShadowMapPass()
+void DX12Renderer::ShutdownShadowPasses()
 {
-	Vec3 sunDir = m_giSystem->m_scene->m_sunDirection.GetNormalized();
-    AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
-    Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
-    float sceneRadius = sceneBounds.GetBoundsSize().GetLength() * 0.5f;
-
-    if (sceneRadius < 1.0f) sceneRadius = 100.0f;
-
-    Vec3 lightPos = sceneCenter - sunDir * sceneRadius * 2.0f;
-
-    Vec3 forward = (sceneCenter - lightPos).GetNormalized();
-    float yaw = Atan2Degrees(forward.y, forward.x);
-    float pitch = Atan2Degrees(-forward.z, sqrtf(forward.x*forward.x + forward.y*forward.y));
-    EulerAngles orientation(yaw, pitch, 0.0f);
-
-    Mat44 worldToCamera = orientation.GetAsMatrix_IFwd_JLeft_KUp();
-    worldToCamera.SetTranslation3D(lightPos);
-    worldToCamera = worldToCamera.GetOrthonormalInverse();
-
-    Mat44 cameraToRender;
-    cameraToRender.SetIJK3D(Vec3(0.f, 0.f, 1.f), Vec3(-1.f, 0.f, 0.f), Vec3(0.f, 1.f, 0.f));
-
-    Mat44 renderToClip = Mat44::MakeOrthoProjection(
-        -sceneRadius, sceneRadius,
-        -sceneRadius, sceneRadius,
-        0.1f, sceneRadius * 4.0f
-    );
-
-    // ============ Shadow Map Stabilization ============
-    // 把shadow map原点snap到texel网格，防止相机移动时抖动
-    {
-        Mat44 shadowMatrix = renderToClip * cameraToRender * worldToCamera;
-
-        // NDC空间中一个texel的大小（NDC范围是-1到1，总共2.0）
-        float texelSizeNDC = 2.0f / (float)SHADOW_MAP_SIZE;
-
-        // 把原点变换到shadow space (NDC)
-        Vec4 origin = shadowMatrix.TransformHomogeneous3D(Vec4(0.f, 0.f, 0.f, 1.f));
-
-        // 透视除法（对于正交投影w应该是1，但保险起见还是做一下）
-        if (origin.w != 0.f)
-        {
-            origin.x /= origin.w;
-            origin.y /= origin.w;
-        }
-
-        // Snap到texel边界（在NDC空间）
-        float snappedX = floorf(origin.x / texelSizeNDC) * texelSizeNDC;
-        float snappedY = floorf(origin.y / texelSizeNDC) * texelSizeNDC;
-
-        // 计算偏移量（NDC空间）
-        float offsetX = snappedX - origin.x;
-        float offsetY = snappedY - origin.y;
-
-        // 应用偏移到投影矩阵
-        Mat44 snapOffset;
-        snapOffset.SetTranslation3D(Vec3(offsetX, offsetY, 0.f));
-        renderToClip = snapOffset * renderToClip;
-    }
-    // ==================================================
-
-	m_cachedLightWorldToCamera = worldToCamera;
-	m_cachedLightCameraToRender = cameraToRender;
-	m_cachedLightRenderToClip = renderToClip;
-    
-    CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_shadowMapTexture,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE
-    );
-    m_commandList->ResourceBarrier(1, &barrier);
-
-    m_commandList->OMSetRenderTargets(0, nullptr, FALSE, &m_shadowDsvHandle);
-    m_commandList->ClearDepthStencilView(
-        m_shadowDsvHandle, 
-        D3D12_CLEAR_FLAG_DEPTH, 
-        1.0f, 0, 
-        0, nullptr
-    );
-
-    D3D12_VIEWPORT viewport = {};
-    viewport.TopLeftX = 0;
-    viewport.TopLeftY = 0;
-    viewport.Width = (float)SHADOW_MAP_SIZE;
-    viewport.Height = (float)SHADOW_MAP_SIZE;
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    D3D12_RECT scissor = {};
-    scissor.left = 0;
-    scissor.top = 0;
-    scissor.right = (LONG)SHADOW_MAP_SIZE;
-    scissor.bottom = (LONG)SHADOW_MAP_SIZE;
-    m_commandList->RSSetViewports(1, &viewport);
-    m_commandList->RSSetScissorRects(1, &scissor);
-
-    m_commandList->SetPipelineState(m_shadowMapPSO);
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-    ShadowConstants shadowConsts = {};
-	shadowConsts.LightWorldToCamera = worldToCamera;   
-	shadowConsts.LightCameraToRender = cameraToRender;
-	shadowConsts.LightRenderToClip = renderToClip;
-    shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
-    shadowConsts.ShadowBias = 0.05f;  // Increased from 0.002
-	shadowConsts.SoftnessFactor = 1.0f;
-    shadowConsts.LightSize = 3.f;
-    m_constantBuffers[k_shadowConstantsSlot]->AppendData(&shadowConsts, sizeof(ShadowConstants), 0);
-    BindConstantBuffer(k_shadowConstantsSlot, m_constantBuffers[k_shadowConstantsSlot]);
-
-    const std::vector<MeshObject*>& allObjects = m_giSystem->m_scene->m_meshObjects;
-    for (MeshObject* meshObj : allObjects)
-    {
-        if (!meshObj) continue;
-    	ModelConstants modelConstants;
-    	modelConstants.ModelToWorldTransform = meshObj->m_cachedWorldMatrix;
-    	meshObj->m_color.GetAsFloats(modelConstants.ModelColor);
-    	m_constantBuffers[k_modelConstantsSlot]->AppendData(&modelConstants, sizeof(ModelConstants), m_currentDrawIndex); 
-    	BindConstantBuffer(k_modelConstantsSlot, m_constantBuffers[k_modelConstantsSlot]); //改 TODO
-        
-        StaticMesh* mesh = meshObj->GetMesh();
-    	BindVertexBuffer(mesh->m_vertexBuffer);
-    	BindIndexBuffer(mesh->m_indexBuffer);
-        m_commandList->DrawIndexedInstanced((UINT)mesh->m_indices.size(), 1, 0, 0, 0);
-        m_currentDrawIndex++;
-    }
-    // 3.8 转换回 SRV 状态供后续采样
-    barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_shadowMapTexture,
-        D3D12_RESOURCE_STATE_DEPTH_WRITE,
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-    );
-    m_commandList->ResourceBarrier(1, &barrier);
-}
-
-void DX12Renderer::ShutdownShadowMapPass()
-{
-	DX_SAFE_RELEASE(m_shadowMapTexture)
-	DX_SAFE_RELEASE(m_shadowMapPSO)
+	if (m_directionalShadowPass)
+	{
+		m_directionalShadowPass->Shutdown();
+		delete m_directionalShadowPass;
+		m_directionalShadowPass = nullptr;
+	}
+	if (m_pointLightShadowPass)
+	{
+		m_pointLightShadowPass->Shutdown();
+		delete m_pointLightShadowPass;
+		m_pointLightShadowPass = nullptr;
+	}
 }
 
 void DX12Renderer::CreateGlobalSDFPassResources()
@@ -3310,8 +3390,7 @@ void DX12Renderer::RenderingGlobalSDFPass()
     	    D3D12_RESOURCE_STATE_COMMON,
     	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     	TransitionResource(m_surfaceCache.m_atlasTexture,
-			//D3D12_RESOURCE_STATE_COMMON,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON,
     	    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     	
     	// Pass 1: BuildGlobalSDF
@@ -3361,9 +3440,8 @@ void DX12Renderer::RenderingGlobalSDFPass()
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 
 			D3D12_RESOURCE_STATE_COMMON);
 		TransitionResource(m_surfaceCache.m_atlasTexture,
-			//D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+			D3D12_RESOURCE_STATE_COMMON
 			);
 		TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -3389,8 +3467,8 @@ void DX12Renderer::RenderingGlobalSDFPass()
 		D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	TransitionResource(m_surfaceCache.m_atlasTexture,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 
-		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);  //TODO: srv和nonsrv是一个状态，似乎不会冲突
+		D3D12_RESOURCE_STATE_COMMON,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_commandList->SetPipelineState(m_injectLightingPSO);
     m_commandList->SetComputeRoot32BitConstants(0, sizeof(VoxelSceneConstants)/4, &constants, 0);
     // [1] UAV Table
@@ -3462,9 +3540,9 @@ void DX12Renderer::CreateGraphicsRootSignature()
 		rootParameters[17].InitAsDescriptorTable(1, &surfaceCacheUAVs, D3D12_SHADER_VISIBILITY_ALL);
 		// u0, u1, u2, u3, u4, u5（如果包含 Buffer 1 的 UAVs） 那就是6 ->应该是不可能包含的
 		
-		// [18-19] = Radiance Cache 
-		rootParameters[18].InitAsShaderResourceView(RADIANCE_CACHE_SRV, 0); 
-		rootParameters[19].InitAsUnorderedAccessView(5, 0);  // u5
+		// [18-19] = Reserved
+		rootParameters[18].InitAsShaderResourceView(SURFACE_CACHE_SRV + DESCRIPTORS_PER_SURFACE_BUFFER, 0);
+		rootParameters[19].InitAsUnorderedAccessView(5, 0); // u5
 		// [20-21] = Probe Grid 
 		rootParameters[20].InitAsShaderResourceView(PROBE_GRID_SRV_INDEX, 0); 
 		rootParameters[21].InitAsConstantBufferView(16, 0);  // b16 - Probe settings TODO:改
@@ -3483,15 +3561,25 @@ void DX12Renderer::CreateGraphicsRootSignature()
 		static CD3DX12_DESCRIPTOR_RANGE screenIndirectRange;
 		screenIndirectRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, SCREEN_INDIRECT_LIGHTING_SRV_REGISTER, 0);  // t241
 		rootParameters[27].InitAsDescriptorTable(1, &screenIndirectRange, D3D12_SHADER_VISIBILITY_PIXEL);
-		// [28-31] = reserved
-		for (UINT i = 28; i < 32; ++i)
-		{
-			rootParameters[i].InitAsConstantBufferView(18 + (i-27), 0);
-		}
+
+		// [28] = GlobalSDF SRV for SDF shadows (t378)
+		static CD3DX12_DESCRIPTOR_RANGE globalSDFRange;
+		globalSDFRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 378, 0);  // t378
+		rootParameters[28].InitAsDescriptorTable(1, &globalSDFRange, D3D12_SHADER_VISIBILITY_PIXEL);
+
+		// [29] = Point Light Cube Shadow Array SRV (t242)
+		static CD3DX12_DESCRIPTOR_RANGE pointShadowRange;
+		pointShadowRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, POINT_SHADOW_SRV_REGISTER, 0);  // t242
+		rootParameters[29].InitAsDescriptorTable(1, &pointShadowRange, D3D12_SHADER_VISIBILITY_PIXEL);
+
+		// [30] = Instance Data StructuredBuffer (t243, vertex shader only)
+		rootParameters[30].InitAsShaderResourceView(INSTANCE_DATA_SRV_REGISTER, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+		// [31] = Instance offset root constant (b21, 1 DWORD, vertex shader only)
+		rootParameters[31].InitAsConstants(1, 21, 0, D3D12_SHADER_VISIBILITY_VERTEX);
         
 		D3D12_STATIC_SAMPLER_DESC samplers[3] = {};
-		// Sampler 0: Point Sampler (s0) - 用于 GBuffer、精确采样
-		samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+		// Sampler 0: Bilinear Sampler (s0) - 用于 GBuffer 材质采样
+		samplers[0].Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
 		samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;  // 改为 CLAMP，避免边界问题
 		samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
 		samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3908,15 +3996,33 @@ void DX12Renderer::RenderingCompositePass()
     constants.AmbientColor = Vec3(0.0f, 0.0f, 0.0f);
     constants.ShadowBias = 0.05f;  // Increased from 0.002 - needs to be proportional to scene scale
     
-    constants.LightWorldToCamera = m_cachedLightWorldToCamera;
-    constants.LightCameraToRender = m_cachedLightCameraToRender;
-    constants.LightRenderToClip = m_cachedLightRenderToClip;
+    constants.LightWorldToCamera = m_directionalShadowPass->GetCachedLightWorldToCamera();
+    constants.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
+    constants.LightRenderToClip = m_directionalShadowPass->GetCachedLightRenderToClip();
     
     constants.ShadowMapSize = (float)SHADOW_MAP_SIZE;
     constants.AOStrength = 0.5f;
 	constants.LightSize = 3.f;
 	constants.SoftnessFactor = 1.f;
-    
+
+    // SDF Shadow 参数
+    if (m_giSystem && m_giSystem->m_scene)
+    {
+        Vec3 sceneCenter = m_giSystem->m_scene->m_sceneBounds.GetCenter();
+        float sceneRadius = m_giSystem->m_scene->m_sceneBounds.GetBoundsSize().GetLength() * 0.5f;
+        constants.SDFCenter = sceneCenter;
+        constants.SDFExtent = sceneRadius;
+        constants.SDFShadowSoftness = 12.0f;
+        constants.UseSDFShadow = 1.0f;
+    }
+    else
+    {
+        constants.SDFCenter = Vec3();
+        constants.SDFExtent = 0.0f;
+        constants.SDFShadowSoftness = 12.0f;
+        constants.UseSDFShadow = 0.0f;
+    }
+
     m_constantBuffers[k_compositeConstantsSlot]->AppendData(&constants, sizeof(CompositeConstants), 0);
     
     // [1] Camera Constants (b1)
@@ -3942,10 +4048,6 @@ void DX12Renderer::RenderingCompositePass()
     );
     m_commandList->SetGraphicsRootDescriptorTable(15, gbufferHandle);
     
-    // // [16] Surface Cache SRVs (如果 Shader 需要)
-    // BindSurfaceCacheForGraphics(&m_surfaceCache);
-    // // [18] Radiance Cache SRV (如果 Shader 需要)
-    // BindRadianceCacheForGraphics(&m_radianceCache);
     // [26] Shadow Map SRV
     CD3DX12_GPU_DESCRIPTOR_HANDLE shadowMapHandle(
         m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
@@ -3960,6 +4062,29 @@ void DX12Renderer::RenderingCompositePass()
 		m_scuDescriptorSize
 	);
 	m_commandList->SetGraphicsRootDescriptorTable(27, indirectLightHandle);
+
+    // [28] GlobalSDF SRV for SDF shadows
+    CD3DX12_GPU_DESCRIPTOR_HANDLE globalSDFHandle(
+        m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+        GLOBAL_SDF_SRV,  // 378
+        m_scuDescriptorSize
+    );
+    m_commandList->SetGraphicsRootDescriptorTable(28, globalSDFHandle);
+
+    // [5] ShadowConstants (b5) - point light shadow sampling data
+    D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddr =
+        m_constantBuffers[k_shadowConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_shadowConstantsSlot]->m_offset;
+    m_commandList->SetGraphicsRootConstantBufferView(k_shadowConstantsSlot, shadowCBAddr);
+
+    // [29] Point Light Cube Shadow Array SRV (t242)
+    CD3DX12_GPU_DESCRIPTOR_HANDLE pointShadowHandle(
+        m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+        POINT_SHADOW_CUBE_ARRAY_SRV,
+        m_scuDescriptorSize
+    );
+    m_commandList->SetGraphicsRootDescriptorTable(29, pointShadowHandle);
+
     m_commandList->SetPipelineState(m_compositePSO);
     
     m_commandList->RSSetViewports(1, &m_viewport);
@@ -3988,33 +4113,139 @@ void DX12Renderer::BeginCardCapturePass()
         DebuggerPrintf("[CardCapture] Warning: Already in Card Capture Pass\n");
         return;
     }
-	const std::vector<uint32_t>& dirtyCards = m_giSystem->GetDirtyCards();  
+
+	// Mark shadow maps dirty when any point light moved (before Execute so it renders this frame)
+	if (m_giSystem->m_scene->m_pointLightShadowDirty)
+	{
+		m_giSystem->m_scene->m_pointLightShadowDirty = false;
+		m_pointLightShadowPass->MarkDirty();
+	}
+
+	// Render point light cube shadow maps (renders if dirty, otherwise skips)
+	m_pointLightShadowPass->Execute(m_commandList, m_constantBuffers[k_shadowConstantsSlot],
+		this, m_giSystem->m_scene);
+
+	// Upload combined shadow constants (directional + point shadow sampling data)
+	// This must happen after both shadow passes but before any pass that reads b5
+	{
+		ShadowConstants shadowConsts = {};
+		shadowConsts.LightWorldToCamera = m_directionalShadowPass->GetCachedLightWorldToCamera();
+		shadowConsts.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
+		shadowConsts.LightRenderToClip = m_directionalShadowPass->GetCachedLightRenderToClip();
+		shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
+		shadowConsts.ShadowBias = 0.05f;
+		shadowConsts.SoftnessFactor = 1.0f;
+		shadowConsts.LightSize = 3.f;
+		m_pointLightShadowPass->FillShadowConstants(shadowConsts);
+		m_constantBuffers[k_shadowConstantsSlot]->AppendData(&shadowConsts, sizeof(ShadowConstants), 0);
+	}
+
+	// Check dirty flag for sun direction change - must be before dirtyCards check
+	if (m_giSystem->m_scene->m_sunDirectionDirty)
+	{
+		m_giSystem->m_scene->m_sunDirectionDirty = false;
+		DebuggerPrintf("[Sun] Direction changed, updating ShadowMap and DirectLight\n");
+		m_directionalShadowPass->Execute(m_commandList, m_constantBuffers[k_shadowConstantsSlot],
+			this, m_giSystem->m_scene);
+
+		// Re-upload combined shadow constants after directional shadow updated its matrices
+		{
+			ShadowConstants shadowConsts = {};
+			shadowConsts.LightWorldToCamera = m_directionalShadowPass->GetCachedLightWorldToCamera();
+			shadowConsts.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
+			shadowConsts.LightRenderToClip = m_directionalShadowPass->GetCachedLightRenderToClip();
+			shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
+			shadowConsts.ShadowBias = 0.05f;
+			shadowConsts.SoftnessFactor = 1.0f;
+			shadowConsts.LightSize = 3.f;
+			m_pointLightShadowPass->FillShadowConstants(shadowConsts);
+			m_constantBuffers[k_shadowConstantsSlot]->AppendData(&shadowConsts, sizeof(ShadowConstants), 0);
+		}
+
+		UpdateDirectLightPass();
+	}
+
+	// Point light changed: full GI update (throttled in Scene::Update).
+	// Composite pass handles smooth per-frame direct lighting via constant buffer.
+	// Throttled GI update: card metadata + DirectLight surface cache re-shade
+	// (shadow maps already handled above, every frame)
+	if (m_giSystem->m_scene->m_pointLightDirty)
+	{
+		m_giSystem->m_scene->m_pointLightDirty = false;
+
+		m_giSystem->UpdateCardMetadata();
+		UploadCardMetadataToGPU();
+		TransitionResource(m_surfaceCache.m_cardMetadataBuffer,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_COMMON);
+
+		UpdateDirectLightPass();
+	}
+
+	const std::vector<uint32_t>& dirtyCards = m_giSystem->GetDirtyCards();
 	if (dirtyCards.empty())
 		return;
-	
+
+	// Re-bind graphics root signature after shadow passes
+	m_commandList->SetGraphicsRootSignature(m_graphicsRootSignature);
+	ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
+	m_commandList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+	// SetGraphicsRootSignature invalidates ALL root param bindings, so rebind everything
+	// that CardCapture needs:
+
+	// [14] Texture SRV table (t0~t199) — CardCapture.hlsl samples g_textures[]
+	CD3DX12_GPU_DESCRIPTOR_HANDLE textureSrvHandle(
+		m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		NUM_CONSTANT_BUFFERS, m_scuDescriptorSize);
+	m_commandList->SetGraphicsRootDescriptorTable(14, textureSrvHandle);
+
+	// [1] Camera constants (b1)
+	D3D12_GPU_VIRTUAL_ADDRESS cameraCBAddr =
+		m_constantBuffers[k_cameraConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_cameraConstantsSlot]->m_offset;
+	m_commandList->SetGraphicsRootConstantBufferView(k_cameraConstantsSlot, cameraCBAddr);
+
+	// [5] Bind shadow constants (b5) with point shadow data
+	D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddr =
+		m_constantBuffers[k_shadowConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_shadowConstantsSlot]->m_offset;
+	m_commandList->SetGraphicsRootConstantBufferView(k_shadowConstantsSlot, shadowCBAddr);
+
 	CD3DX12_GPU_DESCRIPTOR_HANDLE shadowMapHandle(
 		m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
-		SHADOW_MAP_SRV,  // 387
+		SHADOW_MAP_SRV,
 		m_scuDescriptorSize
 	);
 	m_commandList->SetGraphicsRootDescriptorTable(26, shadowMapHandle);
 
+	// Bind point shadow cube array SRV (root param 29, t242)
+	CD3DX12_GPU_DESCRIPTOR_HANDLE pointShadowHandle(
+		m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		POINT_SHADOW_CUBE_ARRAY_SRV,
+		m_scuDescriptorSize
+	);
+	m_commandList->SetGraphicsRootDescriptorTable(29, pointShadowHandle);
+
+	// [4] General light constants (b4) — CardCapture.hlsl uses SunColor, SunNormal, NumLights, LightsArray
+	D3D12_GPU_VIRTUAL_ADDRESS lightCBAddr =
+		m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_generalLightConstantsSlot]->m_offset;
+	m_commandList->SetGraphicsRootConstantBufferView(k_generalLightConstantsSlot, lightCBAddr);
+
 	m_currentCaptureIndex = 0;
-	
+
 	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
 		m_surfaceCache.GetAtlasTexture(),
-		//D3D12_RESOURCE_STATE_COMMON,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+		D3D12_RESOURCE_STATE_COMMON,
 		D3D12_RESOURCE_STATE_COPY_DEST
 	);
 	m_commandList->ResourceBarrier(1, &barrier);
-	
+
     m_currentActivePass = ActivePass::CARDCAPTURE;
 
 	UploadCardMetadataToGPU();
-	
-	RenderingShadowMapPass();
-	
+
 	CaptureDirtySurfaceCards(s_maxCardsPerBatch);
 	//CaptureDirtySurfaceCards(1);
 }
@@ -4205,7 +4436,7 @@ void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, Card
 		);
 		m_commandList->ResourceBarrier(1, &barrier);
 	}
-	// 8. 复制到 Atlas 的不同层
+	
 	for (int layer = 0; layer < SURFACE_CACHE_LAYER_CAPTURE_COUNT; layer++)
 	{
 		CopyCardToAtlasLayer(
@@ -4214,7 +4445,7 @@ void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, Card
 			layer,
 			card->m_atlasPixelCoord.x,
 			card->m_atlasPixelCoord.y,
-			card->m_pixelResolution.x,  //实际分辨率，不是最大分辨率
+			card->m_pixelResolution.x,  
 			card->m_pixelResolution.y
 		);
 	}
@@ -4461,6 +4692,7 @@ void DX12Renderer::CreateCardCapturePipelineStates()
 		IntVec2(32, 32),
 		IntVec2(64, 64),
 		IntVec2(128, 128),
+		IntVec2(256, 256),
 		IntVec2(512, 512)
 	};
 	for (const IntVec2& res : resolutions)
@@ -4609,452 +4841,6 @@ void DX12Renderer::BindSurfaceCacheForGraphics(SurfaceCache* cache)
 
 void DX12Renderer::VisualizeSurfaceCache()
 {
-}
-
-void DX12Renderer::InitializeRadianceCache()
-{
-	if (!m_device)
-	{
-		ERROR_AND_DIE("[DX12Renderer] Cannot initialize Radiance Cache: device is null!");
-	}
-    
-	// 配置参数
-	uint32_t maxProbes = 4096;      // 最多 4096 个 Probes
-	uint32_t raysPerProbe = 32;     // 每个 Probe 发射 32 条射线
-    
-	m_radianceCache.Initialize(m_device, maxProbes, raysPerProbe);
-    
-	DebuggerPrintf("[DX12Renderer] Radiance Cache initialized: %u max probes, %u rays/probe\n",
-				   maxProbes, raysPerProbe);
-}
-
-void DX12Renderer::CreateRadianceCacheResources()
-{
-	InitializeRadianceCache();
-	
-	for (int i = 0; i < RADIANCE_CACHE_BUFFER_COUNT; i++)
-    {
-        ID3D12Resource* probeBuffer = m_radianceCache.m_probeBuffer[i];
-        if (!probeBuffer)
-            continue;
-        
-        // === SRV ===
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = m_radianceCache.GetMaxProbes();
-        srvDesc.Buffer.StructureByteStride = sizeof(RadianceProbeGPU);
-        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-        
-        int srvIndex = RadianceCacheProbeSrvIndex(i);
-        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = GetCPUDescriptorHandle(
-            m_cbvSrvDescHeap,
-            srvIndex
-        );
-        m_device->CreateShaderResourceView(probeBuffer, &srvDesc, srvHandle);
-        
-        // === UAV ===
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-        uavDesc.Format = DXGI_FORMAT_UNKNOWN;
-        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        uavDesc.Buffer.FirstElement = 0;
-        uavDesc.Buffer.NumElements = m_radianceCache.GetMaxProbes();
-        uavDesc.Buffer.StructureByteStride = sizeof(RadianceProbeGPU);
-        uavDesc.Buffer.CounterOffsetInBytes = 0;
-        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-        
-        int uavIndex = RadianceCacheProbeUavIndex(i);
-        D3D12_CPU_DESCRIPTOR_HANDLE uavHandle = GetCPUDescriptorHandle(
-            m_cbvSrvDescHeap,
-            uavIndex
-        );
-        m_device->CreateUnorderedAccessView(probeBuffer, nullptr, &uavDesc, uavHandle);
-    }
-    
-    // ========== Update List SRV ==========
-    {
-        ID3D12Resource* updateListBuffer = m_radianceCache.GetUpdateListBuffer();
-        
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_R32_UINT;
-        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = 256;  // 最多 256 个更新索引
-        srvDesc.Buffer.StructureByteStride = 0;
-        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
-        
-        int srvIndex = RadianceCacheUpdateListSrvIndex();
-        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = GetCPUDescriptorHandle(
-            m_cbvSrvDescHeap,
-            srvIndex
-        );
-        m_device->CreateShaderResourceView(updateListBuffer, &srvDesc, srvHandle);
-    }
-    
-    DebuggerPrintf("[DX12Renderer] Created Radiance Cache descriptors\n");
-}
-
-void DX12Renderer::CreateRadianceCacheUpdatePSO()
-{
-	const char* shaderName = "Data/Shaders/RadianceCacheUpdate";
-	Shader* test = GetShaderByName(shaderName);
-	if (test)
-	{
-		return;
-	}
-	std::string shaderHLSLName = std::string(shaderName) + ".hlsl";
-	std::string shaderSource;
-	int result = FileReadToString(shaderSource, shaderHLSLName);
-	if (result < 0)
-	{
-		ERROR_AND_DIE("Fail to create shader from this shaderName");
-	}
-	ID3DBlob* computeShaderBlob = nullptr;
-	bool success = CompileShaderToByteCode(
-		&computeShaderBlob,
-		"RadianceCacheUpdate",
-		shaderSource.c_str(),
-		"CSMain",
-		"cs_5_1"
-	);
-	if (!success || !computeShaderBlob)
-	{
-		ERROR_AND_DIE("[DX12Renderer] Failed to compile RadianceCacheUpdate.hlsl!");
-	}
-    
-	// 创建 Compute PSO
-	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
-	psoDesc.pRootSignature = m_computeRootSignature;
-	psoDesc.CS = {
-		computeShaderBlob->GetBufferPointer(),
-		computeShaderBlob->GetBufferSize()
-	};
-	psoDesc.NodeMask = 0;
-	psoDesc.CachedPSO = {};
-	psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
-    
-	HRESULT hr = m_device->CreateComputePipelineState(
-		&psoDesc,
-		IID_PPV_ARGS(&m_radianceCacheUpdatePSO)
-	);
-    
-	if (FAILED(hr))
-	{
-		ERROR_AND_DIE("[DX12Renderer] Failed to create Radiance Cache Update PSO!");
-	}
-    
-	DX_SAFE_RELEASE(computeShaderBlob);
-    
-	DebuggerPrintf("[DX12Renderer] Created Radiance Cache Update PSO\n");
-}
-
-void DX12Renderer::BeginRadianceCachePass()
-{
-	RadianceCacheManager* manager = m_giSystem->GetRadianceCacheManager();
-    if (!manager)
-        return;
-    
-    manager->PlaceProbesScreenSpace(m_camera, m_gBuffer);
-    
-    manager->BuildPriorityQueue(m_camera, m_frameIndex);
-    
-    m_radianceCache.BuildUpdateQueue(s_maxProbesPerUpdate); //256
-    
-    uint32_t updateCount = m_radianceCache.GetUpdateProbeCount();
-    if (updateCount == 0)
-    {
-        return;
-    }
-    
-    // ========== 4. 上传数据到 GPU ==========
-    m_radianceCache.UploadProbeData();
-    
-    RadianceCacheConstants constants = {};
-    constants.MaxProbes = m_radianceCache.GetMaxProbes();
-    constants.ActiveProbeCount = m_radianceCache.GetActiveProbeCount();
-    constants.UpdateProbeCount = updateCount;
-    constants.RaysPerProbe = m_radianceCache.GetRaysPerProbe();
-    
-    Vec3 camPos = m_currentCam.CameraWorldPosition;
-    constants.CameraPositionX = camPos.x;
-    constants.CameraPositionY = camPos.y;
-    constants.CameraPositionZ = camPos.z;
-    
-    constants.ViewProj = m_camera.GetProjectionMatrix(); //肯定有问题
-    constants.ViewProjInverse = constants.ViewProj.GetOrthonormalInverse();
-    
-    constants.ScreenWidth = (float)m_config.m_window->GetClientDimensions().x;
-    constants.ScreenHeight = (float)m_config.m_window->GetClientDimensions().y;
-    constants.CurrentFrame = m_frameIndex;
-    constants.TemporalBlend = 0.9f;  // 90% 保留旧数据
-    
-    constants.MaxTraceDistance = 50.0f;
-    constants.ProbeSpacing = 2.0f;
-    
-    constants.ActiveCardCount = (uint32_t)m_giSystem->GetCurrentSurfaceCardMetadataCPU().size();
-    constants.AtlasWidth = m_surfaceCache.m_atlasSize;
-    constants.AtlasHeight = m_surfaceCache.m_atlasSize;
-    constants.TileSize = m_surfaceCache.m_tileSize;
-    constants.BVHNodeCount = m_cardBVHNodeCount;
-
-	m_constantBuffers[k_radianceCacheConstantsSlot]->AppendData(&constants, sizeof(RadianceCacheConstants), m_currentDrawIndex); 
-	BindConstantBuffer(k_radianceCacheConstantsSlot,
-		m_constantBuffers[k_radianceCacheConstantsSlot]);
-	 
-    // Surface Cache Atlas → SRV
-    TransitionResource(
-        m_surfaceCache.GetAtlasTexture(),
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-    );
-    
-    // Previous Probe Buffer → SRV
-    TransitionResource(
-        m_radianceCache.GetPreviousProbeBuffer(),
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-    );
-    // Current Probe Buffer → UAV
-    TransitionResource(
-        m_radianceCache.GetCurrentProbeBuffer(),
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    );
-    
-    // Card BVH → SRV
-    if (m_cardBVHNodeBuffer)
-    {
-        TransitionResource(
-            m_cardBVHNodeBuffer,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-        );
-    }
-    
-    if (m_cardBVHIndexBuffer)
-    {
-        TransitionResource(
-            m_cardBVHIndexBuffer,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-        );
-    }
-    
-    // ========== 6. 绑定资源 ==========
-    BindRadianceCacheForCompute(&m_radianceCache);
-    
-    // ========== 7. 设置 PSO ==========
-    m_commandList->SetPipelineState(m_radianceCacheUpdatePSO);
-    m_commandList->SetComputeRootSignature(m_computeRootSignature);
-    
-    // ========== 8. Dispatch ==========
-    uint32_t groupCount = (updateCount + 63) / 64;  // 每个 thread group 64 个线程
-    m_commandList->Dispatch(groupCount, 1, 1);
-    
-    
-    DebuggerPrintf("[DX12Renderer] Updated %u radiance probes\n", updateCount);
-}
-
-void DX12Renderer::EndRadianceCachePass()
-{
-	D3D12_RESOURCE_BARRIER uavBarrier = {};
-	uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-	uavBarrier.UAV.pResource = m_radianceCache.GetCurrentProbeBuffer();
-	m_commandList->ResourceBarrier(1, &uavBarrier);
-    
-	TransitionResource(
-		m_surfaceCache.GetAtlasTexture(),
-		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-	);
-	TransitionResource(
-		m_radianceCache.GetCurrentProbeBuffer(),
-		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-		D3D12_RESOURCE_STATE_COMMON
-	);
-}
-
-void DX12Renderer::BindRadianceCacheForCompute(RadianceCache* cache)
-{
-	if (!cache || !cache->m_initialized)
-    {
-        DebuggerPrintf("[Renderer] Warning: Cannot bind uninitialized Radiance Cache\n");
-        return;
-    }
-    
-    m_commandList->SetComputeRootSignature(m_computeRootSignature);
-    
-    DebuggerPrintf("[Renderer] Binding Radiance Cache for Compute...\n");
-    
-    D3D12_GPU_DESCRIPTOR_HANDLE gpuStart = m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart();
-    UINT inc = m_scuDescriptorSize;
-    
-    // ========================================
-    // Root Parameter [9]: Radiance Cache Probe UAV (Current, u4)
-    // ========================================
-    {
-        int currentIndex = cache->GetCurrentBufferIndex();
-        int uavIndex = RadianceCacheProbeUavIndex(currentIndex);  
-        
-        D3D12_GPU_DESCRIPTOR_HANDLE probeUavHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            gpuStart,
-            uavIndex,
-            inc
-        );
-        
-        m_commandList->SetComputeRootDescriptorTable(9, probeUavHandle);
-        
-        DebuggerPrintf("  [9] Probe UAV (Current): descriptor index %d\n", uavIndex);
-    }
-    
-    // ========================================
-    // Root Parameter [11]: Radiance Cache Probe SRV (Previous, t208)
-    // ========================================
-    {
-        int previousIndex = 1 - cache->GetCurrentBufferIndex();
-        int srvIndex = RadianceCacheProbeSrvIndex(previousIndex);
-        
-        D3D12_GPU_DESCRIPTOR_HANDLE probeSrvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            gpuStart,
-            srvIndex,
-            inc
-        );
-        
-        m_commandList->SetComputeRootDescriptorTable(11, probeSrvHandle);
-        
-        DebuggerPrintf("  [11] Probe SRV (Previous): descriptor index %d\n", srvIndex);
-    }
-    
-    // Root Parameter [10]: Surface Cache Atlas SRV 
-    {
-        // 绑定 PRIMARY Surface Cache Atlas（用于采样直接光照）
-        //SurfaceCache* primaryCache = &m_surfaceCaches[SURFACE_CACHE_TYPE_PRIMARY];
-        //int currentIndex = primaryCache->GetCurrentBufferIndex();
-        int atlasSrvIndex = PrimaryAtlasSrvIndex(0);  // 例如 219 TODO
-        
-        D3D12_GPU_DESCRIPTOR_HANDLE atlasSrvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            gpuStart,
-            atlasSrvIndex,
-            inc
-        );
-        
-        m_commandList->SetComputeRootDescriptorTable(10, atlasSrvHandle);
-        
-        DebuggerPrintf("  [10] Surface Cache Atlas SRV: descriptor index %d\n", atlasSrvIndex);
-    }
-    // Root Parameter [6]: Card Metadata SRV (t6)
-    {
-        //SurfaceCache* primaryCache = &m_surfaceCache;
-        //int currentIndex = primaryCache->GetCurrentBufferIndex();
-        int metaSrvIndex = PrimaryMetaSrvIndex(0); 
-        D3D12_GPU_DESCRIPTOR_HANDLE metaSrvHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            gpuStart,
-            metaSrvIndex,
-            inc
-        );
-        
-        m_commandList->SetComputeRootDescriptorTable(6, metaSrvHandle);
-        
-        DebuggerPrintf("  [6] Card Metadata SRV: descriptor index %d\n", metaSrvIndex);
-    }
-    
-    // Root Parameter [12]: Card BVH SRVs
-    {
-        // 注意：这里绑定的是 BVH Nodes 的起始位置
-        // Descriptor Range 会自动覆盖 t240 (Nodes) 和 t241 (Indices)
-        int bvhNodeSrvIndex = CARD_BVH_NODE_SRV;  //228
-        
-        D3D12_GPU_DESCRIPTOR_HANDLE bvhHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(
-            gpuStart,
-            bvhNodeSrvIndex,
-            inc
-        );
-        
-        m_commandList->SetComputeRootDescriptorTable(12, bvhHandle);
-        
-        DebuggerPrintf("  [12] Card BVH: descriptor index %d (Nodes) + %d (Indices)\n", 
-            bvhNodeSrvIndex, bvhNodeSrvIndex + 1);
-    }
-    
-    // Root Parameter [13]: Radiance Cache Constants (b13)
-    {
-        RadianceCacheConstants rcConstants = {};
-        
-        rcConstants.MaxProbes = cache->GetMaxProbes();
-        rcConstants.ActiveProbeCount = cache->GetActiveProbeCount();
-        rcConstants.UpdateProbeCount = cache->GetUpdateProbeCount();
-        rcConstants.RaysPerProbe = cache->GetRaysPerProbe();
-        
-        rcConstants.CameraPositionX = m_camera.GetPosition().x;
-        rcConstants.CameraPositionY = m_camera.GetPosition().y;
-        rcConstants.CameraPositionZ = m_camera.GetPosition().z;
-        
-        Mat44 viewProj = m_camera.GetProjectionMatrix(); //TO CHECK
-        viewProj.Append(m_camera.GetCameraToRenderTransform());
-        rcConstants.ViewProj = viewProj;
-        
-        Mat44 viewProjInverse = viewProj;
-        rcConstants.ViewProjInverse = viewProjInverse.GetOrthonormalInverse();
-        
-        IntVec2 screenSize = m_config.m_window->GetClientDimensions();
-        rcConstants.ScreenWidth = (float)screenSize.x;
-        rcConstants.ScreenHeight = (float)screenSize.y;
-        
-        rcConstants.CurrentFrame = m_frameIndex;
-        rcConstants.TemporalBlend = 0.9f;  // Lumen 默认值
-        
-        rcConstants.MaxTraceDistance = 100.0f;  // 可配置
-        rcConstants.ProbeSpacing = 2.0f;        // 可配置
-        
-        SurfaceCache* primaryCache = &m_surfaceCache;
-        rcConstants.ActiveCardCount = (uint32_t)m_giSystem->GetCurrentSurfaceCardMetadataCPU().size();
-        rcConstants.AtlasWidth = primaryCache->m_atlasSize;
-        rcConstants.AtlasHeight = primaryCache->m_atlasSize;
-        rcConstants.TileSize = primaryCache->m_tileSize;
-        
-        rcConstants.BVHNodeCount = m_cardBVHNodeCount;
-        
-        m_constantBuffers[k_radianceCacheConstantsSlot]->AppendData(
-            &rcConstants,
-            sizeof(RadianceCacheConstants),
-            m_currentDrawIndex
-        );
-        D3D12_GPU_VIRTUAL_ADDRESS cbvAddress = 
-            m_constantBuffers[k_radianceCacheConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress();
-        m_commandList->SetComputeRootConstantBufferView(0, cbvAddress);
-        
-        DebuggerPrintf("  [13] Radiance Cache Constants: %u probes, %u active, %u updating\n",
-            rcConstants.MaxProbes, rcConstants.ActiveProbeCount, rcConstants.UpdateProbeCount);
-    }
-    
-    // Root Parameter [1]: Update List Buffer (已在其他地方处理)
-    // Update List 在 cache->UploadProbeData() 中上传
-    DebuggerPrintf("[Renderer] Radiance Cache bound for Compute\n");
-}
-
-void DX12Renderer::BindRadianceCacheForGraphics(RadianceCache* cache)
-{
-	if (!cache || !cache->m_initialized)
-	{
-		DebuggerPrintf("[Renderer] Warning: Cannot bind uninitialized Radiance Cache\n");
-		return;
-	}
-	ID3D12Resource* currentProbeBuffer = cache->GetCurrentProbeBuffer();
-    
-	CD3DX12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-		currentProbeBuffer,
-		D3D12_RESOURCE_STATE_COMMON,  // 或 D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-	);
-	m_commandList->ResourceBarrier(1, &barrier);
-    
-	D3D12_GPU_VIRTUAL_ADDRESS probeBufferAddress = currentProbeBuffer->GetGPUVirtualAddress();
-	m_commandList->SetGraphicsRootShaderResourceView(18, probeBufferAddress);
-	// DebuggerPrintf("[Renderer] Bound Radiance Cache SRV at GPU address 0x%llx\n", 
-	// 			   probeBufferAddress);
 }
 
 void DX12Renderer::UploadBufferData(ID3D12Resource* dstBuffer, const void* srcData, uint32_t dataSize) //TODO
@@ -5237,7 +5023,12 @@ void DX12Renderer::CreateCombineSurfaceCacheResources()
 
 void DX12Renderer::RenderingCombineSurfaceCachePass()
 {
-	m_combineSurfaceCache->Execute(m_commandList, &m_surfaceCache, m_giSystem->m_scene->m_nextCardID);
+	uint32_t maxRes = 0;
+	for (const auto& meta : m_giSystem->m_cardMetadataCPU)
+	{
+		maxRes = max(maxRes, max(meta.m_resolutionX, meta.m_resolutionY));
+	}
+	m_combineSurfaceCache->Execute(m_commandList, &m_surfaceCache, m_giSystem->m_scene->m_nextCardID, maxRes);
 }
 
 void DX12Renderer::CreateSurfaceCacheRadiosityResources()
@@ -5253,8 +5044,30 @@ void DX12Renderer::CreateSurfaceCacheRadiosityResources()
 
 void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
 {
-	if (!m_surfaceRadiosity) 
+	if (!m_surfaceRadiosity)
         return;
+
+	// Skip radiosity trace when lighting is unchanged
+	Scene* scene = m_giSystem->m_scene;
+	bool lightingDirty = scene->m_sunDirectionDirty || scene->m_pointLightDirty || !scene->m_dirtyCardIDs.empty();
+	if (!lightingDirty && m_radiosityConverged)
+		return;
+
+	// Allow a few extra frames after last change to let temporal accumulation converge
+	if (!lightingDirty)
+	{
+		m_radiositySettleFrames++;
+		if (m_radiositySettleFrames > 30)
+		{
+			m_radiosityConverged = true;
+			return;
+		}
+	}
+	else
+	{
+		m_radiositySettleFrames = 0;
+		m_radiosityConverged = false;
+	}
 	CD3DX12_RESOURCE_BARRIER preRadiosityBarriers[] = {
 		CD3DX12_RESOURCE_BARRIER::Transition(m_globalSDFTexture,
 			D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -5277,7 +5090,7 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
     constants.ProbeSpacing = (float)RadiosityConfig::PROBE_SPACING;     // 4.0
     constants.TraceMaxDistance = RadiosityConfig::TRACE_DISTANCE;       // 200.0
     constants.TraceMaxSteps = RadiosityConfig::TRACE_MAX_STEPS;         // 64
-    // 追踪参数
+
     constants.TraceHitThreshold = 0.02f;
     constants.RayBias = 0.5f;
     constants.TemporalBlendFactor = RadiosityConfig::TEMPORAL_BLEND;    // 0.05
@@ -5317,6 +5130,179 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
     m_surfaceRadiosity->Execute(m_commandList, radiosityCB, constants, &m_surfaceCache);
 }
 
+void DX12Renderer::CreateDirectLightUpdateResources()
+{
+	// Root Signature:
+	// b0: DirectLightParams (AtlasWidth, AtlasHeight, ActiveCardCount)
+	// b4: GeneralLightConstants (reuse existing)
+	// b5: ShadowConstants (reuse existing)
+	// t0: CardMetadata, t1: SurfaceAtlas, t2: ShadowMap, t3: PointLightShadowMaps
+	// u0: SurfaceAtlasUAV
+
+	CD3DX12_DESCRIPTOR_RANGE1 srvRanges[4];
+	srvRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);  // t0: CardMetadata
+	srvRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0,
+		D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);  // t1: SurfaceAtlas (layer 3 in UAV during dispatch)
+	srvRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);  // t2: ShadowMap
+	srvRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);  // t3: PointLightShadowMaps
+
+	CD3DX12_DESCRIPTOR_RANGE1 uavRange;
+	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);  // u0: SurfaceAtlasUAV
+
+	CD3DX12_ROOT_PARAMETER1 rootParams[8];
+	rootParams[0].InitAsConstants(4, 0);                      // b0: DirectLightParams (4 uints)
+	rootParams[1].InitAsConstantBufferView(4);                // b4: GeneralLightConstants
+	rootParams[2].InitAsConstantBufferView(5);                // b5: ShadowConstants
+	rootParams[3].InitAsDescriptorTable(1, &srvRanges[0]);    // t0
+	rootParams[4].InitAsDescriptorTable(1, &srvRanges[1]);    // t1
+	rootParams[5].InitAsDescriptorTable(1, &srvRanges[2]);    // t2
+	rootParams[6].InitAsDescriptorTable(1, &uavRange);        // u0
+	rootParams[7].InitAsDescriptorTable(1, &srvRanges[3]);    // t3: PointLightShadowMaps
+
+	CD3DX12_STATIC_SAMPLER_DESC samplers[2];
+	samplers[0].Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);  // s0: LinearSampler
+	samplers[1].Init(1, D3D12_FILTER_MIN_MAG_MIP_POINT);   // s1: PointSampler
+
+	CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc;
+	rootSigDesc.Init_1_1(_countof(rootParams), rootParams, _countof(samplers), samplers);
+
+	ComPtr<ID3DBlob> signature, error;
+	HRESULT hr = D3D12SerializeVersionedRootSignature(&rootSigDesc, &signature, &error);
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to serialize DirectLightUpdate root signature");
+
+	hr = m_device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(),
+		IID_PPV_ARGS(&m_directLightUpdateRootSignature));
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create DirectLightUpdate root signature");
+
+	// Compile shader
+	std::string shaderSource;
+	FileReadToString(shaderSource, "Data/Shaders/DirectLightUpdate.hlsl");
+
+	ComPtr<ID3DBlob> cs, csError;
+	hr = D3DCompile(shaderSource.c_str(), shaderSource.size(), "DirectLightUpdate.hlsl",
+		nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "cs_5_1",
+		D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &csError);
+
+	if (FAILED(hr))
+	{
+		if (csError)
+			DebuggerPrintf("[DirectLightUpdate] Compile error: %s\n", (char*)csError->GetBufferPointer());
+		GUARANTEE_OR_DIE(false, "Failed to compile DirectLightUpdate shader");
+	}
+
+	// Create PSO
+	D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.pRootSignature = m_directLightUpdateRootSignature;
+	psoDesc.CS = { cs->GetBufferPointer(), cs->GetBufferSize() };
+
+	hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_directLightUpdatePSO));
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create DirectLightUpdate PSO");
+
+	DebuggerPrintf("[DX12] DirectLightUpdate resources created\n");
+}
+
+void DX12Renderer::UpdateDirectLightPass()
+{
+	if (!m_directLightUpdatePSO)
+		return;
+
+	uint32_t activeCardCount = m_giSystem->m_scene->m_nextCardID;
+	if (activeCardCount == 0)
+		return;
+
+	// Transition resources
+	CD3DX12_RESOURCE_BARRIER barriers[4];
+	barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_atlasTexture,
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		3);  // DirectLight layer (index 3)
+	barriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_cardMetadataBuffer,
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	barriers[2] = CD3DX12_RESOURCE_BARRIER::Transition(m_directionalShadowPass->GetShadowMapTexture(),
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	int barrierCount = 3;
+	if (m_pointLightShadowPass->GetCubeArrayTexture())
+	{
+		barriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		barrierCount = 4;
+	}
+	m_commandList->ResourceBarrier(barrierCount, barriers);
+
+	// Set pipeline
+	m_commandList->SetPipelineState(m_directLightUpdatePSO);
+	m_commandList->SetComputeRootSignature(m_directLightUpdateRootSignature);
+
+	ID3D12DescriptorHeap* heaps[] = { m_cbvSrvDescHeap };
+	m_commandList->SetDescriptorHeaps(1, heaps);
+
+	// Root 0: DirectLightParams (4 uints as root constants)
+	uint32_t atlasSize = m_giSystem->m_config.m_primaryAtlasSize;
+	uint32_t params[4] = { atlasSize, atlasSize, activeCardCount, 0 };
+	m_commandList->SetComputeRoot32BitConstants(0, 4, params, 0);
+
+	// Root 1: GeneralLightConstants (b4) - reuse existing
+	D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress = m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_generalLightConstantsSlot]->m_offset;
+	m_commandList->SetComputeRootConstantBufferView(1, lightCBAddress);
+
+	// Root 2: ShadowConstants (b5) - includes point shadow sampling data
+	D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress = m_constantBuffers[k_shadowConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+		+ m_constantBuffers[k_shadowConstantsSlot]->m_offset;
+	m_commandList->SetComputeRootConstantBufferView(2, shadowCBAddress);
+
+	// Root 3-6: SRVs and UAV
+	CD3DX12_GPU_DESCRIPTOR_HANDLE cardMetadataSRV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		SURFCACHE_PRIMARY_META_SRV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(3, cardMetadataSRV);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE atlasSRV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		SURFCACHE_PRIMARY_ATLAS_SRV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(4, atlasSRV);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE shadowMapSRV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		SHADOW_MAP_SRV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(5, shadowMapSRV);
+
+	CD3DX12_GPU_DESCRIPTOR_HANDLE atlasUAV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		SURFCACHE_PRIMARY_ATLAS_UAV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(6, atlasUAV);
+
+	// Root 7: PointLightShadowMaps (t3)
+	CD3DX12_GPU_DESCRIPTOR_HANDLE pointShadowSRV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		POINT_SHADOW_CUBE_ARRAY_SRV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(7, pointShadowSRV);
+
+	// Dispatch: cover entire atlas, 8x8 threads per group
+	uint32_t groupsX = (atlasSize + 7) / 8;
+	uint32_t groupsY = (atlasSize + 7) / 8;
+	m_commandList->Dispatch(groupsX, groupsY, 1);
+
+	// Transition back
+	CD3DX12_RESOURCE_BARRIER postBarriers[4];
+	postBarriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_atlasTexture,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, 3);
+	postBarriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_cardMetadataBuffer,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+	postBarriers[2] = CD3DX12_RESOURCE_BARRIER::Transition(m_directionalShadowPass->GetShadowMapTexture(),
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	int postBarrierCount = 3;
+	if (m_pointLightShadowPass->GetCubeArrayTexture())
+	{
+		postBarriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		postBarrierCount = 4;
+	}
+	m_commandList->ResourceBarrier(postBarrierCount, postBarriers);
+
+	DebuggerPrintf("[DirectLightUpdate] Updated %u cards\n", activeCardCount);
+}
+
+void DX12Renderer::ShutdownDirectLightUpdatePass()
+{
+	DX_SAFE_RELEASE(m_directLightUpdatePSO);
+	DX_SAFE_RELEASE(m_directLightUpdateRootSignature);
+}
+
 void DX12Renderer::CreateScreenProbeGatherResources()
 {
 	m_screenProbeFinalGather = new ScreenProbeFinalGather();
@@ -5340,9 +5326,9 @@ void DX12Renderer::RenderingScreenProbeGatherPass()
     constants.ProbeGridHeight = (screenDims.y + 7) / 8;
     // Probe 配置
     constants.ProbeSpacing = SCREEN_PROBE_SPACING;           // 8
-    constants.RaysPerProbe = SCREEN_PROBE_RAYS;              // 64
-    constants.RaysTexWidth = constants.ProbeGridWidth * 8;
-    constants.RaysTexHeight = constants.ProbeGridHeight * 8;
+    constants.RaysPerProbe = SCREEN_PROBE_RAYS;              // 128
+    constants.RaysTexWidth = constants.ProbeGridWidth * OCTAHEDRON_WIDTH;   // 8 wide per probe
+    constants.RaysTexHeight = constants.ProbeGridHeight * OCTAHEDRON_HEIGHT; // 16 tall per probe
     // 追踪参数
     constants.TraceMaxDistance = 100.0f;        // Mesh SDF
     constants.TraceMaxSteps = 64;
@@ -5350,14 +5336,18 @@ void DX12Renderer::RenderingScreenProbeGatherPass()
     constants.RayBias = 0.5f;
     constants.MeshSDFTraceDistance = MESH_SDF_TRACE_DISTANCE;   // 100.0
     constants.VoxelTraceDistance = VOXEL_TRACE_DISTANCE;        // 500.0
-    constants.TemporalBlendFactor = 0.05f;
+    constants.TemporalBlendFactor = 0.1f;  // 更强的历史累积
     constants.SkyIntensity = 0.3f;
 
     constants.CurrentFrame = m_frameIndex;
-    constants.OctahedronSize = OCTAHEDRON_SIZE;                 // 8
+    constants.OctahedronSize = OCTAHEDRON_SIZE;                 // 8 (legacy)
     constants.OctahedronBorder = OCTAHEDRON_BORDER;             // 1
     constants.BorderedOctSize = BORDERED_OCTAHEDRON_SIZE;       // 10
-    
+    constants.OctahedronWidth = OCTAHEDRON_WIDTH;               // 8
+    constants.OctahedronHeight = OCTAHEDRON_HEIGHT;             // 16
+    constants.MeshInstanceCount = (uint32_t)m_giSystem->m_scene->m_meshInfos.size();
+    constants.Padding6 = 0;
+
     AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
     Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
     float sceneRadius = sceneBounds.GetBoundsSize().GetLength() * 0.5f;
@@ -5372,7 +5362,9 @@ void DX12Renderer::RenderingScreenProbeGatherPass()
     // {
 	Vec3 sceneSize = sceneBounds.GetBoundsSize();
 	float maxDim = max(sceneSize.x, max(sceneSize.y, sceneSize.z));
-	constants.VoxelSize = maxDim / (float)GLOBAL_SDF_RESOLUTION; 
+	constants.VoxelGridMin = sceneBounds.m_mins;
+	constants.VoxelGridMax = sceneBounds.m_maxs;
+	constants.VoxelSize = maxDim / (float)GLOBAL_SDF_RESOLUTION;
 	constants.VoxelResolution = GLOBAL_SDF_RESOLUTION;
 
 	constants.DepthThreshold = 0.1f;
@@ -5502,6 +5494,13 @@ void DX12Renderer::RenderingGIVisualizationPass(const CompositeConstants& compos
         m_commandList->RSSetScissorRects(1, &scissorRect);
     }
 
+    D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress =
+        m_constantBuffers[k_generalLightConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_generalLightConstantsSlot]->m_offset;
+    D3D12_GPU_VIRTUAL_ADDRESS shadowCBAddress =
+        m_constantBuffers[k_shadowConstantsSlot]->m_dx12ConstantBuffer->GetGPUVirtualAddress()
+        + m_constantBuffers[k_shadowConstantsSlot]->m_offset;
+
     m_giVisualization->Execute(
         m_commandList,
         m_constantBuffers[k_giVisualizationConstantsSlot],
@@ -5510,7 +5509,9 @@ void DX12Renderer::RenderingGIVisualizationPass(const CompositeConstants& compos
         m_screenProbeConstants,
         m_currentCam,
         &m_surfaceCache,
-        m_giSystem->m_scene->m_nextCardID
+        m_giSystem->m_scene->m_nextCardID,
+        lightCBAddress,
+        shadowCBAddress
     );
 
     if (GIVisualization::NeedsCopyToBackBuffer(mode))
@@ -5754,12 +5755,13 @@ void DX12Renderer::ImGuiStartUp()
 	ImGui::CreateContext();
 	ImPlot::CreateContext();
 	ImGuiIO& io = ImGui::GetIO();
-	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; 
-	ImGui::StyleColorsDark();  // 或 Light/Classic
+	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+	ImGui::StyleColorsDark();
 
 	D3D12_DESCRIPTOR_HEAP_DESC imGuiSRVDescHeap = {};
 	imGuiSRVDescHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	imGuiSRVDescHeap.NumDescriptors = FRAME_BUFFER_COUNT;
+	imGuiSRVDescHeap.NumDescriptors = 1 + 16; // 1 font + 16 layer thumbnails
 	imGuiSRVDescHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	imGuiSRVDescHeap.NodeMask = 0;
 
@@ -5773,6 +5775,26 @@ void DX12Renderer::ImGuiStartUp()
 	ImGui_ImplDX12_Init(m_device, FRAME_BUFFER_COUNT, DXGI_FORMAT_R8G8B8A8_UNORM, m_imguiSrvDescHeap,
 	                    m_imguiSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
 	                    m_imguiSrvDescHeap->GetGPUDescriptorHandleForHeapStart());
+
+	// Load default font explicitly, then merge CJK glyphs for Japanese/Chinese brush names.
+	io.Fonts->AddFontDefault();
+	{
+		ImFontConfig mergeConfig;
+		mergeConfig.MergeMode = true;
+		mergeConfig.PixelSnapH = true;
+		static char const* const cjkFonts[] = {
+			"C:\\Windows\\Fonts\\msgothic.ttc",
+			"C:\\Windows\\Fonts\\meiryo.ttc",
+			"C:\\Windows\\Fonts\\msyh.ttc",
+		};
+		for (char const* fontPath : cjkFonts)
+		{
+			if (io.Fonts->AddFontFromFileTTF(fontPath, 13.0f, &mergeConfig, io.Fonts->GetGlyphRangesJapanese()))
+			{
+				break;
+			}
+		}
+	}
 
 	unsigned char* pixels;
 	int width, height;
@@ -5802,6 +5824,28 @@ void DX12Renderer::ImGuiShutDown()
 	ImPlot::DestroyContext();
 	ImGui::DestroyContext();
 }
+void* DX12Renderer::RegisterTextureForImGui(Texture* texture, int slot)
+{
+	if (texture == nullptr || texture->m_dx12Texture == nullptr)
+		return nullptr;
+
+	// Create SRV in ImGui heap at position (1 + slot), slot 0 is used by font
+	CD3DX12_CPU_DESCRIPTOR_HANDLE cpuHandle(
+		m_imguiSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+		1 + slot, m_scuDescriptorSize);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+	m_device->CreateShaderResourceView(texture->m_dx12Texture, &srvDesc, cpuHandle);
+
+	// Return GPU descriptor handle as ImTextureID (void*)
+	D3D12_GPU_DESCRIPTOR_HANDLE gpuHandle = m_imguiSrvDescHeap->GetGPUDescriptorHandleForHeapStart();
+	gpuHandle.ptr += (UINT64)(1 + slot) * m_scuDescriptorSize;
+	return (void*)gpuHandle.ptr;
+}
 size_t DX12Renderer::GetConstantBufferSize(int cbSlot)
 {
 	if (cbSlot == k_modelConstantsSlot)
@@ -5814,10 +5858,8 @@ size_t DX12Renderer::GetConstantBufferSize(int cbSlot)
 		return sizeof(MaterialConstants);
 	if (cbSlot == k_generalLightConstantsSlot)
 		return sizeof(GeneralLightConstants);
-	// if (cbSlot == k_surfaceCacheConstantsSlot)
-	// 	return sizeof(SurfaceCacheConstants);
-	// if (cbSlot == k_passConstantsSlot)
-	// 	return sizeof(PassModeConstants);
+	if (cbSlot == k_shadowConstantsSlot)
+		return sizeof(ShadowConstants);
 	return 64;
 }
 
@@ -5832,6 +5874,76 @@ bool DX12Renderer::RenderGIVisualizationImGuiPanel()
 	if (!m_giVisualization || !m_giVisualization->IsInitialized())
 		return false;
 
-	return m_giVisualization->RenderImGuiPanel(m_vizParams);
+	bool changed = m_giVisualization->RenderImGuiPanel(m_vizParams);
+
+	// Point lights section (inside the same "Rendering" window)
+	Scene* scene = m_giSystem ? m_giSystem->m_scene : nullptr;
+	if (scene)
+	{
+		ImGui::Begin("Rendering");
+		ImGui::Text("Point Lights");
+		ImGui::Separator();
+
+		bool lightChanged = false;
+		for (int i = 0; i < (int)scene->m_lightObjects.size(); i++)
+		{
+			LightObject* light = scene->m_lightObjects[i];
+			if (light->GetLightType() != LIGHT_POINT)
+				continue;
+
+			ImGui::PushID(i);
+
+			bool enabled = (light->m_lightColor.a > 0);
+			if (ImGui::Checkbox(light->GetName().c_str(), &enabled))
+			{
+				light->m_lightColor.a = enabled ? light->m_originalAlpha : 0;
+				lightChanged = true;
+			}
+
+			if (enabled)
+			{
+				Vec3 pos = light->GetPosition();
+				float posArr[3] = { pos.x, pos.y, pos.z };
+				if (ImGui::DragFloat3("Position", posArr, 0.05f))
+				{
+					light->SetPosition(Vec3(posArr[0], posArr[1], posArr[2]));
+					lightChanged = true;
+				}
+
+				float outerR = light->GetOuterRadius();
+				if (ImGui::DragFloat("Radius", &outerR, 0.1f, 0.1f, 50.f))
+				{
+					light->m_outerRadius = outerR;
+					lightChanged = true;
+				}
+
+				float col[3] = { light->m_lightColor.r / 255.f, light->m_lightColor.g / 255.f, light->m_lightColor.b / 255.f };
+				if (ImGui::ColorEdit3("Color", col))
+				{
+					light->m_lightColor.r = (unsigned char)(col[0] * 255.f);
+					light->m_lightColor.g = (unsigned char)(col[1] * 255.f);
+					light->m_lightColor.b = (unsigned char)(col[2] * 255.f);
+					lightChanged = true;
+				}
+
+				// Per-frame indicator at light position
+				DebugAddWorldPoint(light->GetPosition(), 0.05f, 0.f,
+					Rgba8(light->m_lightColor.r, light->m_lightColor.g, light->m_lightColor.b));
+			}
+			ImGui::Separator();
+			ImGui::PopID();
+		}
+
+		if (lightChanged)
+		{
+			scene->ProduceLightVariables();
+			scene->m_pointLightDirty = true;
+			changed = true;
+		}
+
+		ImGui::End();
+	}
+
+	return changed;
 }
 #endif

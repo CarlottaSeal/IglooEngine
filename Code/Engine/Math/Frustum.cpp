@@ -88,11 +88,11 @@ Frustum Frustum::FromViewProjectionMatrix(const Mat44& viewProjectionMatrix, Cam
 	frustum.m_planes[Top].m_normal.z = m[11] - m[9];
 	frustum.m_planes[Top].m_distToPlaneAloneNormalFromOrigin = m[15] - m[13];
 
-	// Near plane: row3 + row2
-	frustum.m_planes[Near].m_normal.x = m[3] + m[2];
-	frustum.m_planes[Near].m_normal.y = m[7] + m[6];
-	frustum.m_planes[Near].m_normal.z = m[11] + m[10];
-	frustum.m_planes[Near].m_distToPlaneAloneNormalFromOrigin = m[15] + m[14];
+	// Near plane: row2 (DX convention, z ∈ [0,1])
+	frustum.m_planes[Near].m_normal.x = m[2];
+	frustum.m_planes[Near].m_normal.y = m[6];
+	frustum.m_planes[Near].m_normal.z = m[10];
+	frustum.m_planes[Near].m_distToPlaneAloneNormalFromOrigin = m[14];
 
 	// Far plane: row3 - row2
 	frustum.m_planes[Far].m_normal.x = m[3] - m[2];

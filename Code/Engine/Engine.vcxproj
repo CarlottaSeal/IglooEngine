@@ -254,7 +254,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_LIB;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(SolutionDir)Code/;$(SolutionDir)../Engine/Code/;$(VULKAN_SDK)\Include;$(VULKAN_SDK)\Include</AdditionalIncludeDirectories>
@@ -296,7 +296,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_LIB;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalIncludeDirectories>$(SolutionDir)Code/;$(SolutionDir)../Engine/Code/;$(VULKAN_SDK)\Include;$(VULKAN_SDK)\Include</AdditionalIncludeDirectories>
@@ -361,14 +361,19 @@
     <ClCompile Include="..\ThirdParty\Noise\SmoothNoise.cpp" />
     <ClCompile Include="Audio\AudioSystem.cpp" />
     <ClCompile Include="Core\Clock.cpp" />
+    <ClCompile Include="Core\AutomatedTesting.cpp" />
     <ClCompile Include="Core\DebugRenderSystem.cpp" />
     <ClCompile Include="Core\DevConsole.cpp" />
     <ClCompile Include="Core\EngineCommon.cpp" />
     <ClCompile Include="Core\ErrorWarningAssert.cpp" />
-    <ClCompile Include="Core\EventSystem.cpp" />
+    <ClCompile Include="Core\Event\EventSystem.cpp" />
+    <ClCompile Include="Core\BufferParser.cpp" />
+    <ClCompile Include="Core\BufferWriter.cpp" />
     <ClCompile Include="Core\FileUtils.cpp" />
+    <ClCompile Include="Core\HashedCaseInsensitiveString.cpp" />
     <ClCompile Include="Core\HeatMaps.cpp" />
     <ClCompile Include="Core\Image.cpp" />
+    <ClCompile Include="Core\NamedProperties.cpp" />
     <ClCompile Include="Core\NamedStrings.cpp" />
     <ClCompile Include="Core\NetworkSystem.cpp" />
     <ClCompile Include="Core\Rgba8.cpp" />
@@ -381,15 +386,20 @@
     <ClCompile Include="Core\VertexUtils.cpp" />
     <ClCompile Include="Core\Vertex_PCU.cpp" />
     <ClCompile Include="Core\Vertex_PCUTBN.cpp" />
+    <ClCompile Include="Core\Vertex_Font.cpp" />
     <ClCompile Include="Core\XmlUtils.cpp" />
     <ClCompile Include="Input\AnalogJoystick.cpp" />
     <ClCompile Include="Input\InputSystem.cpp" />
+    <ClCompile Include="Input\TabletInput.cpp" />
     <ClCompile Include="Input\KeyButtonState.cpp" />
     <ClCompile Include="Input\XboxController.cpp" />
     <ClCompile Include="Job\JobSystem.cpp" />
     <ClCompile Include="Math\AABB2.cpp" />
     <ClCompile Include="Math\AABB3.cpp" />
     <ClCompile Include="Math\Capsule2D.cpp" />
+    <ClCompile Include="Math\BSPTree2D.cpp" />
+    <ClCompile Include="Math\BVHTree2D.cpp" />
+    <ClCompile Include="Math\ConvexShape2D.cpp" />
     <ClCompile Include="Math\Curve1D.cpp" />
     <ClCompile Include="Math\Disc2D.cpp" />
     <ClCompile Include="Math\EulerAngles.cpp" />
@@ -411,10 +421,11 @@
     <ClCompile Include="Math\Vec3.cpp" />
     <ClCompile Include="Math\Vec4.cpp" />
     <ClCompile Include="Renderer\BitmapFont.cpp" />
+    <ClCompile Include="Renderer\BMFont.cpp" />
     <ClCompile Include="Renderer\Cache\CardBVH.cpp" />
     <ClCompile Include="Renderer\Cache\CombineSurfaceCache.cpp" />
-    <ClCompile Include="Renderer\Cache\RadianceCache.cpp" />
-    <ClCompile Include="Renderer\Cache\RadianceCacheManager.cpp" />
+    <ClCompile Include="Renderer\Cache\DirectionalShadowPass.cpp" />
+    <ClCompile Include="Renderer\Cache\PointLightShadowPass.cpp" />
     <ClCompile Include="Renderer\Cache\ScreenProbeFinalGather.cpp" />
     <ClCompile Include="Renderer\Cache\SurfaceCache.cpp" />
     <ClCompile Include="Renderer\Cache\SurfaceRadiosityCache.cpp" />
@@ -494,15 +505,21 @@
     <ClInclude Include="..\ThirdParty\stb\stb_image.h" />
     <ClInclude Include="Audio\AudioSystem.hpp" />
     <ClInclude Include="Core\Clock.hpp" />
+    <ClInclude Include="Core\AutomatedTesting.hpp" />
     <ClInclude Include="Core\DebugRenderSystem.hpp" />
     <ClInclude Include="Core\DevConsole.hpp" />
     <ClInclude Include="Core\EngineCommon.hpp" />
     <ClInclude Include="Core\EngineConfig.h" />
     <ClInclude Include="Core\ErrorWarningAssert.hpp" />
     <ClInclude Include="Core\EventSystem.hpp" />
+    <ClInclude Include="Core\Event\EventSystem.hpp" />
+    <ClInclude Include="Core\BufferParser.hpp" />
+    <ClInclude Include="Core\BufferWriter.hpp" />
     <ClInclude Include="Core\FileUtils.hpp" />
+    <ClInclude Include="Core\HashedCaseInsensitiveString.hpp" />
     <ClInclude Include="Core\HeatMaps.hpp" />
     <ClInclude Include="Core\Image.hpp" />
+    <ClInclude Include="Core\NamedProperties.hpp" />
     <ClInclude Include="Core\NamedStrings.hpp" />
     <ClInclude Include="Core\NetworkSystem.h" />
     <ClInclude Include="Core\Rgba8.hpp" />
@@ -515,15 +532,20 @@
     <ClInclude Include="Core\VertexUtils.hpp" />
     <ClInclude Include="Core\Vertex_PCU.hpp" />
     <ClInclude Include="Core\Vertex_PCUTBN.hpp" />
+    <ClInclude Include="Core\Vertex_Font.hpp" />
     <ClInclude Include="Core\XmlUtils.hpp" />
     <ClInclude Include="Input\AnalogJoystick.hpp" />
     <ClInclude Include="Input\InputSystem.hpp" />
+    <ClInclude Include="Input\TabletInput.hpp" />
     <ClInclude Include="Input\KeyButtonState.hpp" />
     <ClInclude Include="Input\XboxController.hpp" />
     <ClInclude Include="Job\JobSystem.h" />
     <ClInclude Include="Math\AABB2.hpp" />
     <ClInclude Include="Math\AABB3.hpp" />
     <ClInclude Include="Math\Capsule2D.h" />
+    <ClInclude Include="Math\BSPTree2D.hpp" />
+    <ClInclude Include="Math\BVHTree2D.hpp" />
+    <ClInclude Include="Math\ConvexShape2D.hpp" />
     <ClInclude Include="Math\Curve1D.h" />
     <ClInclude Include="Math\Disc2D.h" />
     <ClInclude Include="Math\EulerAngles.hpp" />
@@ -545,10 +567,11 @@
     <ClInclude Include="Math\Vec3.hpp" />
     <ClInclude Include="Math\Vec4.hpp" />
     <ClInclude Include="Renderer\BitmapFont.hpp" />
+    <ClInclude Include="Renderer\BMFont.hpp" />
     <ClInclude Include="Renderer\Cache\CardBVH.h" />
     <ClInclude Include="Renderer\Cache\CombineSurfaceCache.h" />
-    <ClInclude Include="Renderer\Cache\RadianceCache.h" />
-    <ClInclude Include="Renderer\Cache\RadianceCacheManager.h" />
+    <ClInclude Include="Renderer\Cache\DirectionalShadowPass.h" />
+    <ClInclude Include="Renderer\Cache\PointLightShadowPass.h" />
     <ClInclude Include="Renderer\Cache\ScreenProbeFinalGather.h" />
     <ClInclude Include="Renderer\Cache\SurfaceCache.h" />
     <ClInclude Include="Renderer\Cache\CacheCommon.h" />

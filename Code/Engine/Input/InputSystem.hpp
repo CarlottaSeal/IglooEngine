@@ -1,6 +1,7 @@
-#pragma once
+﻿#pragma once
 #include "Engine/Input/XboxController.hpp"
 #include "Engine/Input/KeyButtonState.hpp"
+#include "Engine/Input/TabletInput.hpp"
 #include "Engine/Core/EngineCommon.hpp"
 
 extern unsigned char const KEYCODE_F1;
@@ -98,7 +99,13 @@ public:
 
 	bool ShouldIgnoreMouseInput() const;
 	bool ShouldIgnoreKeyboardInput() const;
-	
+
+	// Tablet (Wacom) support
+	TabletInput& GetTablet() { return m_tablet; }
+	float GetTabletPressure() const;   // 0.0~1.0, returns 1.0 if no tablet
+	bool  IsTabletConnected() const;
+	bool  IsPenInRange() const;
+
 public:
 	CursorState m_cursorState;
 	bool m_isCursorVisible = false;
@@ -108,4 +115,5 @@ protected:
 	KeyButtonState m_keystates[NUM_KEYCODES];
 	XboxController m_controllers[NUM_XBOX_CONTROLLERS];
 	InputSystemConfig m_config;
+	TabletInput    m_tablet;
 };

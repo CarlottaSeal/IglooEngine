@@ -138,15 +138,18 @@ void CombineSurfaceCache::CreatePipelineState()
     m_pso->SetName(L"CombineSurfaceCache_PSO");
 }
 
-void CombineSurfaceCache::Execute(ID3D12GraphicsCommandList* cmdList, SurfaceCache* surfaceCache, int globalActiveCardCount)
+void CombineSurfaceCache::Execute(ID3D12GraphicsCommandList* cmdList, SurfaceCache* surfaceCache, int globalActiveCardCount, uint32_t maxCardSize)
 {
     if (!m_initialized || !surfaceCache)
         return;
-    
+
     uint32_t activeCardCount = globalActiveCardCount;
     if (activeCardCount == 0)
         return;
-    
+
+    if (maxCardSize == 0)
+        maxCardSize = MAX_CARD_SIZE;
+
     // 1. Barrier: 整个 Atlas 转为 UAV 状态（用于读取和写入）
     CD3DX12_RESOURCE_BARRIER preBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
         surfaceCache->m_atlasTexture,
@@ -155,17 +158,16 @@ void CombineSurfaceCache::Execute(ID3D12GraphicsCommandList* cmdList, SurfaceCac
         D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES
     );
     cmdList->ResourceBarrier(1, &preBarrier);
-    
+
     cmdList->SetComputeRootSignature(m_rootSignature);
     cmdList->SetPipelineState(m_pso);
-    
+
     // 3. 设置 Descriptor Tables
     // [0] t0 = CardMetadata SRV
     // [1] u0 = Atlas UAV
     cmdList->SetComputeRootDescriptorTable(0, GetGPUHandle(SURFCACHE_PRIMARY_META_SRV));   // t0
     cmdList->SetComputeRootDescriptorTable(1, GetGPUHandle(SURFCACHE_PRIMARY_ATLAS_UAV));  // u0
-    
-    uint32_t maxCardSize = MAX_CARD_SIZE;
+
     uint32_t groupsXY = (maxCardSize + 7) / 8;
     cmdList->Dispatch(groupsXY, groupsXY, activeCardCount);
     

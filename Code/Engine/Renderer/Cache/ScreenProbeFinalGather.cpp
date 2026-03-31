@@ -10,17 +10,17 @@
 #include "Engine/Renderer/ConstantBuffer.hpp"
 #include "Engine/Renderer/HelperFunctionLib.h"
 
-// 资源依赖关系总结：
-// Pass1 (ProbePlacement):     写入 ProbeBuffer
-// Pass2 (BRDFPDFGeneration):  读取 ProbeBuffer, 写入 BRDFPDF
-// Pass3 (LightingPDFGeneration): 读取 ProbeBuffer, PrevRadiance, 写入 LightingPDF
-// Pass4 (GenerateSampleDirections): 读取 ProbeBuffer, BRDFPDF, LightingPDF, 写入 SampleDirections
-// Pass5 (MeshSDFTrace):       读取 ProbeBuffer, SampleDirections, 写入 MeshTraceResults
-// Pass6 (VoxelSDFTrace):      读取 ProbeBuffer, SampleDirections, 写入 VoxelTraceResults
-// Pass7 (RadianceComposite):  读取 ProbeBuffer, SampleDirections, VoxelTraceResults, 写入 ProbeRadiance
-// Pass8 (TemporalAccumulation): 读取 ProbeRadiance, ProbeRadianceHistory, 写入 ProbeRadianceHistory
-// Pass9 (SpatialFilter):      读取 ProbeRadianceHistory, 写入 ProbeRadianceFiltered
-// Pass10 (FinalGather):       读取 ProbeRadianceFiltered, ProbeBuffer, GBuffer, 写入 ScreenIndirectLighting
+// Resource dependencies:
+// Pass1 (ProbePlacement):           writes ProbeBuffer
+// Pass2 (BRDFPDFGeneration):        reads ProbeBuffer, writes BRDFPDF
+// Pass3 (LightingPDFGeneration):    reads ProbeBuffer, PrevRadiance, writes LightingPDF
+// Pass4 (GenerateSampleDirections): reads ProbeBuffer, BRDFPDF, LightingPDF, writes SampleDirections
+// Pass5 (MeshSDFTrace):             reads ProbeBuffer, SampleDirections, writes MeshTraceResults
+// Pass6 (VoxelSDFTrace):            reads ProbeBuffer, SampleDirections, writes VoxelTraceResults
+// Pass7 (RadianceComposite):        reads ProbeBuffer, SampleDirections, VoxelTraceResults, writes ProbeRadiance
+// Pass8 (TemporalAccumulation):     reads ProbeRadiance, ProbeRadianceHistory, writes ProbeRadianceHistory (DISABLED)
+// Pass9 (SpatialFilter):            reads ProbeRadiance, writes ProbeRadianceFiltered
+// Pass10 (FinalGather):             reads ProbeRadianceFiltered, ProbeBuffer, GBuffer, writes ScreenIndirectLighting
 
 
 ScreenProbeFinalGather::~ScreenProbeFinalGather()
@@ -73,6 +73,7 @@ void ScreenProbeFinalGather::Shutdown()
     DX_SAFE_RELEASE(m_screenIndirectLighting);
     DX_SAFE_RELEASE(m_screenIndirectRaw);
     DX_SAFE_RELEASE(m_prevScreenRadiance);
+    DX_SAFE_RELEASE(m_prevDepthBuffer);
 
     DX_SAFE_RELEASE(m_pso_ProbePlacement);
     DX_SAFE_RELEASE(m_pso_BRDFPDFGeneration);
@@ -83,6 +84,7 @@ void ScreenProbeFinalGather::Shutdown()
     DX_SAFE_RELEASE(m_pso_RadianceComposite);
     DX_SAFE_RELEASE(m_pso_TemporalAccumulation);
     DX_SAFE_RELEASE(m_pso_SpatialFilter);
+    DX_SAFE_RELEASE(m_pso_OctIrradiance);
     DX_SAFE_RELEASE(m_pso_FinalGather);
     DX_SAFE_RELEASE(m_pso_ScreenSpaceTemporalFilter);
 
@@ -121,28 +123,28 @@ void ScreenProbeFinalGather::CreateResources()
     CreateBuffer(&m_voxelTraceResultBuffer,probeCount * numTraces,
         sizeof(TraceResult),  // TraceResult struct
         SCREEN_PROBE_VOXEL_TRACE_SRV,SCREEN_PROBE_VOXEL_TRACE_UAV,L"ScreenProbe_VoxelTraceResult");
-    // 7. Probe Radiance Texture (Slot 253 SRV, 254 UAV)
-    CreateTexture2D(&m_probeRadiance,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,DXGI_FORMAT_R16G16B16A16_FLOAT,
+    // 7. Probe Radiance Texture (Slot 253 SRV, 254 UAV) - 8x16 per probe for 128 rays
+    CreateTexture2D(&m_probeRadiance,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,DXGI_FORMAT_R16G16B16A16_FLOAT,
         SCREEN_PROBE_RADIANCE_SRV,SCREEN_PROBE_RADIANCE_UAV,L"ScreenProbe_ProbeRadiance");
     // 8. Probe Radiance History (Slot 255 SRV, 256 UAV)
-    CreateTexture2D(&m_probeRadianceHistoryA,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,DXGI_FORMAT_R16G16B16A16_FLOAT,
+    CreateTexture2D(&m_probeRadianceHistoryA,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,DXGI_FORMAT_R16G16B16A16_FLOAT,
          SCREEN_PROBE_RADIANCE_HISTORY_SRV,      // 425
          SCREEN_PROBE_RADIANCE_HISTORY_UAV,      // 409
          L"ScreenProbe_ProbeRadianceHistoryA");
-    // 8B. Probe Radiance History B 
-    CreateTexture2D(&m_probeRadianceHistoryB,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,DXGI_FORMAT_R16G16B16A16_FLOAT,
+    // 8B. Probe Radiance History B
+    CreateTexture2D(&m_probeRadianceHistoryB,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,DXGI_FORMAT_R16G16B16A16_FLOAT,
         SCREEN_PROBE_RADIANCE_HISTORY_B_SRV,   SCREEN_PROBE_RADIANCE_HISTORY_B_UAV,   L"ScreenProbe_ProbeRadianceHistoryB");
     // 9. Probe Radiance Filtered (Slot 257 SRV, 258 UAV)
-    CreateTexture2D(&m_probeRadianceFiltered,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,DXGI_FORMAT_R16G16B16A16_FLOAT,
+    CreateTexture2D(&m_probeRadianceFiltered,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,DXGI_FORMAT_R16G16B16A16_FLOAT,
         SCREEN_PROBE_RADIANCE_FILTERED_SRV,SCREEN_PROBE_RADIANCE_FILTERED_UAV,
         L"ScreenProbe_ProbeRadianceFiltered");
     // 10-12. Octahedral SH Textures (R, G, B)
-    CreateTexture2D(&m_octSH_R,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,
+    CreateTexture2D(&m_octSH_R,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,
         DXGI_FORMAT_R16_FLOAT,SCREEN_PROBE_OCT_SH_R_SRV,
         SCREEN_PROBE_OCT_SH_R_UAV,L"ScreenProbe_OctSH_R");
-    CreateTexture2D(&m_octSH_G,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,DXGI_FORMAT_R16_FLOAT,
+    CreateTexture2D(&m_octSH_G,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,DXGI_FORMAT_R16_FLOAT,
         SCREEN_PROBE_OCT_SH_G_SRV,SCREEN_PROBE_OCT_SH_G_UAV,L"ScreenProbe_OctSH_G");
-    CreateTexture2D(&m_octSH_B,m_probeGridWidth * OCTAHEDRON_SIZE,m_probeGridHeight * OCTAHEDRON_SIZE,
+    CreateTexture2D(&m_octSH_B,m_probeGridWidth * OCTAHEDRON_WIDTH,m_probeGridHeight * OCTAHEDRON_HEIGHT,
         DXGI_FORMAT_R16_FLOAT,SCREEN_PROBE_OCT_SH_B_SRV,SCREEN_PROBE_OCT_SH_B_UAV,L"ScreenProbe_OctSH_B");
     // 13. Screen Indirect Lighting (Slot 265 SRV, 266 UAV) - 最终输出
     CreateTexture2D(&m_screenIndirectLighting,m_screenWidth,m_screenHeight,DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -153,6 +155,9 @@ void ScreenProbeFinalGather::CreateResources()
     // 15. Screen Indirect Raw (FinalGather 原始输出，时间滤波前)
     CreateTexture2D(&m_screenIndirectRaw,m_screenWidth,m_screenHeight,DXGI_FORMAT_R16G16B16A16_FLOAT,
         SCREEN_INDIRECT_RAW_SRV,SCREEN_INDIRECT_RAW_UAV,L"ScreenProbe_IndirectRaw");
+    // 16. Previous Depth Buffer (用于时间滤波深度比较)
+    CreateTexture2D(&m_prevDepthBuffer,m_screenWidth,m_screenHeight,DXGI_FORMAT_R32_FLOAT,
+        PREV_DEPTH_BUFFER_SRV,-1,L"ScreenProbe_PrevDepth");  // 只需要 SRV，无 UAV
     DebuggerPrintf("[ScreenProbe] All resources created\n");
 }
 
@@ -521,8 +526,9 @@ void ScreenProbeFinalGather::Execute(
     }
     m_commandList = cmdList;
     m_constantBuffer = constantBuffer;
+    m_gBuffer = gBuffer;  // 保存 GBuffer 引用，用于深度缓冲区复制
     //DebuggerPrintf("[ScreenProbe] === Execute Frame ===\n");
-    
+
     ID3D12Resource* historyInput = m_useHistoryB ? m_probeRadianceHistoryB : m_probeRadianceHistoryA;
     ID3D12Resource* historyOutput = m_useHistoryB ? m_probeRadianceHistoryA : m_probeRadianceHistoryB;
     
@@ -542,6 +548,9 @@ void ScreenProbeFinalGather::Execute(
         CD3DX12_RESOURCE_BARRIER::Transition(m_screenIndirectRaw,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         CD3DX12_RESOURCE_BARRIER::Transition(m_prevScreenRadiance,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        // Previous depth buffer：转成SRV（用于时间滤波）
+        CD3DX12_RESOURCE_BARRIER::Transition(m_prevDepthBuffer,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
     };
     m_commandList->ResourceBarrier(_countof(textureBarriers), textureBarriers);
@@ -574,8 +583,9 @@ void ScreenProbeFinalGather::Execute(
     Pass07_RadianceComposite(constants);
     Pass08_TemporalAccumulation(constants);
     Pass09_SpatialFilter(constants);
+    Pass09B_OctIrradiance(constants);  // SH 低通滤波
     Pass10_FinalGather(constants);
-    Pass11_ScreenSpaceTemporalFilter(constants);
+    Pass11_ScreenSpaceTemporalFilter(constants);  // TSR-style temporal filter
     
     CD3DX12_RESOURCE_BARRIER endBarriers[] = {
         CD3DX12_RESOURCE_BARRIER::Transition(m_probeRadiance,
@@ -591,6 +601,10 @@ void ScreenProbeFinalGather::Execute(
         CD3DX12_RESOURCE_BARRIER::Transition(m_screenIndirectLighting,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
         CD3DX12_RESOURCE_BARRIER::Transition(m_screenIndirectRaw,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_prevDepthBuffer,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_prevScreenRadiance,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     m_commandList->ResourceBarrier(_countof(endBarriers), endBarriers);
@@ -705,16 +719,15 @@ void ScreenProbeFinalGather::Pass04_GenerateSampleDirections(const ScreenProbeCo
     if (!pso) return;
     
     m_commandList->SetPipelineState(pso);
-    uint32_t totalRays = m_probeGridWidth * m_probeGridHeight * SCREEN_PROBE_RAYS; // RaysPerProbe = 64
-    uint32_t groups = (totalRays + SCREEN_PROBE_RAYS - 1) / SCREEN_PROBE_RAYS;
-    m_commandList->Dispatch(groups, 1, 1);
-    
+    // 2D dispatch: one thread group per probe, 64 threads per group (8x8)
+    m_commandList->Dispatch(m_probeGridWidth, m_probeGridHeight, 1);
+
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = m_sampleDirectionsBuffer;
     m_commandList->ResourceBarrier(1, &barrier);
-    
-    //DebuggerPrintf("  [Pass 4] Sample Directions: %u groups\n", groups);
+
+    //DebuggerPrintf("  [Pass 4] Sample Directions: %ux%u groups\n", m_probeGridWidth, m_probeGridHeight);
 }
 
 //=============================================================================
@@ -734,16 +747,15 @@ void ScreenProbeFinalGather::Pass05_MeshSDFTrace(const ScreenProbeConstants& c)
     if (!pso) return;
     
     m_commandList->SetPipelineState(pso);
-    uint32_t totalRays = m_probeGridWidth * m_probeGridHeight * SCREEN_PROBE_RAYS;
-    uint32_t groups = (totalRays + SCREEN_PROBE_RAYS - 1) / SCREEN_PROBE_RAYS;
-    m_commandList->Dispatch(groups, 1, 1);
-    
+    // 2D dispatch: one thread group per probe, 64 threads per group (8x8)
+    m_commandList->Dispatch(m_probeGridWidth, m_probeGridHeight, 1);
+
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = m_meshTraceResultBuffer;
     m_commandList->ResourceBarrier(1, &barrier);
-    
-    //DebuggerPrintf("  [Pass 5] Mesh SDF Trace: %u groups\n", groups);
+
+    //DebuggerPrintf("  [Pass 5] Mesh SDF Trace: %ux%u groups\n", m_probeGridWidth, m_probeGridHeight);
 }
 
 //=============================================================================
@@ -763,16 +775,15 @@ void ScreenProbeFinalGather::Pass06_VoxelSDFTrace(const ScreenProbeConstants& c)
     if (!pso) return;
     
     m_commandList->SetPipelineState(pso);
-    uint32_t totalRays = m_probeGridWidth * m_probeGridHeight * SCREEN_PROBE_RAYS;
-    uint32_t groups = (totalRays + SCREEN_PROBE_RAYS - 1) / SCREEN_PROBE_RAYS;
-    m_commandList->Dispatch(groups, 1, 1);
-    
+    // 2D dispatch: one thread group per probe, 64 threads per group (8x8)
+    m_commandList->Dispatch(m_probeGridWidth, m_probeGridHeight, 1);
+
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = m_voxelTraceResultBuffer;
     m_commandList->ResourceBarrier(1, &barrier);
-    
-    //DebuggerPrintf("  [Pass 6] Voxel SDF Trace: %u groups\n", groups);
+
+    //DebuggerPrintf("  [Pass 6] Voxel SDF Trace: %ux%u groups\n", m_probeGridWidth, m_probeGridHeight);
 }
 
 //=============================================================================
@@ -794,12 +805,10 @@ void ScreenProbeFinalGather::Pass07_RadianceComposite(const ScreenProbeConstants
     if (!pso) return;
     
     m_commandList->SetPipelineState(pso);
-    // uint32_t texWidth = m_probeGridWidth * 8;
-    // uint32_t texHeight = m_probeGridHeight * 8;
-    // uint32_t groupsX = (texWidth + 7) / 8;
-    // uint32_t groupsY = (texHeight + 7) / 8;
-    uint32_t groupsX = m_probeGridWidth;
-    uint32_t groupsY = m_probeGridHeight;
+    uint32_t texWidth = m_probeGridWidth * OCTAHEDRON_WIDTH;
+    uint32_t texHeight = m_probeGridHeight * OCTAHEDRON_HEIGHT;
+    uint32_t groupsX = (texWidth + 15) / 16;
+    uint32_t groupsY = (texHeight + 15) / 16;
     m_commandList->Dispatch(groupsX, groupsY, 1);
     
     // UAV Barrier + 状态转换: ProbeRadiance 从 UAV -> SRV
@@ -886,9 +895,58 @@ void ScreenProbeFinalGather::Pass09_SpatialFilter(const ScreenProbeConstants& c)
 }
 
 //=============================================================================
+// Pass 9B: OctIrradiance (SimLumen-style SH smoothing)
+// 输入: ProbeRadianceFiltered (t426) - 从 Pass9 转成 SRV
+// 输出: ProbeRadiance (u408) - SH投影后重建的irradiance
+//
+// 这是SimLumen的关键稳定性步骤：
+// 1. 将radiance投影到3阶球谐函数(SH)
+// 2. 从SH重建irradiance
+// 这相当于低通滤波，平滑掉高频噪声，实现时间稳定性
+//=============================================================================
+void ScreenProbeFinalGather::Pass09B_OctIrradiance(const ScreenProbeConstants& c)
+{
+    UNUSED(c);
+    ID3D12PipelineState* pso = GetOrCreatePSO(
+        &m_pso_OctIrradiance,
+        "Data/Shaders/ScreenProbe/OctIrradiance.hlsl",
+        "main",
+        L"ScreenProbe_OctIrradiance"
+    );
+    if (!pso) return;
+
+    // ProbeRadiance 需要从 SRV 转为 UAV（因为 Pass07 结束时转为了 SRV）
+    CD3DX12_RESOURCE_BARRIER preBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_probeRadiance,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+    );
+    m_commandList->ResourceBarrier(1, &preBarrier);
+
+    m_commandList->SetPipelineState(pso);
+
+    // 每个thread处理一个完整的probe (8x8 texels)
+    // Dispatch: (ProbeGridWidth, ProbeGridHeight, 1)
+    uint32_t groupsX = (m_probeGridWidth + 7) / 8;
+    uint32_t groupsY = (m_probeGridHeight + 7) / 8;
+    m_commandList->Dispatch(groupsX, groupsY, 1);
+
+    // UAV Barrier + 状态转换: ProbeRadiance 从 UAV -> SRV (给 FinalGather 读取)
+    CD3DX12_RESOURCE_BARRIER postBarriers[] = {
+        CD3DX12_RESOURCE_BARRIER::UAV(m_probeRadiance),
+        CD3DX12_RESOURCE_BARRIER::Transition(m_probeRadiance,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+    };
+    m_commandList->ResourceBarrier(_countof(postBarriers), postBarriers);
+
+    //DebuggerPrintf("  [Pass 9B] OctIrradiance (SH smoothing): %ux%u groups\n", groupsX, groupsY);
+}
+
+//=============================================================================
 // Pass 10: Final Gather
 // 输入: DepthBuffer (t218), NormalBuffer (t215), AlbedoBuffer (t214)
-//       ProbeRadianceFiltered (t425) - 从 Pass9 转成 SRV
+//       ProbeRadiance (t424) - 从 Pass9B (OctIrradiance) 转成 SRV
 //       ProbeBuffer (t415)
 // 输出: ScreenIndirectRaw (u433) - FinalGather 原始输出
 //
@@ -910,16 +968,21 @@ void ScreenProbeFinalGather::Pass10_FinalGather(const ScreenProbeConstants& c)
     uint32_t groupsY = (m_screenHeight + 7) / 8;
     m_commandList->Dispatch(groupsX, groupsY, 1);
 
-    // UAV Barrier + 状态转换: ScreenIndirectRaw 从 UAV -> SRV (给 Pass11 读取)
-    CD3DX12_RESOURCE_BARRIER barriers[] = {
-        CD3DX12_RESOURCE_BARRIER::UAV(m_screenIndirectRaw),
-        CD3DX12_RESOURCE_BARRIER::Transition(m_screenIndirectRaw,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
-    };
-    m_commandList->ResourceBarrier(_countof(barriers), barriers);
+    // UAV Barrier on ScreenIndirectRaw, then transition to SRV for Pass11
+    D3D12_RESOURCE_BARRIER uavBarrier = {};
+    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarrier.UAV.pResource = m_screenIndirectRaw;
+    m_commandList->ResourceBarrier(1, &uavBarrier);
 
-    //DebuggerPrintf("  [Pass 10] Final Gather: %ux%u groups\n", groupsX, groupsY);
+    // Transition ScreenIndirectRaw: UAV -> SRV (for Pass11 to read)
+    CD3DX12_RESOURCE_BARRIER rawToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_screenIndirectRaw,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+    );
+    m_commandList->ResourceBarrier(1, &rawToSrv);
+
+    // Note: Copy to PrevScreenRadiance is done in Pass11 after temporal filtering
 }
 
 //=============================================================================
@@ -988,6 +1051,41 @@ void ScreenProbeFinalGather::Pass11_ScreenSpaceTemporalFilter(const ScreenProbeC
         };
         m_commandList->ResourceBarrier(_countof(restoreCopyBarriers), restoreCopyBarriers);
         //DebuggerPrintf("  [Post-Pass11] Copied ScreenIndirectLighting → PrevScreenRadiance\n");
+    }
+
+    // 复制当前深度 → PrevDepthBuffer (为下一帧的深度比较)
+    if (m_gBuffer && m_gBuffer->m_depth)
+    {
+        CD3DX12_RESOURCE_BARRIER depthCopyBarriers[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(
+                m_gBuffer->m_depth,
+                D3D12_RESOURCE_STATE_DEPTH_READ,  // 假设当前深度已经是 DEPTH_READ 状态
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            ),
+            CD3DX12_RESOURCE_BARRIER::Transition(
+                m_prevDepthBuffer,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST
+            )
+        };
+        m_commandList->ResourceBarrier(_countof(depthCopyBarriers), depthCopyBarriers);
+
+        m_commandList->CopyResource(m_prevDepthBuffer, m_gBuffer->m_depth);
+
+        CD3DX12_RESOURCE_BARRIER depthRestoreBarriers[] = {
+            CD3DX12_RESOURCE_BARRIER::Transition(
+                m_gBuffer->m_depth,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_DEPTH_READ  // 恢复到原始状态
+            ),
+            CD3DX12_RESOURCE_BARRIER::Transition(
+                m_prevDepthBuffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            )
+        };
+        m_commandList->ResourceBarrier(_countof(depthRestoreBarriers), depthRestoreBarriers);
+        //DebuggerPrintf("  [Post-Pass11] Copied GBuffer Depth → PrevDepthBuffer\n");
     }
 }
 #endif

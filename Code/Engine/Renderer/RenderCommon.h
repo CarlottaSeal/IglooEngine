@@ -64,7 +64,16 @@ enum class VertexType
 {
     VERTEX_PCU,
     VERTEX_PCUTBN,
+    VERTEX_FONT,
     COUNT
+};
+
+struct FontConstants
+{
+    float SDFThreshold;		// alpha threshold for SDF edge
+    float SDFSmoothRange;	// smoothstep range for anti-aliasing
+    float Time;				// for animated effects
+    float Weight;			// global weight adjustment
 };
 
 #ifdef ENGINE_DX11_RENDERER
@@ -73,6 +82,7 @@ static const int k_cameraConstantsSlot = 2;
 static const int k_modelConstantsSlot = 3;
 static const int k_generalLightConstantsSlot = 4;
 static const int k_shadowConstantsSlot = 6;
+static const int k_fontConstantsSlot = 7;
 #endif
 #ifdef ENGINE_DX12_RENDERER
 static const int k_perFrameConstantsSlot = 0;
@@ -83,13 +93,12 @@ static const int k_generalLightConstantsSlot = 4;
 static const int k_shadowConstantsSlot = 5;
 static const int k_surfaceRadiosityConstantsSlot = 6;       
 static const int k_screenProbeFinalGatherConstantsSlot = 7;
-static const int k_radianceCacheConstantsSlot = 13;
 //static const int k_sdfGenerationConstantsSlot = 11;
 static const int k_giVisualizationConstantsSlot = 11;
 static const int k_cardCaptureConstantsSlot = 10;
 static const int k_cardCaptureModelConstantsSlot = 9;
 static const int k_cardCaptureMaterialConstantsSlot = 8;
-static const int k_compositeConstantsSlot = 12; 
+static const int k_compositeConstantsSlot = 12;
 #endif
 
 struct CameraConstants
@@ -97,12 +106,18 @@ struct CameraConstants
     Mat44 WorldToCameraTransform;
     Mat44 CameraToRenderTransform;
     Mat44 RenderToClipTransform;
-    
+
     Vec3 CameraWorldPosition;
     float padding;
 };
 
 struct ModelConstants
+{
+    Mat44 ModelToWorldTransform;
+    float ModelColor[4];
+};
+
+struct InstanceData
 {
     Mat44 ModelToWorldTransform;
     float ModelColor[4];
@@ -164,6 +179,7 @@ struct GeneralLightConstants
 
 struct ShadowConstants
 {
+    // Directional shadow
     Mat44 LightWorldToCamera;
     Mat44 LightCameraToRender;
     Mat44 LightRenderToClip;
@@ -171,6 +187,18 @@ struct ShadowConstants
     float ShadowBias;
     float SoftnessFactor;
     float LightSize;
+
+    // Point light cube shadow (per-face rendering)
+    float LightPosition[3];
+    float FarPlane;
+
+    // Point light shadow sampling info
+    int ShadowLightIndices[4];    // generalLightID per shadow slot, -1 = unused
+    float ShadowFarPlanes[4];     // far plane per shadow slot
+    float PointShadowBias;
+    float PointShadowSoftness;
+    int NumShadowCastingLights;
+    float PointShadowPadding;
 };
 
 struct PerFrameConstants 
@@ -213,6 +241,10 @@ enum class RenderMode
 // };
 
 static constexpr uint32_t SHADOW_MAP_SIZE = 2048;
+static constexpr uint32_t POINT_LIGHT_SHADOW_MAP_SIZE = 512;
+static constexpr int MAX_SHADOW_CASTING_POINT_LIGHTS = 4;
+static constexpr int POINT_SHADOW_CUBE_FACES = 6;
+static constexpr int POINT_SHADOW_TOTAL_FACES = MAX_SHADOW_CASTING_POINT_LIGHTS * POINT_SHADOW_CUBE_FACES; // 24
 
 static const int FRAME_BUFFER_COUNT = 3;  // Swap Chain 三重缓冲
 static const int MAX_TEXTURE_COUNT = 200;
@@ -225,11 +257,9 @@ static constexpr int SURFACE_CACHE_DESCRIPTOR_COUNT = 4;
 //static constexpr int SURFACE_CACHE_BUFFER_COUNT = 1;        // 双缓冲 ->改为无缓冲！ 删掉这个
 static constexpr int SURFACE_CACHE_LAYER_CAPTURE_COUNT = 4;
 static constexpr int DESCRIPTORS_PER_SURFACE_BUFFER = 4;    // Atlas SRV, Meta SRV, Atlas UAV, Meta UAV
-// Radiance Cache 
-static constexpr int RADIANCE_CACHE_BUFFER_COUNT = 2;       // 双缓冲
-static constexpr int DESCRIPTORS_PER_RADIANCE_BUFFER = 2;   // Probe SRV, Probe UAV
 
 static constexpr int SHADOW_MAP_DSV_COUNT = 1;
+static constexpr int POINT_SHADOW_DSV_COUNT = POINT_SHADOW_TOTAL_FACES; // 24
 static constexpr int CARD_CAPTURE_RTV_COUNT = SURFACE_CACHE_LAYER_COUNT;
 // SDF
 static const int MAX_SDF_TEXTURE_COUNT = 128;
@@ -249,18 +279,8 @@ static constexpr int SURFCACHE_PRIMARY_META_SRV  = SURFCACHE_PRIMARY_BASE + 1;  
 static constexpr int SURFCACHE_PRIMARY_ATLAS_UAV = SURFCACHE_PRIMARY_BASE + 2;   // 221
 static constexpr int SURFCACHE_PRIMARY_META_UAV  = SURFCACHE_PRIMARY_BASE + 3;   // 222
 
-//Section 6: Radiance Cache
-//static constexpr int RADIANCE_CACHE_BASE = SURFCACHE_GI_BASE + 
-//  (DESCRIPTORS_PER_SURFACE_BUFFER * SURFACE_CACHE_BUFFER_COUNT); 
-static constexpr int RADIANCE_CACHE_BASE = SURFCACHE_PRIMARY_META_UAV + 1; //223
-static constexpr int RADIANCE_CACHE_BUF0_PROBE_SRV = RADIANCE_CACHE_BASE + 0;  
-static constexpr int RADIANCE_CACHE_BUF0_PROBE_UAV = RADIANCE_CACHE_BASE + 1;  
-static constexpr int RADIANCE_CACHE_BUF1_PROBE_SRV = RADIANCE_CACHE_BASE + 2;  
-static constexpr int RADIANCE_CACHE_BUF1_PROBE_UAV = RADIANCE_CACHE_BASE + 3;  
-static constexpr int RADIANCE_CACHE_UPDATE_LIST_SRV = RADIANCE_CACHE_BASE + 4; 
-
-// Section 7: Card BVH 
-static constexpr int CARD_BVH_BASE = RADIANCE_CACHE_UPDATE_LIST_SRV + 1;  // 228
+// Section 7: Card BVH
+static constexpr int CARD_BVH_BASE = SURFCACHE_PRIMARY_META_UAV + 1 + 5; // 228
 static constexpr int CARD_BVH_NODE_SRV = CARD_BVH_BASE + 0;   
 static constexpr int CARD_BVH_INDEX_SRV = CARD_BVH_BASE + 1;  
 
@@ -377,22 +397,25 @@ static constexpr int VIZ_OUTPUT_UAV = SCREEN_PROBE_BASE + SCREEN_PROBE_DESCRIPTO
 static constexpr int SCREEN_INDIRECT_RAW_UAV = VIZ_OUTPUT_UAV + 1;  // 433
 static constexpr int SCREEN_INDIRECT_RAW_SRV = SCREEN_INDIRECT_RAW_UAV + 1;  // 434
 
-static constexpr int TOTAL_NUM_DESCRIPTORS = SCREEN_INDIRECT_RAW_SRV + 1;  // 435
+// Point Light Cube Shadow Array SRV
+static constexpr int POINT_SHADOW_CUBE_ARRAY_SRV = SCREEN_INDIRECT_RAW_SRV + 1;  // 435
+
+// Instance data uses root SRV (no descriptor needed)
+static constexpr int TOTAL_NUM_DESCRIPTORS = POINT_SHADOW_CUBE_ARRAY_SRV + 1;  // 436
 
 // Shader Register Bindings (for Root Signature)
 static constexpr int GBUFFER_SRV_START = MAX_TEXTURE_COUNT;  // shader registers: t200, t201, t202, 203 204 <-其实没必要
-static constexpr int SURFACE_CACHE_SRV = GBUFFER_SRV_START + GBUFFER_COUNT+ DEPTH_SRV_COUNT; 
-// Radiance Cache
-static constexpr int RADIANCE_CACHE_SRV = SURFACE_CACHE_SRV + DESCRIPTORS_PER_SURFACE_BUFFER;  // shader register
+static constexpr int SURFACE_CACHE_SRV = GBUFFER_SRV_START + GBUFFER_COUNT+ DEPTH_SRV_COUNT;
 
 // 其他逐帧资源的 shader register 映射
-static constexpr int RADIANCE_CACHE_SRV_INDEX = RADIANCE_CACHE_BUF1_PROBE_SRV;  // Current frame
 static constexpr int PROBE_GRID_SRV_INDEX = PROBE_GRID_SRV_BASE;
 static constexpr int SSR_SRV_INDEX = SSR_SRV_BASE;
 static constexpr int TEMPORAL_PREV_SRV_INDEX = TEMPORAL_PREV_SRV_BASE;
 static constexpr int TEMPORAL_MOTION_SRV_INDEX = TEMPORAL_MOTION_SRV_BASE;
 static constexpr int SHADOW_MAP_SRV_INDEX = TEMPORAL_MOTION_SRV_INDEX + 1; 
 static constexpr int SCREEN_INDIRECT_LIGHTING_SRV_REGISTER = SHADOW_MAP_SRV_INDEX + 1;  // t241
+static constexpr int POINT_SHADOW_SRV_REGISTER = SCREEN_INDIRECT_LIGHTING_SRV_REGISTER + 1;  // t242
+static constexpr int INSTANCE_DATA_SRV_REGISTER = POINT_SHADOW_SRV_REGISTER + 1;  // t243
 
 constexpr int PrimaryAtlasSrvIndex(int bufferIndex) 
 { 
@@ -409,22 +432,6 @@ constexpr int PrimaryAtlasUavIndex(int bufferIndex)
 constexpr int PrimaryMetaUavIndex(int bufferIndex) 
 { 
     return SURFCACHE_PRIMARY_BASE + bufferIndex * DESCRIPTORS_PER_SURFACE_BUFFER + 3; 
-}
-
-// Helper Functions: Radiance Cache Descriptor Indices
-constexpr int RadianceCacheProbeSrvIndex(int bufferIndex) 
-{ 
-    return RADIANCE_CACHE_BASE + bufferIndex * DESCRIPTORS_PER_RADIANCE_BUFFER + 0; 
-}
-
-constexpr int RadianceCacheProbeUavIndex(int bufferIndex) 
-{ 
-    return RADIANCE_CACHE_BASE + bufferIndex * DESCRIPTORS_PER_RADIANCE_BUFFER + 1; 
-}
-
-constexpr int RadianceCacheUpdateListSrvIndex() 
-{ 
-    return RADIANCE_CACHE_UPDATE_LIST_SRV; 
 }
 
 static constexpr int s_maxCardsPerBatch = 128;
@@ -459,9 +466,10 @@ struct SDFGenerationConstants
 	uint32_t Resolution;
 	Vec3 BoundsMax;
 	uint32_t NumTriangles;
-    uint32_t NumVertices;    
-    uint32_t NumBVHNodes;     
-    float padding[2];    
+    uint32_t NumVertices;
+    uint32_t NumBVHNodes;
+    uint32_t ZSliceOffset;
+    float padding;
 };
 
 struct CardCaptureConstants
@@ -484,37 +492,6 @@ struct CardCaptureConstants
 
     // LightMask支持（从CardInstanceData传入）
     uint32_t LightMask[4];       // 支持128个lights (4 * 32 bits)
-};
-
-struct RadianceCacheConstants
-{
-    uint32_t MaxProbes;
-    uint32_t ActiveProbeCount;
-    uint32_t UpdateProbeCount;
-    uint32_t RaysPerProbe;
-    
-    float CameraPositionX;
-    float CameraPositionY;
-    float CameraPositionZ;
-    float Padding0;
-    
-    Mat44 ViewProj;
-    Mat44 ViewProjInverse;
-    
-    float ScreenWidth;
-    float ScreenHeight;
-    uint32_t CurrentFrame;
-    float TemporalBlend;
-    
-    float MaxTraceDistance;
-    float ProbeSpacing;
-    uint32_t ActiveCardCount;
-    float Padding1;
-    
-    uint32_t AtlasWidth;
-    uint32_t AtlasHeight;
-    uint32_t TileSize;
-    uint32_t BVHNodeCount;
 };
 
 struct RenderItem //TODO: 删掉~
@@ -581,8 +558,6 @@ struct SurfaceRadiosityConstants
     uint32_t Padding1;
 };
 
-
-// Screen Probe Final Gather 常量缓冲区
 struct ScreenProbeConstants
 {
     uint32_t ScreenWidth;           // 1920
@@ -606,9 +581,14 @@ struct ScreenProbeConstants
     float    SkyIntensity;          // 0.3
     
     uint32_t CurrentFrame;
-    uint32_t OctahedronSize;        // 8
+    uint32_t OctahedronSize;        // 8 (width, legacy)
     uint32_t OctahedronBorder;      // 1
     uint32_t BorderedOctSize;       // 10
+
+    uint32_t OctahedronWidth;       // 8
+    uint32_t OctahedronHeight;      // 16 (8x16 = 128 rays)
+    uint32_t MeshInstanceCount;
+    uint32_t Padding6;
 
     float    DepthThreshold;        // 0.1f - Pass 6.1
     float    PlaneDepthWeight;      // 10.0f - Pass 6.2
@@ -668,32 +648,39 @@ struct ScreenProbeConstants
 
 struct CompositeConstants
 {
-    Mat44 ClipToRenderTransform;    
-    Mat44 RenderToCameraTransform;  
-    Mat44 CameraToWorldTransform;   
-    
-    float ScreenWidth;              
-    float ScreenHeight;             
-    float IndirectIntensity;        
-    float DirectIntensity;          
-    
+    Mat44 ClipToRenderTransform;
+    Mat44 RenderToCameraTransform;
+    Mat44 CameraToWorldTransform;
+
+    float ScreenWidth;
+    float ScreenHeight;
+    float IndirectIntensity;
+    float DirectIntensity;
+
     // 太阳光参数
     float SunColor[4];
-    
+
     float SunNormal[3];
-    float AmbientIntensity;         
-    
-    Vec3 AmbientColor;              
-    float ShadowBias;               
-    
-    Mat44 LightWorldToCamera;       
-    Mat44 LightCameraToRender;      
-    Mat44 LightRenderToClip;        
-    
-    float ShadowMapSize;            
-    float AOStrength;               
+    float AmbientIntensity;
+
+    Vec3 AmbientColor;
+    float ShadowBias;
+
+    Mat44 LightWorldToCamera;
+    Mat44 LightCameraToRender;
+    Mat44 LightRenderToClip;
+
+    float ShadowMapSize;
+    float AOStrength;
     float SoftnessFactor;
-    float LightSize;            
+    float LightSize;
+
+    // SDF Shadow 参数
+    Vec3 SDFCenter;
+    float SDFExtent;
+    float SDFShadowSoftness;
+    float UseSDFShadow;
+    float SDFPadding[2];
 };
 
 enum class GIVisualizationMode : uint32_t
@@ -725,8 +712,11 @@ enum class GIVisualizationMode : uint32_t
     
     // SDF (1种) - Fullscreen Compute
     MeshSDF_Normal,
-    
-    COUNT  // = 16
+
+    // AO (1种) - Fullscreen Compute
+    ProbeAO,
+
+    COUNT  // = 17
 };
 
 struct GIVisualizationParams
@@ -760,7 +750,8 @@ inline const char* GetVisualizationModeName(GIVisualizationMode mode)
         case GIVisualizationMode::ScreenProbe_RadianceFiltered: return "ScreenProbe: Radiance Filtered";
         
         case GIVisualizationMode::MeshSDF_Normal:             return "MeshSDF: Normal";
-        
+        case GIVisualizationMode::ProbeAO:                    return "Probe AO";
+
         default: return "Unknown";
     }
 }

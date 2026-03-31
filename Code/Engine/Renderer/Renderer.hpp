@@ -8,6 +8,7 @@
 #include "Engine/Core/Rgba8.hpp"
 #include "Engine/Core/Vertex_PCU.hpp"
 #include "Engine/Core/Vertex_PCUTBN.hpp"
+#include "Engine/Core/Vertex_Font.hpp"
 #include "Engine/Math/AABB2.hpp"
 #include "Engine/Math/IntVec2.hpp"
 #include <vector>
@@ -20,6 +21,7 @@ class VulkanRenderer;
 
 class Window;
 class BitmapFont;
+class BMFont;
 class Image;
 class Texture;
 class Shader;
@@ -91,6 +93,8 @@ public:
 	virtual void DrawVertexArray(int numVerts, const Vertex_PCU* verts);
 	virtual void DrawVertexArray(const std::vector<Vertex_PCUTBN>& verts);
 	virtual void DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts);
+	virtual void DrawVertexArray(const std::vector<Vertex_Font>& verts);
+	virtual void DrawVertexArray(int numVerts, const Vertex_Font* verts);
 	virtual void DrawVertexIndexArray(const std::vector<Vertex_PCUTBN>& verts, const std::vector<unsigned int>& indices);
 	virtual void DrawVertexIndexArray(const std::vector<Vertex_PCUTBN>& verts, const std::vector<unsigned int>& indices, VertexBuffer* vbo, IndexBuffer* ibo);
 	virtual void DrawVertexIndexArray(int numVerts, const Vertex_PCUTBN* verts, int numIndices, const unsigned int* indices);
@@ -108,8 +112,9 @@ public:
     void BindTexture(const Texture* texture, int slot = 0);
    
     BitmapFont* CreateOrGetBitmapFont(const char* bitmapFontFilePathWithNoExtension);
-    //BitmapFont* CreateBitmapFontFromData()
-    //BitmapFont* GetBitmapFontFromFileName(const char* imageFilePath);
+    BitmapFont* CreateOrGetProportionalFont(const char* bitmapFontFilePathWithNoExtension);
+    BMFont* CreateOrGetBMFont(const char* fntFilePath);
+    void SetFontConstants(float sdfThreshold = 0.5f, float sdfSmoothRange = 0.05f, float time = 0.f, float weight = 0.f);
 
     //Shader Related Functions
     Shader* CreateShader(char const* shaderName, char const* shaderSource, VertexType vertexType = VertexType::VERTEX_PCU);
@@ -167,6 +172,12 @@ public:
 #endif
 	void SetModelConstants(const Mat44& modelToWorldTransform = Mat44(), const Rgba8& modelColor = Rgba8::WHITE);
 	void SetMaterialConstants(const Texture* diffuseTex = nullptr, const Texture* normalTex = nullptr, const Texture* specularTex = nullptr);
+
+	// Instanced drawing for GBuffer pass
+	void ResetInstanceData();
+	uint32_t AppendInstanceData(const Mat44& worldMatrix, const Rgba8& color);
+	void DrawIndexedInstancedBatch(VertexBuffer* vbo, IndexBuffer* ibo,
+		int indexCount, uint32_t startInstance, uint32_t instanceCount);
     void SetShadowConstants(const Mat44& lightViewProjectionMatrix = Mat44());
 	void SetPerFrameConstants(const float time, const int debugInt, const float debugFloat);
 
@@ -187,6 +198,10 @@ public:
 #endif
 #ifdef ENGINE_DX12_RENDERER
 		DX12Renderer* GetSubRenderer()
+		{
+			return m_dx12Renderer;
+		}
+		const DX12Renderer* GetSubRenderer() const
 		{
 			return m_dx12Renderer;
 		}

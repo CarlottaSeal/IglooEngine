@@ -123,10 +123,10 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
                 renderer->BindTexture(&m_textFont->GetTexture());
 #endif
 #ifdef ENGINE_DX12_RENDERER
-            	renderer->SetMaterialConstants();
+            	renderer->SetMaterialConstants(&m_textFont->GetTexture());
 #endif
                 renderer->SetRasterizerMode(RasterizerMode::SOLID_CULL_NONE);
-            }    
+            }
             else
                 renderer->SetRasterizerMode(RasterizerMode::SOLID_CULL_BACK);
         }
@@ -591,6 +591,18 @@ void DebugAddWorldWireAABB(const AABB3& box, float duration, const Rgba8& startC
 		g_theDebugRenderTool->m_worldObjects.push_back(wireBox);
 	}
 	wireBox->m_timer->Start();
+}
+
+void DebugAddWorldQuad(const Vec3& bl, const Vec3& br, const Vec3& tr, const Vec3& tl,
+	float duration, const Rgba8& color, DebugRenderMode mode)
+{
+	DebugObject* quad = new DebugObject(duration, color, color, mode);
+	AddVertsForQuad3D(quad->m_verts, bl, br, tr, tl, color);
+	{
+		std::lock_guard<std::recursive_mutex> lock(g_theDebugRenderTool->m_mutex);
+		g_theDebugRenderTool->m_worldObjects.push_back(quad);
+	}
+	quad->m_timer->Start();
 }
 
 void DebugAddWorldArrow(const Vec3& start, const Vec3& end, float radius, float duration, const Rgba8& startColor, const Rgba8& endColor, DebugRenderMode mode)

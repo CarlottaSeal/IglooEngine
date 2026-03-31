@@ -6,23 +6,23 @@ namespace RadiosityConfig
 {
     constexpr uint32_t PROBE_SPACING = 4;      // Surface Cache 上每 4 像素一个 Probe
     constexpr uint32_t RAYS_PER_PROBE = 16;    // 每个 Probe 16 根光线
-    constexpr float TEMPORAL_BLEND = 0.05f;    // 时间混合系数
+    constexpr float TEMPORAL_BLEND = 1.0f;    // 禁用 probe 级别 temporal
     constexpr float TRACE_DISTANCE = 200.0f;   // 追踪距离
     constexpr uint32_t TRACE_MAX_STEPS = 64;   // 最大步数
 }
 
 struct SurfaceCardMetadata
 {
-	uint32_t m_atlasX;           // Atlas像素坐标X
-	uint32_t m_atlasY;           // Atlas像素坐标Y
-	uint32_t m_resolutionX;      // Card分辨率X
-	uint32_t m_resolutionY;      // Card分辨率Y
+	uint32_t m_atlasX;           
+	uint32_t m_atlasY;           
+	uint32_t m_resolutionX;      
+	uint32_t m_resolutionY;      
  
 	float m_originX, m_originY, m_originZ;
 	float m_padding0;
  
 	float m_axisXx, m_axisXy, m_axisXz;
-	float m_objectID;
+	int m_objectID;
  
 	float m_axisYx, m_axisYy, m_axisYz;
 	float m_padding2;

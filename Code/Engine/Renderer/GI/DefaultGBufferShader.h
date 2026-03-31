@@ -22,13 +22,12 @@ cbuffer CameraConstants : register(b1)
     //float padding1;
 }
 
-cbuffer ModelConstants : register(b2) 
+cbuffer DrawConstants : register(b21)
 {
-    float4x4 ModelToWorldTransform;
-    float4 ModelColor;
+    uint InstanceOffset;
 }
 
-cbuffer MaterialConstants : register(b3) 
+cbuffer MaterialConstants : register(b3)
 {
     int DiffuseId;
     int NormalId;
@@ -36,10 +35,17 @@ cbuffer MaterialConstants : register(b3)
     float padding2;
 }
 
+struct InstanceData
+{
+    float4x4 ModelToWorld;
+    float4 Color;
+};
+StructuredBuffer<InstanceData> g_Instances : register(t243);
+
 Texture2D g_textures[MAX_TEXTURE_COUNT] : register(t0);
 SamplerState g_sampler : register(s0);
 
-struct VSInput 
+struct VSInput
 {
     float3 Position : POSITION;
     float4 Color : COLOR;
@@ -47,6 +53,7 @@ struct VSInput
     float3 Tangent : TANGENT;
     float3 Bitangent : BITANGENT;
     float3 Normal : NORMAL;
+    uint InstanceID : SV_InstanceID;
 };
 
 struct VSOutput 
@@ -62,37 +69,41 @@ struct VSOutput
     float4 CurrClipPos : CURRPOS;
 };
 
-VSOutput GBufferVS(VSInput input) 
+VSOutput GBufferVS(VSInput input)
 {
     VSOutput output;
-    
+
+    InstanceData inst = g_Instances[input.InstanceID + InstanceOffset];
+    float4x4 ModelToWorld = inst.ModelToWorld;
+    float4 InstanceColor = inst.Color;
+
     float4 modelPos = float4(input.Position, 1.0f);
-    
-    float4 worldPos = mul(ModelToWorldTransform, modelPos);
+
+    float4 worldPos = mul(ModelToWorld, modelPos);
     float4 cameraPos = mul(WorldToCameraTransform, worldPos);
     float4 renderPos = mul(CameraToRenderTransform, cameraPos);
     float4 clipPos = mul(RenderToClipTransform, renderPos);
-    
+
     float4 modelNormal = float4(input.Normal, 0.0f);
     float4 modelTangent = float4(input.Tangent, 0.0f);
     float4 modelBitangent = float4(input.Bitangent, 0.0f);
-    
-    float4 worldNormal = mul(ModelToWorldTransform, modelNormal);
-    float4 worldTangent = mul(ModelToWorldTransform, modelTangent);
-    float4 worldBitangent = mul(ModelToWorldTransform, modelBitangent);
-    
-    output.Position = clipPos;                                   
-    output.WorldPos = worldPos.xyz;                          
-    output.WorldNormal = normalize(worldNormal.xyz);          
-    output.WorldTangent = normalize(worldTangent.xyz);          
-    output.WorldBitangent = normalize(worldBitangent.xyz);    
-    
+
+    float4 worldNormal = mul(ModelToWorld, modelNormal);
+    float4 worldTangent = mul(ModelToWorld, modelTangent);
+    float4 worldBitangent = mul(ModelToWorld, modelBitangent);
+
+    output.Position = clipPos;
+    output.WorldPos = worldPos.xyz;
+    output.WorldNormal = normalize(worldNormal.xyz);
+    output.WorldTangent = normalize(worldTangent.xyz);
+    output.WorldBitangent = normalize(worldBitangent.xyz);
+
     output.CurrClipPos = clipPos;
-    output.PrevClipPos = clipPos; 
-    
+    output.PrevClipPos = clipPos;
+
     output.TexCoord = input.TexCoord;
-    output.Color = input.Color * ModelColor;
-    
+    output.Color = input.Color * InstanceColor;
+
     return output;
 }
 

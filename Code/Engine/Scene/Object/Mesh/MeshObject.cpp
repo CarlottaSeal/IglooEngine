@@ -52,8 +52,20 @@ AABB3 MeshObject::GetWorldBounds() const
     AABB3 local = GetLocalBounds();
     Vec3 center = (local.m_maxs + local.m_mins) * 0.5f;
 	Vec3 halfSize = (local.m_maxs - local.m_mins) * 0.5f;
-	center += m_position;
-	return AABB3(center - halfSize, center + halfSize);
+
+	Mat44 rot = m_orientation.GetAsMatrix_IFwd_JLeft_KUp();
+	Vec3 i = rot.GetIBasis3D();
+	Vec3 j = rot.GetJBasis3D();
+	Vec3 k = rot.GetKBasis3D();
+
+	Vec3 worldCenter = rot.TransformVectorQuantity3D(center) + m_position;
+
+	Vec3 newHalf;
+	newHalf.x = fabsf(i.x) * halfSize.x + fabsf(j.x) * halfSize.y + fabsf(k.x) * halfSize.z;
+	newHalf.y = fabsf(i.y) * halfSize.x + fabsf(j.y) * halfSize.y + fabsf(k.y) * halfSize.z;
+	newHalf.z = fabsf(i.z) * halfSize.x + fabsf(j.z) * halfSize.y + fabsf(k.z) * halfSize.z;
+
+	return AABB3(worldCenter - newHalf, worldCenter + newHalf);
 }
 
 float MeshObject::CalculateCaptureDepth(const CardInstanceData* instance, uint8_t direction)

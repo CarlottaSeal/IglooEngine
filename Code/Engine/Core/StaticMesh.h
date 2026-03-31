@@ -114,6 +114,10 @@ public:
 
     std::unordered_map<float, BVH> m_bvhsByScale;
 	bool m_bvhBuilt = false;
+	mutable AABB3 m_cachedTransformedBounds;
+	mutable bool m_transformedBoundsCached = false;
+	mutable AABB3 m_cachedUntransformedBounds;
+	mutable bool m_untransformedBoundsCached = false;
 	// scale → sdfResourceID 
     std::map<float, SDFTexture3D*> m_sdfsByScale;
     //std::map<float, MeshSDFData*> m_sdfsByScale;

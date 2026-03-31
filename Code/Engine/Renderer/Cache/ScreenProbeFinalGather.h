@@ -11,7 +11,9 @@ static constexpr uint32_t SCREEN_PROBE_RAYS = 64;           // 每 Probe 64 条�
 static constexpr float MESH_SDF_TRACE_DISTANCE = 100.0f;    // Mesh SDF 追踪距离
 static constexpr float VOXEL_TRACE_DISTANCE = 500.0f;       // Voxel 追踪距离
 
-static constexpr uint32_t OCTAHEDRON_SIZE = 8;              // 8×8 八面体贴图
+static constexpr uint32_t OCTAHEDRON_WIDTH = 8;             // 八面体贴图宽度
+static constexpr uint32_t OCTAHEDRON_HEIGHT = 8;            // 八面体贴图高度 (8x8=64)
+static constexpr uint32_t OCTAHEDRON_SIZE = 8;              // 保持兼容
 static constexpr uint32_t OCTAHEDRON_BORDER = 1;            // 1 像素边界
 static constexpr uint32_t BORDERED_OCTAHEDRON_SIZE = OCTAHEDRON_SIZE + OCTAHEDRON_BORDER * 2; // 10×10
 
@@ -88,6 +90,7 @@ private:
     void Pass07_RadianceComposite(const ScreenProbeConstants& c);
     void Pass08_TemporalAccumulation(const ScreenProbeConstants& c);
     void Pass09_SpatialFilter(const ScreenProbeConstants& c);
+    void Pass09B_OctIrradiance(const ScreenProbeConstants& c);  // SimLumen-style SH smoothing
     void Pass10_FinalGather(const ScreenProbeConstants& c);
     void Pass11_ScreenSpaceTemporalFilter(const ScreenProbeConstants& c);  // 屏幕空间时间重投影
     
@@ -105,6 +108,7 @@ private:
     // 执行时的临时引用（只在 Execute 期间有效）
     ID3D12GraphicsCommandList* m_commandList = nullptr;
     ConstantBuffer* m_constantBuffer = nullptr;
+    GBufferData* m_gBuffer = nullptr;  // 用于深度缓冲区复制
      
     ID3D12Resource* m_probeBuffer = nullptr;
     ID3D12Resource* m_brdfPdfBuffer = nullptr;
@@ -128,6 +132,7 @@ private:
     ID3D12Resource* m_screenIndirectLighting = nullptr;      // 最终滤波后输出
     ID3D12Resource* m_screenIndirectRaw = nullptr;           // FinalGather 原始输出 (时间滤波前)
     ID3D12Resource* m_prevScreenRadiance = nullptr;          // 上一帧滤波结果 (历史)
+    ID3D12Resource* m_prevDepthBuffer = nullptr;             // 上一帧深度 (用于时间滤波)
     
     ID3D12PipelineState* m_pso_ProbePlacement = nullptr;
     ID3D12PipelineState* m_pso_BRDFPDFGeneration = nullptr;
@@ -138,6 +143,7 @@ private:
     ID3D12PipelineState* m_pso_RadianceComposite = nullptr;
     ID3D12PipelineState* m_pso_TemporalAccumulation = nullptr;
     ID3D12PipelineState* m_pso_SpatialFilter = nullptr;
+    ID3D12PipelineState* m_pso_OctIrradiance = nullptr;  // SimLumen-style SH smoothing
     ID3D12PipelineState* m_pso_FinalGather = nullptr;
     ID3D12PipelineState* m_pso_ScreenSpaceTemporalFilter = nullptr;  // 屏幕空间时间重投影
 };

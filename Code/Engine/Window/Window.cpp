@@ -17,9 +17,14 @@ LRESULT CALLBACK WindowsMessageHandlingProcedure(HWND windowHandle, UINT wmMessa
 	InputSystem* input = Window::s_mainWindow->m_config.m_inputSystem;
 
 	extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-	if (ImGui_ImplWin32_WndProcHandler(windowHandle, wmMessageCode, wParam, lParam))
+	ImGui_ImplWin32_WndProcHandler(windowHandle, wmMessageCode, wParam, lParam);
+	// Note: we always fall through so WM_KEYDOWN/WM_KEYUP reach the game InputSystem.
+	// ImGui uses its own IO state; game keys (V, M, etc.) must not be swallowed.
+
+	// Forward Wintab messages to tablet input
+	if (input && input->GetTablet().HandleMessage(windowHandle, wmMessageCode, wParam, lParam))
 	{
-		return true;
+		return 0;
 	}
 
 	switch (wmMessageCode)
@@ -154,6 +159,13 @@ void Window::Startup()
 {
 	//CreateOSWindow(applicationInstanceHandle, m_config.m_aspectRatio);
 	CreateOSWindow();
+
+	// Initialize tablet input if InputSystem is available
+	if (m_config.m_inputSystem)
+	{
+		bool tabletFound = m_config.m_inputSystem->GetTablet().Startup(m_windowHandle);
+		(void)tabletFound; // OK if no tablet detected
+	}
 }
 
 void Window::BeginFrame()
@@ -167,6 +179,10 @@ void Window::EndFrame()
 
 void Window::Shutdown()
 {
+	if (m_config.m_inputSystem)
+	{
+		m_config.m_inputSystem->GetTablet().Shutdown();
+	}
 }
 
 void Window::ToggleFullscreen()

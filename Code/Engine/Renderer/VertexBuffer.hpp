@@ -19,6 +19,8 @@ class VertexBuffer
 	friend class Renderer;
 	friend class DX11Renderer;
 	friend class DX12Renderer;
+	friend class DirectionalShadowPass;
+	friend class PointLightShadowPass;
 	friend class VulkanRenderer;
 
 public:

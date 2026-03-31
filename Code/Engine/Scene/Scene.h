@@ -95,6 +95,7 @@ public:
     
 #ifdef ENGINE_DX12_RENDERER
     DX12Renderer* GetRenderer() { return m_config.m_renderer->GetSubRenderer(); }
+    const DX12Renderer* GetRenderer() const { return m_config.m_renderer->GetSubRenderer(); }
 #endif
     GISystem* GetGISystem() { return m_config.m_giSystem; }
     
@@ -146,6 +147,12 @@ public:
     //Sun light应该不是一个物体。<-还是统一管理吧
     Vec3 m_sunDirection = Vec3(3.f, 1.f, -2.f);
     Rgba8 m_sunColor = Rgba8(90,90,90,255);
+    bool m_sunDirectionDirty = true; // dirty flag for shadow map update
+    bool m_pointLightDirty = false;  // dirty flag for point light changes (triggers UpdateDirectLightPass)
+    bool m_pointLightShadowDirty = false; // per-frame: shadow maps must track moving lights
+    bool m_suppressCaptureDirty = false; // internal: suppress adding to m_dirtyCardIDs during light updates
+
+    void SetSunDirection(const Vec3& dir) { m_sunDirection = dir; m_sunDirectionDirty = true; }
     int m_numLights = 0;
     std::vector<Rgba8> m_lightColors;
     std::vector<Vec3> m_worldLightPositions;
@@ -157,6 +164,10 @@ public:
     std::vector<float> m_outerDotThresholds;
 
     
+    // Frustum culling stats (mutable for use in const Render)
+    mutable int m_lastCulledCount = 0;
+    mutable int m_lastTotalCount = 0;
+
     // no use
     std::vector<MeshObject*> m_visibleMeshes;
     std::vector<LightObject*> m_activeLights;

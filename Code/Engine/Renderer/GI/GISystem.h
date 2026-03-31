@@ -2,14 +2,12 @@
 #include <queue>
 #include <unordered_map>
 
-#include "Engine/Renderer/Cache/RadianceCache.h"
 #include "Engine/Renderer/Cache/SurfaceCache.h"
 #include "Engine/Renderer/DX12Renderer.hpp"
 #include "Engine/Renderer/RenderCommon.h"
 #include "Engine/Renderer/DXR/DXRAcceleration.h"
 
 class CardBVH;
-class RadianceCacheManager;
 class Scene;
 
 struct SurfaceCacheGlobalStats
@@ -45,10 +43,10 @@ public:
     void SetDirtyCards(const std::vector<uint32_t>& cardIDs);
     const std::vector<uint32_t>& GetDirtyCards() const { return m_dirtyCards; }
     void RemoveProcessedDirtyCards(size_t count);
+    void MarkAllCardsDirty();
 
     std::vector<uint32_t> BuildUpdateList(uint32_t maxCardsPerFrame);
 
-    RadianceCacheManager* GetRadianceCacheManager() { return m_radianceCacheManager; }
     CardBVH* GetCardBVH() { return m_cardBVH; }
     
     void BuildCardBVH();
@@ -88,7 +86,6 @@ private:
     std::unordered_map<IntVec2, bool> m_tileUsageMap;         
     std::unordered_map<uint32_t, uint32_t> m_atlasToWorld;  // atlas索引到世界tile的映射 <-应该没用了
 
-    RadianceCacheManager* m_radianceCacheManager;
     CardBVH* m_cardBVH;
     
     SurfaceCacheGlobalStats m_globalStats;

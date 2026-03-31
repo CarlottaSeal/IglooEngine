@@ -19,6 +19,8 @@ class ConstantBuffer
 	friend class DX11Renderer;
 	friend class DX12Renderer;
 	friend class VulkanRenderer;
+	friend class DirectionalShadowPass;
+	friend class PointLightShadowPass;
 
 public:
 	ConstantBuffer(ID3D11Device* device, size_t size);

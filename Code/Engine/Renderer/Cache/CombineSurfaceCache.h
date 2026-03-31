@@ -23,7 +23,7 @@ public:
     
     void Initialize(ID3D12Device* device, ID3D12DescriptorHeap* descriptorHeap);
     void Shutdown();
-    void Execute(ID3D12GraphicsCommandList* cmdList, SurfaceCache* surfaceCache, int globalActiveCardCount);
+    void Execute(ID3D12GraphicsCommandList* cmdList, SurfaceCache* surfaceCache, int globalActiveCardCount, uint32_t maxCardSize = 0);
     
     bool IsInitialized() const { return m_initialized; }
     

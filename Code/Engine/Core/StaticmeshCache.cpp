@@ -269,7 +269,7 @@ bool StaticMeshCache::ApplyToMesh(StaticMesh* mesh, int meshID) const
 
 void StaticMeshCache::SaveToBinary(std::vector<uint8_t>& buffer) const
 {
-    size_t startSize = buffer.size();
+    //size_t startSize = buffer.size();
 
     size_t headerOffset = buffer.size();
     buffer.resize(buffer.size() + sizeof(MeshCacheHeader));
@@ -318,12 +318,11 @@ void StaticMeshCache::SaveToBinary(std::vector<uint8_t>& buffer) const
             reinterpret_cast<const uint8_t*>(m_sdfData.data()),
             m_sdfData.size() * sizeof(float));
     }
-
-    size_t compressedSize = buffer.size() - startSize;
-    size_t uncompressedSize = m_vertices.size() * sizeof(Vertex_PCUTBN) + 
-                              m_indices.size() * sizeof(unsigned int) +
-                              m_sdfData.size() * sizeof(float);
-    
+    //meshcache debug log
+    // size_t compressedSize = buffer.size() - startSize;
+    // size_t uncompressedSize = m_vertices.size() * sizeof(Vertex_PCUTBN) + 
+    //                           m_indices.size() * sizeof(unsigned int) +
+    //                           m_sdfData.size() * sizeof(float);
     // DebuggerPrintf("[MeshCache] Saved %zu bytes (original ~%zu bytes, %.1f%% compression)\n",
     //     compressedSize, uncompressedSize, 
     //     uncompressedSize > 0 ? (100.0f * compressedSize / uncompressedSize) : 0.0f);

@@ -244,7 +244,8 @@ private:
     // Pipeline
     VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;
+    VkPipeline m_graphicsPipeline = VK_NULL_HANDLE;        // For Vertex_PCU
+    VkPipeline m_graphicsPipelinePCUTBN = VK_NULL_HANDLE;  // For Vertex_PCUTBN
 
     // Descriptor Pool
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -256,15 +257,53 @@ private:
     size_t m_currentFrame = 0;
     uint32_t m_imageIndex = 0;
 
+    // Per-swapchain-image semaphores (to avoid semaphore reuse issues)
+    std::vector<VkSemaphore> m_imageAvailableSemaphores;  // One per swapchain image
+    std::vector<VkSemaphore> m_renderFinishedSemaphores;  // One per swapchain image
+    uint32_t m_semaphoreIndex = 0;  // Tracks which semaphore to use next
+
     // Depth Buffer
     VkImage m_depthImage = VK_NULL_HANDLE;
     VkDeviceMemory m_depthImageMemory = VK_NULL_HANDLE;
     VkImageView m_depthImageView = VK_NULL_HANDLE;
 
-    // Uniform Buffers
+    // Uniform Buffers (legacy - to be removed)
     std::vector<VkBuffer> m_uniformBuffers;
     std::vector<VkDeviceMemory> m_uniformBuffersMemory;
     std::vector<void*> m_uniformBuffersMapped;
+
+    // Camera Uniform Buffers (per frame)
+    std::vector<VkBuffer> m_cameraUniformBuffers;
+    std::vector<VkDeviceMemory> m_cameraUniformBuffersMemory;
+    std::vector<void*> m_cameraUniformBuffersMapped;
+
+    // Model Uniform Buffers (per frame)
+    std::vector<VkBuffer> m_modelUniformBuffers;
+    std::vector<VkDeviceMemory> m_modelUniformBuffersMemory;
+    std::vector<void*> m_modelUniformBuffersMapped;
+
+    // Light Uniform Buffers (per frame)
+    std::vector<VkBuffer> m_lightUniformBuffers;
+    std::vector<VkDeviceMemory> m_lightUniformBuffersMemory;
+    std::vector<void*> m_lightUniformBuffersMapped;
+
+    // Shadow Uniform Buffers (per frame)
+    std::vector<VkBuffer> m_shadowUniformBuffers;
+    std::vector<VkDeviceMemory> m_shadowUniformBuffersMemory;
+    std::vector<void*> m_shadowUniformBuffersMapped;
+
+    // PerFrame Uniform Buffers (per frame)
+    std::vector<VkBuffer> m_perFrameUniformBuffers;
+    std::vector<VkDeviceMemory> m_perFrameUniformBuffersMemory;
+    std::vector<void*> m_perFrameUniformBuffersMapped;
+
+    // Samplers for different modes
+    VkSampler m_defaultSampler = VK_NULL_HANDLE;
+    VkSampler m_samplerPointClamp = VK_NULL_HANDLE;
+    VkSampler m_samplerPointWrap = VK_NULL_HANDLE;
+    VkSampler m_samplerBilinearClamp = VK_NULL_HANDLE;
+    VkSampler m_samplerBilinearWrap = VK_NULL_HANDLE;
+    SamplerMode m_currentSamplerMode = SamplerMode::POINT_CLAMP;
 
     // Staging Buffer for transfers
     VkBuffer m_stagingBuffer = VK_NULL_HANDLE;
@@ -298,6 +337,12 @@ private:
     SamplerMode m_desiredSamplerMode = SamplerMode::POINT_CLAMP;
     RasterizerMode m_desiredRasterizerMode = RasterizerMode::SOLID_CULL_BACK;
     DepthMode m_desiredDepthMode = DepthMode::READ_WRITE_LESS_EQUAL;
+    bool m_isRenderPassActive = false;
+
+    // Bound textures (for each slot)
+    static const int MAX_TEXTURE_SLOTS = 4;
+    const Texture* m_boundTextures[MAX_TEXTURE_SLOTS] = { nullptr, nullptr, nullptr, nullptr };
+    bool m_textureBindingDirty = false;
 
     // Default textures
     const Texture* m_defaultTexture = nullptr;
