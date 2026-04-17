@@ -476,6 +476,8 @@ protected:
 	// DirectLight Update Pass
 	ID3D12PipelineState* m_directLightUpdatePSO = nullptr;
 	ID3D12RootSignature* m_directLightUpdateRootSignature = nullptr;
+	ID3D12Resource* m_cardIndexLookupTexture = nullptr;       // (atlasSize/tileSize)^2 R32_UINT, tile→cardIndex
+	ID3D12Resource* m_cardIndexLookupUploadBuffer = nullptr;  // 16 KB staging buffer
 	ScreenProbeFinalGather* m_screenProbeFinalGather = nullptr;
 	ScreenProbeConstants m_screenProbeConstants;
 	

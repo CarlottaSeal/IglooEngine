@@ -41,6 +41,11 @@ public:
     Mat44 GetPerspectiveMatrix() const;
     Mat44 GetProjectionMatrix() const;
 
+    float GetPerspectiveFOV() const    { return m_perspectiveFOV; }
+    float GetPerspectiveAspect() const { return m_perspectiveAspect; }
+    float GetPerspectiveNear() const   { return m_perspectiveNear; }
+    float GetPerspectiveFar() const    { return m_perspectiveFar; }
+
     void SetCameraMode(CameraMode mode);
 
     AABB2 MakePlayerViewport(int numOfPlayers, int playerIndex = 0) const;

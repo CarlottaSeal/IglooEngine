@@ -62,19 +62,25 @@ void GISystem::InitializeDXR(ID3D12Device5* device)
 
 void GISystem::SetDirtyCards(const std::vector<uint32_t>& cardIDs)
 {
-	m_dirtyCards = cardIDs;
-	//m_needsCacheUpdate = !cardIDs.empty();
+	// Merge instead of replace — unprocessed cards from previous frames must not be lost
+	for (uint32_t id : cardIDs)
+	{
+		if (std::find(m_dirtyCards.begin(), m_dirtyCards.end(), id) == m_dirtyCards.end())
+		{
+			m_dirtyCards.push_back(id);
+		}
+	}
 }
 
-void GISystem::RemoveProcessedDirtyCards(size_t count)
+void GISystem::RemoveProcessedDirtyCards(const std::vector<uint32_t>& processedIDs)
 {
-	if (count >= m_dirtyCards.size())
+	for (uint32_t id : processedIDs)
 	{
-		m_dirtyCards.clear();
-	}
-	else
-	{
-		m_dirtyCards.erase(m_dirtyCards.begin(), m_dirtyCards.begin() + count);
+		auto it = std::find(m_dirtyCards.begin(), m_dirtyCards.end(), id);
+		if (it != m_dirtyCards.end())
+		{
+			m_dirtyCards.erase(it);
+		}
 	}
 }
 

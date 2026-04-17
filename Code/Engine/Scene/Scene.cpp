@@ -1,14 +1,25 @@
 ﻿#include "Scene.h"
 
 #include "Object/Mesh/MeshObject.h"
+#include "Object/Light/LightObject.h"
 
 #include "Engine/Core/EngineCommon.hpp"
+#include "Engine/Core/StaticMesh.h"
+#include "Engine/Core/Vertex_PCUTBN.hpp"
 #include "Engine/Math/MathUtils.hpp"
+#include "Engine/Renderer/Camera.hpp"
 #include "Engine/Renderer/SDFTexture3D.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
+#include "Engine/Renderer/Texture.hpp"
 #include "Engine/Renderer/GI/GISystem.h"
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fstream>
 #include <utility>
+
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 
 Scene::Scene(SceneConfig const config)
     : m_config(config)
@@ -91,16 +102,21 @@ void Scene::Update(float deltaTime)
         else if (object->GetType() == OBJECT_LIGHT)
         {
             anyLightMoved = true;
-            m_pointLightShadowDirty = true; // shadows must re-render every frame
+            m_pointLightShadowDirty = true;
 
-            // Expensive GI work (cards + metadata + DirectLightPass) throttled
-            if (m_currentFrame % 10 == 0)
+            // Start an incremental card-scan job if none is running
+            if (!m_cardUpdateJobActive)
             {
                 auto* light = static_cast<LightObject*>(object);
-                m_suppressCaptureDirty = true;
-                light->UpdateAffectedCards();
-                m_suppressCaptureDirty = false;
-                m_pointLightDirty = true;
+                m_cardUpdateJob.light    = light;
+                m_cardUpdateJob.bounds   = light->GetWorldBounds();
+                m_cardUpdateJob.objectIdx = 0;
+                m_cardUpdateJob.newCards.clear();
+                m_cardUpdateJob.objectIDs.clear();
+                m_cardUpdateJob.objectIDs.reserve(m_giRegistry.size());
+                for (auto& [id, _] : m_giRegistry)
+                    m_cardUpdateJob.objectIDs.push_back(id);
+                m_cardUpdateJobActive = true;
             }
 
             object->ClearMoveFlag();
@@ -113,6 +129,68 @@ void Scene::Update(float deltaTime)
     if (anyLightMoved)
     {
         ProduceLightVariables();
+    }
+
+    // Advance incremental card scan: CARD_SCAN_BATCH objects per frame
+    if (m_cardUpdateJobActive)
+    {
+        LightCardUpdateJob& job = m_cardUpdateJob;
+        int end = job.objectIdx + CARD_SCAN_BATCH;
+        if (end > (int)job.objectIDs.size())
+            end = (int)job.objectIDs.size();
+
+        for (int i = job.objectIdx; i < end; ++i)
+        {
+            auto entryIt = m_giRegistry.find(job.objectIDs[i]);
+            if (entryIt == m_giRegistry.end()) continue;
+
+            MeshObject* obj = static_cast<MeshObject*>(GetSceneObject(entryIt->second.m_objectID));
+            if (!obj) continue;
+
+            for (uint32_t cardID : entryIt->second.m_cardIDs)
+            {
+                SurfaceCard* card = GetSurfaceCardByID(cardID);
+                if (!card) continue;
+                CardInstanceData* instance = obj->GetCardInstance(card->m_templateIndex);
+                if (!instance) continue;
+                if (!DoAABBsOverlap3D(job.bounds, ComputeCardWorldBounds(instance, card))) continue;
+
+                if (job.light->GetLightType() == LIGHT_SPOT)
+                {
+                    Vec3 toCard = instance->m_worldOrigin - job.light->m_position;
+                    float dot = DotProduct3D(toCard.GetNormalized(), job.light->m_spotForward);
+                    if (dot < job.light->m_outerDotThresholds) continue;
+                }
+
+                job.newCards.push_back(cardID);
+            }
+        }
+        job.objectIdx = end;
+
+        if (job.objectIdx >= (int)job.objectIDs.size())
+        {
+            // Scan complete — atomically swap old cards for new
+            LightObject* light = job.light;
+            for (uint32_t oldCard : light->m_affectedCards)
+                RemoveLightFromCard(light->m_id, oldCard);
+
+            light->m_affectedCards = job.newCards;
+            for (uint32_t cardID : job.newCards)
+            {
+                SurfaceCard* card = GetSurfaceCardByID(cardID);
+                if (!card) continue;
+                MeshObject* obj = static_cast<MeshObject*>(GetSceneObject(card->m_meshObjectID));
+                if (obj)
+                {
+                    CardInstanceData* instance = obj->GetCardInstance(card->m_templateIndex);
+                    if (instance) instance->m_isDirty = true;
+                }
+                card->m_pendingUpdate = true;
+                m_cardToLightObjects[cardID].push_back(light->m_id);
+            }
+            m_pointLightDirty = true;
+            m_cardUpdateJobActive = false;
+        }
     }
 
     ProcessGIUpdates();
@@ -596,14 +674,17 @@ void Scene::RemoveObjectFromLists(SceneObject* object)
         
     case SceneObjectType::OBJECT_LIGHT:
         {
-            auto lightIt = std::find(m_lightObjects.begin(), m_lightObjects.end(), 
-                                    static_cast<LightObject*>(object));
+            auto* lightObj = static_cast<LightObject*>(object);
+
+            auto lightIt = std::find(m_lightObjects.begin(), m_lightObjects.end(), lightObj);
             if (lightIt != m_lightObjects.end())
             {
                 m_lightObjects.erase(lightIt);
-                
                 ReassignLightIDs();
             }
+
+            if (m_cardUpdateJobActive && m_cardUpdateJob.light == lightObj)
+                m_cardUpdateJobActive = false;
         }
         break;
     }
@@ -1516,4 +1597,176 @@ void Scene::CleanupSurfaceCardsForObject(uint32_t objectID)
 
     DebuggerPrintf("[Scene] Cleaned up %zu SurfaceCards for object %u\n",
                    cards.size(), objectID);
+}
+
+// Emits world-space triangle soup + lights + camera for the CUDA reference
+// path tracer. Triangles are MeshObject.world * StaticMesh.m_transform * raw.
+void Scene::DumpToJSON(const std::string& filePath, const Camera& camera,
+                       int imageWidth, int imageHeight) const
+{
+    std::ofstream f(filePath, std::ios::out);
+    if (!f.is_open())
+    {
+        char errbuf[256] = {0};
+        strerror_s(errbuf, sizeof(errbuf), errno);
+        char cwdbuf[MAX_PATH] = {0};
+        GetCurrentDirectoryA(MAX_PATH, cwdbuf);
+        DebuggerPrintf("[Scene::DumpToJSON] Failed to open '%s' (errno=%d: %s, cwd=%s)\n",
+                       filePath.c_str(), errno, errbuf, cwdbuf);
+        return;
+    }
+    f << std::fixed;
+    f.precision(6);
+
+    f << "{\n";
+    f << "  \"version\": 1,\n";
+
+    // ---- Camera ----
+    Vec3 camPos = camera.GetPosition();
+    Mat44 camToWorld = camera.GetCameraToWorldTransform();
+    const float* cw = camToWorld.GetAsFloatArray();
+    f << "  \"camera\": {\n";
+    f << "    \"pos\": [" << camPos.x << "," << camPos.y << "," << camPos.z << "],\n";
+    f << "    \"camera_to_world\": [";
+    for (int i = 0; i < 16; ++i) { f << cw[i]; if (i < 15) f << ","; }
+    f << "],\n";
+    f << "    \"fov_y_deg\": " << camera.GetPerspectiveFOV() << ",\n";
+    f << "    \"aspect\": " << camera.GetPerspectiveAspect() << ",\n";
+    f << "    \"near\": " << camera.GetPerspectiveNear() << ",\n";
+    f << "    \"far\": " << camera.GetPerspectiveFar() << ",\n";
+    f << "    \"image_width\": " << imageWidth << ",\n";
+    f << "    \"image_height\": " << imageHeight << "\n";
+    f << "  },\n";
+
+    // ---- Sun (scene-level global) ----
+    f << "  \"sun\": {\n";
+    f << "    \"direction\": [" << m_sunDirection.x << "," << m_sunDirection.y << "," << m_sunDirection.z << "],\n";
+    f << "    \"color\": [" << (m_sunColor.r / 255.0f) << "," << (m_sunColor.g / 255.0f) << "," << (m_sunColor.b / 255.0f) << "],\n";
+    f << "    \"intensity\": " << (m_sunColor.a / 255.0f) << "\n";
+    f << "  },\n";
+
+    // ---- Lights (per-object; Scene is friend of LightObject) ----
+    f << "  \"lights\": [\n";
+    for (size_t i = 0; i < m_lightObjects.size(); ++i)
+    {
+        LightObject* L = m_lightObjects[i];
+        f << "    {";
+        if (L->GetLightType() == LIGHT_DIRECTIONAL)
+        {
+            f << "\"type\":\"directional\",";
+            f << "\"direction\":[" << L->m_sunDirection.x << "," << L->m_sunDirection.y << "," << L->m_sunDirection.z << "],";
+            f << "\"color\":[" << (L->m_sunColor.r / 255.f) << "," << (L->m_sunColor.g / 255.f) << "," << (L->m_sunColor.b / 255.f) << "],";
+            f << "\"intensity\":" << (L->m_sunColor.a / 255.f);
+        }
+        else if (L->GetLightType() == LIGHT_POINT)
+        {
+            Vec3 p = L->GetPosition();
+            f << "\"type\":\"point\",";
+            f << "\"pos\":[" << p.x << "," << p.y << "," << p.z << "],";
+            f << "\"color\":[" << (L->m_lightColor.r / 255.f) << "," << (L->m_lightColor.g / 255.f) << "," << (L->m_lightColor.b / 255.f) << "],";
+            f << "\"intensity\":" << (L->m_lightColor.a / 255.f) << ",";
+            f << "\"radius\":" << L->GetOuterRadius();
+        }
+        else
+        {
+            f << "\"type\":\"unsupported\"";
+        }
+        f << "}";
+        if (i + 1 < m_lightObjects.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ],\n";
+
+    // ---- Materials (dedup by diffuse texture pointer; V1 uses constant albedo) ----
+    std::unordered_map<const Texture*, int> texToMat;
+    std::vector<const Texture*>             matTextures;
+    for (MeshObject* obj : m_meshObjects)
+    {
+        const StaticMesh* mesh = obj->GetMesh();
+        if (!mesh) continue;
+        const Texture* tex = mesh->m_diffuseTexture;
+        if (texToMat.find(tex) == texToMat.end())
+        {
+            texToMat[tex] = (int)matTextures.size();
+            matTextures.push_back(tex);
+        }
+    }
+    f << "  \"materials\": [\n";
+    for (size_t i = 0; i < matTextures.size(); ++i)
+    {
+        const Texture* tex = matTextures[i];
+        f << "    {\"albedo\":[0.8,0.8,0.8],\"emissive\":[0,0,0]";
+        if (tex != nullptr)
+        {
+            std::string p = tex->GetImageFilePath();
+            // Escape backslashes for valid JSON
+            std::string esc;
+            esc.reserve(p.size() + 8);
+            for (char c : p)
+            {
+                if (c == '\\' || c == '"') { esc += '\\'; esc += c; }
+                else                       esc += c;
+            }
+            f << ",\"diffuse_tex\":\"" << esc << "\"";
+        }
+        f << "}";
+        if (i + 1 < matTextures.size()) f << ",";
+        f << "\n";
+    }
+    f << "  ],\n";
+
+    // ---- Triangles (flat, world-space) ----
+    // Per MeshObject: world space = MeshObject.worldMatrix * StaticMesh.m_transform * raw vert
+    f << "  \"triangles\": [\n";
+    size_t totalTris = 0;
+    bool   firstTri  = true;
+    for (MeshObject* obj : m_meshObjects)
+    {
+        StaticMesh* mesh = obj->GetMesh();
+        if (!mesh) continue;
+
+        // GetWorldMatrix() on MeshObject already appends m_mesh->m_transform — do NOT re-append.
+        const Mat44& full = obj->GetWorldMatrix();
+
+        const std::vector<Vertex_PCUTBN>& verts = mesh->m_verts;
+        const std::vector<unsigned int>&  idx   = mesh->m_indices;
+        int matIdx = texToMat[mesh->m_diffuseTexture];
+
+        for (size_t k = 0; k + 2 < idx.size(); k += 3)
+        {
+            Vec3 v[3], n[3];
+            Vec2 uv[3];
+            for (int c = 0; c < 3; ++c)
+            {
+                const Vertex_PCUTBN& src = verts[idx[k + c]];
+                v[c]  = full.TransformPosition3D(src.m_position);
+                Vec3 nRaw = full.TransformVectorQuantity3D(src.m_normal);
+                float len = sqrtf(nRaw.x * nRaw.x + nRaw.y * nRaw.y + nRaw.z * nRaw.z);
+                n[c]  = (len > 1e-8f) ? Vec3(nRaw.x / len, nRaw.y / len, nRaw.z / len) : Vec3(0, 0, 1);
+                uv[c] = src.m_uvTexCoords;
+            }
+            if (!firstTri) f << ",\n";
+            firstTri = false;
+            f << "    {\"v\":[["
+              << v[0].x << "," << v[0].y << "," << v[0].z << "],["
+              << v[1].x << "," << v[1].y << "," << v[1].z << "],["
+              << v[2].x << "," << v[2].y << "," << v[2].z << "]],"
+              << "\"n\":[["
+              << n[0].x << "," << n[0].y << "," << n[0].z << "],["
+              << n[1].x << "," << n[1].y << "," << n[1].z << "],["
+              << n[2].x << "," << n[2].y << "," << n[2].z << "]],"
+              << "\"uv\":[["
+              << uv[0].x << "," << uv[0].y << "],["
+              << uv[1].x << "," << uv[1].y << "],["
+              << uv[2].x << "," << uv[2].y << "]],"
+              << "\"mat\":" << matIdx << "}";
+            ++totalTris;
+        }
+    }
+    f << "\n  ]\n";
+    f << "}\n";
+    f.close();
+
+    DebuggerPrintf("[Scene::DumpToJSON] %zu triangles, %zu lights, %zu materials -> %s\n",
+                   totalTris, m_lightObjects.size(), matTextures.size(), filePath.c_str());
 }

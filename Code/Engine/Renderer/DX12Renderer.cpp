@@ -4326,15 +4326,68 @@ void DX12Renderer::UploadCardMetadataToGPU()
                 
 				m_commandList->CopyResource(defaultBuffer, uploadBuffer);
                 
-				TransitionResource(defaultBuffer, 
-					D3D12_RESOURCE_STATE_COPY_DEST, 
+				TransitionResource(defaultBuffer,
+					D3D12_RESOURCE_STATE_COPY_DEST,
 					D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-				TransitionResource(uploadBuffer, 
-				D3D12_RESOURCE_STATE_COPY_SOURCE, 
+				TransitionResource(uploadBuffer,
+				D3D12_RESOURCE_STATE_COPY_SOURCE,
 				D3D12_RESOURCE_STATE_GENERIC_READ);//新增的
 			}
 		}
 	//}
+
+	// Rebuild card index lookup texture.
+	// Maps each atlas tile to the card index that owns it (0xFFFFFFFF = empty).
+	// Only valid after surface cache atlas positions are finalized.
+	if (!m_cardIndexLookupTexture || !m_cardIndexLookupUploadBuffer)
+		return;
+
+	uint32_t tileSize    = m_surfaceCache.m_tileSize;
+	uint32_t atlasSize   = m_surfaceCache.m_atlasSize;
+	uint32_t tilesPerRow = atlasSize / tileSize;
+	uint32_t tileCount   = tilesPerRow * tilesPerRow;
+
+	std::vector<uint32_t> lookupData(tileCount, 0xFFFFFFFF);
+	const auto& cards = m_giSystem->m_cardMetadataCPU;
+	for (uint32_t i = 0; i < (uint32_t)cards.size(); i++)
+	{
+		const SurfaceCardMetadata& meta = cards[i];
+		uint32_t tileX0 = meta.m_atlasX / tileSize;
+		uint32_t tileY0 = meta.m_atlasY / tileSize;
+		uint32_t tileX1 = (meta.m_atlasX + meta.m_resolutionX + tileSize - 1) / tileSize;
+		uint32_t tileY1 = (meta.m_atlasY + meta.m_resolutionY + tileSize - 1) / tileSize;
+		for (uint32_t ty = tileY0; ty < tileY1; ty++)
+			for (uint32_t tx = tileX0; tx < tileX1; tx++)
+				lookupData[ty * tilesPerRow + tx] = i;
+	}
+
+	void* mappedLookup = nullptr;
+	if (SUCCEEDED(m_cardIndexLookupUploadBuffer->Map(0, nullptr, &mappedLookup)))
+	{
+		memcpy(mappedLookup, lookupData.data(), tileCount * sizeof(uint32_t));
+		m_cardIndexLookupUploadBuffer->Unmap(0, nullptr);
+
+		TransitionResource(m_cardIndexLookupTexture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+
+		D3D12_TEXTURE_COPY_LOCATION dst = {};
+		dst.pResource        = m_cardIndexLookupTexture;
+		dst.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst.SubresourceIndex = 0;
+
+		D3D12_TEXTURE_COPY_LOCATION src = {};
+		src.pResource                              = m_cardIndexLookupUploadBuffer;
+		src.Type                                   = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		src.PlacedFootprint.Offset                 = 0;
+		src.PlacedFootprint.Footprint.Format       = DXGI_FORMAT_R32_UINT;
+		src.PlacedFootprint.Footprint.Width        = tilesPerRow;
+		src.PlacedFootprint.Footprint.Height       = tilesPerRow;
+		src.PlacedFootprint.Footprint.Depth        = 1;
+		src.PlacedFootprint.Footprint.RowPitch     = tilesPerRow * sizeof(uint32_t);  // 256 bytes, naturally aligned
+
+		m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+		TransitionResource(m_cardIndexLookupTexture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+	}
 }
 
 void DX12Renderer::CaptureDirtySurfaceCards(uint32_t maxCardsPerFrame)
@@ -4368,7 +4421,7 @@ void DX12Renderer::CaptureDirtySurfaceCards(uint32_t maxCardsPerFrame)
 			FinalizeCardCapture(card);
 		}
 	}
-	m_giSystem->RemoveProcessedDirtyCards(cardsToUpdate.size());
+	m_giSystem->RemoveProcessedDirtyCards(cardsToUpdate);
 }
 
 void DX12Renderer::CaptureSingleCard(MeshObject* object, SurfaceCard* card, CardInstanceData* instance, const SurfaceCardTemplate& templ)
@@ -5139,17 +5192,18 @@ void DX12Renderer::CreateDirectLightUpdateResources()
 	// t0: CardMetadata, t1: SurfaceAtlas, t2: ShadowMap, t3: PointLightShadowMaps
 	// u0: SurfaceAtlasUAV
 
-	CD3DX12_DESCRIPTOR_RANGE1 srvRanges[4];
+	CD3DX12_DESCRIPTOR_RANGE1 srvRanges[5];
 	srvRanges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);  // t0: CardMetadata
 	srvRanges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0,
 		D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE);  // t1: SurfaceAtlas (layer 3 in UAV during dispatch)
 	srvRanges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);  // t2: ShadowMap
 	srvRanges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3);  // t3: PointLightShadowMaps
+	srvRanges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4);  // t4: CardIndexLookup
 
 	CD3DX12_DESCRIPTOR_RANGE1 uavRange;
 	uavRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);  // u0: SurfaceAtlasUAV
 
-	CD3DX12_ROOT_PARAMETER1 rootParams[8];
+	CD3DX12_ROOT_PARAMETER1 rootParams[9];
 	rootParams[0].InitAsConstants(4, 0);                      // b0: DirectLightParams (4 uints)
 	rootParams[1].InitAsConstantBufferView(4);                // b4: GeneralLightConstants
 	rootParams[2].InitAsConstantBufferView(5);                // b5: ShadowConstants
@@ -5158,6 +5212,7 @@ void DX12Renderer::CreateDirectLightUpdateResources()
 	rootParams[5].InitAsDescriptorTable(1, &srvRanges[2]);    // t2
 	rootParams[6].InitAsDescriptorTable(1, &uavRange);        // u0
 	rootParams[7].InitAsDescriptorTable(1, &srvRanges[3]);    // t3: PointLightShadowMaps
+	rootParams[8].InitAsDescriptorTable(1, &srvRanges[4]);    // t4: CardIndexLookup
 
 	CD3DX12_STATIC_SAMPLER_DESC samplers[2];
 	samplers[0].Init(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);  // s0: LinearSampler
@@ -5198,6 +5253,53 @@ void DX12Renderer::CreateDirectLightUpdateResources()
 	hr = m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_directLightUpdatePSO));
 	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create DirectLightUpdate PSO");
 
+	// Card index lookup texture: (atlasSize/tileSize) x (atlasSize/tileSize), R32_UINT
+	// Each texel stores the card index that owns that atlas tile, or 0xFFFFFFFF if empty.
+	// Eliminates the O(n) per-thread card search in the shader.
+	uint32_t atlasSize = m_surfaceCache.m_atlasSize;
+	uint32_t tileSize  = m_surfaceCache.m_tileSize;
+	uint32_t tilesPerRow = atlasSize / tileSize;  // 4096/64 = 64
+
+	D3D12_RESOURCE_DESC lookupTexDesc = {};
+	lookupTexDesc.Dimension          = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	lookupTexDesc.Width              = tilesPerRow;
+	lookupTexDesc.Height             = tilesPerRow;
+	lookupTexDesc.DepthOrArraySize   = 1;
+	lookupTexDesc.MipLevels          = 1;
+	lookupTexDesc.Format             = DXGI_FORMAT_R32_UINT;
+	lookupTexDesc.SampleDesc.Count   = 1;
+	lookupTexDesc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+	lookupTexDesc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+	D3D12_HEAP_PROPERTIES defaultHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+	hr = m_device->CreateCommittedResource(
+		&defaultHeap, D3D12_HEAP_FLAG_NONE,
+		&lookupTexDesc, D3D12_RESOURCE_STATE_COMMON,
+		nullptr, IID_PPV_ARGS(&m_cardIndexLookupTexture));
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create CardIndexLookup texture");
+
+	// Upload buffer: tilesPerRow * tilesPerRow * 4 bytes = 64*64*4 = 16 KB
+	// RowPitch = tilesPerRow * 4 = 256, exactly D3D12_TEXTURE_DATA_PITCH_ALIGNMENT — no padding needed.
+	uint32_t lookupByteSize = tilesPerRow * tilesPerRow * sizeof(uint32_t);
+	D3D12_HEAP_PROPERTIES uploadHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+	D3D12_RESOURCE_DESC uploadBufDesc = CD3DX12_RESOURCE_DESC::Buffer(lookupByteSize);
+	hr = m_device->CreateCommittedResource(
+		&uploadHeap, D3D12_HEAP_FLAG_NONE,
+		&uploadBufDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr, IID_PPV_ARGS(&m_cardIndexLookupUploadBuffer));
+	GUARANTEE_OR_DIE(SUCCEEDED(hr), "Failed to create CardIndexLookup upload buffer");
+
+	// SRV in descriptor heap
+	D3D12_SHADER_RESOURCE_VIEW_DESC lookupSRVDesc = {};
+	lookupSRVDesc.Format                    = DXGI_FORMAT_R32_UINT;
+	lookupSRVDesc.ViewDimension             = D3D12_SRV_DIMENSION_TEXTURE2D;
+	lookupSRVDesc.Shader4ComponentMapping   = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	lookupSRVDesc.Texture2D.MipLevels       = 1;
+	CD3DX12_CPU_DESCRIPTOR_HANDLE lookupSRVHandle(
+		m_cbvSrvDescHeap->GetCPUDescriptorHandleForHeapStart(),
+		CARD_INDEX_LOOKUP_SRV, m_scuDescriptorSize);
+	m_device->CreateShaderResourceView(m_cardIndexLookupTexture, &lookupSRVDesc, lookupSRVHandle);
+
 	DebuggerPrintf("[DX12] DirectLightUpdate resources created\n");
 }
 
@@ -5211,7 +5313,7 @@ void DX12Renderer::UpdateDirectLightPass()
 		return;
 
 	// Transition resources
-	CD3DX12_RESOURCE_BARRIER barriers[4];
+	CD3DX12_RESOURCE_BARRIER barriers[5];
 	barriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_atlasTexture,
 		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		3);  // DirectLight layer (index 3)
@@ -5219,12 +5321,14 @@ void DX12Renderer::UpdateDirectLightPass()
 		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	barriers[2] = CD3DX12_RESOURCE_BARRIER::Transition(m_directionalShadowPass->GetShadowMapTexture(),
 		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-	int barrierCount = 3;
+	barriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_cardIndexLookupTexture,
+		D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	int barrierCount = 4;
 	if (m_pointLightShadowPass->GetCubeArrayTexture())
 	{
-		barriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
+		barriers[4] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
 			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-		barrierCount = 4;
+		barrierCount = 5;
 	}
 	m_commandList->ResourceBarrier(barrierCount, barriers);
 
@@ -5272,25 +5376,32 @@ void DX12Renderer::UpdateDirectLightPass()
 		POINT_SHADOW_CUBE_ARRAY_SRV, m_scuDescriptorSize);
 	m_commandList->SetComputeRootDescriptorTable(7, pointShadowSRV);
 
+	// Root 8: CardIndexLookup (t4)
+	CD3DX12_GPU_DESCRIPTOR_HANDLE cardLookupSRV(m_cbvSrvDescHeap->GetGPUDescriptorHandleForHeapStart(),
+		CARD_INDEX_LOOKUP_SRV, m_scuDescriptorSize);
+	m_commandList->SetComputeRootDescriptorTable(8, cardLookupSRV);
+
 	// Dispatch: cover entire atlas, 8x8 threads per group
 	uint32_t groupsX = (atlasSize + 7) / 8;
 	uint32_t groupsY = (atlasSize + 7) / 8;
 	m_commandList->Dispatch(groupsX, groupsY, 1);
 
 	// Transition back
-	CD3DX12_RESOURCE_BARRIER postBarriers[4];
+	CD3DX12_RESOURCE_BARRIER postBarriers[5];
 	postBarriers[0] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_atlasTexture,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, 3);
 	postBarriers[1] = CD3DX12_RESOURCE_BARRIER::Transition(m_surfaceCache.m_cardMetadataBuffer,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
 	postBarriers[2] = CD3DX12_RESOURCE_BARRIER::Transition(m_directionalShadowPass->GetShadowMapTexture(),
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-	int postBarrierCount = 3;
+	postBarriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_cardIndexLookupTexture,
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+	int postBarrierCount = 4;
 	if (m_pointLightShadowPass->GetCubeArrayTexture())
 	{
-		postBarriers[3] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
+		postBarriers[4] = CD3DX12_RESOURCE_BARRIER::Transition(m_pointLightShadowPass->GetCubeArrayTexture(),
 			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-		postBarrierCount = 4;
+		postBarrierCount = 5;
 	}
 	m_commandList->ResourceBarrier(postBarrierCount, postBarriers);
 
@@ -5301,6 +5412,8 @@ void DX12Renderer::ShutdownDirectLightUpdatePass()
 {
 	DX_SAFE_RELEASE(m_directLightUpdatePSO);
 	DX_SAFE_RELEASE(m_directLightUpdateRootSignature);
+	DX_SAFE_RELEASE(m_cardIndexLookupTexture);
+	DX_SAFE_RELEASE(m_cardIndexLookupUploadBuffer);
 }
 
 void DX12Renderer::CreateScreenProbeGatherResources()
@@ -5761,7 +5874,7 @@ void DX12Renderer::ImGuiStartUp()
 
 	D3D12_DESCRIPTOR_HEAP_DESC imGuiSRVDescHeap = {};
 	imGuiSRVDescHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	imGuiSRVDescHeap.NumDescriptors = 1 + 16; // 1 font + 16 layer thumbnails
+	imGuiSRVDescHeap.NumDescriptors = 1 + 16 + 1; // 1 font + 16 layer thumbnails + 1 navigator composite
 	imGuiSRVDescHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	imGuiSRVDescHeap.NodeMask = 0;
 

@@ -42,7 +42,7 @@ public:
     
     void SetDirtyCards(const std::vector<uint32_t>& cardIDs);
     const std::vector<uint32_t>& GetDirtyCards() const { return m_dirtyCards; }
-    void RemoveProcessedDirtyCards(size_t count);
+    void RemoveProcessedDirtyCards(const std::vector<uint32_t>& processedIDs);
     void MarkAllCardsDirty();
 
     std::vector<uint32_t> BuildUpdateList(uint32_t maxCardsPerFrame);

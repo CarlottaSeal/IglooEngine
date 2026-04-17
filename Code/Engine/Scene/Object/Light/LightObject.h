@@ -34,6 +34,7 @@ public:
     LightObjectType GetLightType() const { return m_lightType; }
     int GetGeneralLightID() const { return m_generalLightID; }
     float GetOuterRadius() const { return m_outerRadius; }
+    int GetAffectedCardCount() const { return (int)m_affectedCards.size(); }
     
 protected:
     virtual void OnTransformChanged() override;

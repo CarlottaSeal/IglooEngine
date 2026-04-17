@@ -84,6 +84,10 @@ public:
     std::vector<MeshObject*> GetVisibleMeshes(const Camera& camera);
     const GIObjectEntry* GetGIEntry(uint32_t objectID) const;
 
+    // Dump full scene (triangles in world space + lights + camera) to a JSON file.
+    // Consumed by LuminaGI-CudaRef (CUDA reference path tracer) for validation.
+    void DumpToJSON(const std::string& filePath, const Camera& camera, int imageWidth, int imageHeight) const;
+
     void ProduceLightVariables();
     void ReassignLightIDs();
     void SetLightConstants() const;
@@ -151,6 +155,17 @@ public:
     bool m_pointLightDirty = false;  // dirty flag for point light changes (triggers UpdateDirectLightPass)
     bool m_pointLightShadowDirty = false; // per-frame: shadow maps must track moving lights
     bool m_suppressCaptureDirty = false; // internal: suppress adding to m_dirtyCardIDs during light updates
+
+    struct LightCardUpdateJob {
+        LightObject*          light     = nullptr;
+        AABB3                 bounds;            // frozen at job start
+        std::vector<uint32_t> objectIDs;         // GI object ID snapshot
+        int                   objectIdx = 0;
+        std::vector<uint32_t> newCards;
+    };
+    LightCardUpdateJob   m_cardUpdateJob;
+    bool                 m_cardUpdateJobActive = false;
+    static constexpr int CARD_SCAN_BATCH = 5;   // GI objects per frame
 
     void SetSunDirection(const Vec3& dir) { m_sunDirection = dir; m_sunDirectionDirty = true; }
     int m_numLights = 0;

@@ -15,7 +15,12 @@
 
 #ifdef ENGINE_DX12_RENDERER
 #include "Engine/Renderer/DX12Renderer.hpp"
+#include "Engine/Scene/Scene.h"
+#include "Engine/Window/Window.hpp"
+#include "Engine/Math/IntVec2.hpp"
 extern Renderer* g_theRenderer;
+extern Scene*    g_theScene;
+extern Window*   g_theWindow;
 #endif
 
 //--------------------------------------------------------------
@@ -151,7 +156,17 @@ void AutomatedTestingEndFrame()
 			CreateDirectoryA(s_screenshotDir.c_str(), NULL);
 
 			std::string filePath = s_screenshotDir + "/screenshot.png";
-			g_theRenderer->GetSubRenderer()->CaptureScreenshot(filePath);
+			DX12Renderer* sub = g_theRenderer->GetSubRenderer();
+			sub->CaptureScreenshot(filePath);
+
+			// Also dump scene JSON alongside for LuminaGI-CudaRef validation
+			if (g_theScene && g_theWindow)
+			{
+				std::string jsonPath = s_screenshotDir + "/screenshot.json";
+				IntVec2 dim = g_theWindow->GetClientDimensions();
+				g_theScene->DumpToJSON(jsonPath, sub->GetCurrentCamera(), dim.x, dim.y);
+			}
+
 			s_screenshotTaken = true;
 
 			// If no benchmark mode, quit after screenshot

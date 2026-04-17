@@ -400,8 +400,11 @@ static constexpr int SCREEN_INDIRECT_RAW_SRV = SCREEN_INDIRECT_RAW_UAV + 1;  // 
 // Point Light Cube Shadow Array SRV
 static constexpr int POINT_SHADOW_CUBE_ARRAY_SRV = SCREEN_INDIRECT_RAW_SRV + 1;  // 435
 
+// Card index lookup texture (tile-granularity atlas → card index map)
+static constexpr int CARD_INDEX_LOOKUP_SRV = POINT_SHADOW_CUBE_ARRAY_SRV + 1;  // 436
+
 // Instance data uses root SRV (no descriptor needed)
-static constexpr int TOTAL_NUM_DESCRIPTORS = POINT_SHADOW_CUBE_ARRAY_SRV + 1;  // 436
+static constexpr int TOTAL_NUM_DESCRIPTORS = CARD_INDEX_LOOKUP_SRV + 1;  // 437
 
 // Shader Register Bindings (for Root Signature)
 static constexpr int GBUFFER_SRV_START = MAX_TEXTURE_COUNT;  // shader registers: t200, t201, t202, 203 204 <-其实没必要
