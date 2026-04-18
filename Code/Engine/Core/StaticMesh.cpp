@@ -12,6 +12,9 @@
 #include "Engine/Renderer/SDFTexture3D.h"
 #include "Engine/Renderer/Cache/SurfaceCard.h"
 
+// stb_image_write is already implemented in DX12Renderer.cpp; include only (no define here).
+#include "ThirdParty/stb/stb_image_write.h"
+
 StaticMesh::StaticMesh()
 	: m_filePath("")
 	, m_normalTexture(nullptr)
@@ -116,10 +119,22 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
 
     if (EndsWith(m_filePath, ".glb"))
     {
+        // Helper: save the in-memory Image to <stem>_<kind>.png on disk so that
+        // downstream tools (e.g. LuminaGI-CudaRef) can load the texture by path.
+        auto saveGLBTexturePNG = [](Image* img, const std::string& path)
+        {
+            if (!img) return;
+            IntVec2 dim = img->GetDimensions();
+            if (dim.x <= 0 || dim.y <= 0) return;
+            stbi_write_png(path.c_str(), dim.x, dim.y, 4, img->GetRawData(), dim.x * 4);
+        };
+
         Image* diffuseI = LoadImageDueToGLTFData(LoadGLTFDataFromFile(m_filePath), GLBChannel::Albedo, m_filePath);
         if (diffuseI)
         {
-            diffuseI->SetName(xmlPathNoExtensions + "_diffuse");
+            std::string diffusePath = xmlPathNoExtensions + "_diffuse.png";
+            saveGLBTexturePNG(diffuseI, diffusePath);
+            diffuseI->SetName(diffusePath);
             m_diffuseTexture = renderer->CreateTextureFromImage(*diffuseI);
 #ifdef ENGINE_DX12_RENDERER
 			renderer->GetSubRenderer()->PushBackNewTextureManually(m_diffuseTexture);
@@ -128,7 +143,9 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
         Image* normalI = LoadImageDueToGLTFData(LoadGLTFDataFromFile(m_filePath), GLBChannel::Normal, m_filePath);
         if (normalI)
         {
-            normalI->SetName(xmlPathNoExtensions + "_normal");
+            std::string normalPath = xmlPathNoExtensions + "_normal.png";
+            saveGLBTexturePNG(normalI, normalPath);
+            normalI->SetName(normalPath);
             m_normalTexture = renderer->CreateTextureFromImage(*normalI);
 #ifdef ENGINE_DX12_RENDERER
 			renderer->GetSubRenderer()->PushBackNewTextureManually(m_normalTexture);
@@ -137,7 +154,9 @@ StaticMesh::StaticMesh(Renderer* renderer, std::string const& xmlPathNoExtension
         Image* specI = LoadImageDueToGLTFData(LoadGLTFDataFromFile(m_filePath), GLBChannel::AO, m_filePath);
         if (specI)
         {
-            specI->SetName(xmlPathNoExtensions + "_ao");
+            std::string specPath = xmlPathNoExtensions + "_ao.png";
+            saveGLBTexturePNG(specI, specPath);
+            specI->SetName(specPath);
             m_specularTexture = renderer->CreateTextureFromImage(*specI);
 #ifdef ENGINE_DX12_RENDERER
 			renderer->GetSubRenderer()->PushBackNewTextureManually(m_specularTexture);

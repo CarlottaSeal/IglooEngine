@@ -194,7 +194,7 @@ void BitmapFont::AddVertsForTextInBox2D(std::vector<Vertex_PCU>& vertexArray, st
 			if (glyphIndex < 0 || glyphIndex >= m_fontGlyphsSpriteSheet.GetNumSprites())
 				continue;
 
-			float aspect = m_isProportional ? m_glyphAspects[glyphIndex] : cellAspectScale * scale;
+			//float aspect = m_isProportional ? m_glyphAspects[glyphIndex] : cellAspectScale * scale;
 			float glyphWidth = m_isProportional ? lineHeight * m_glyphAspects[glyphIndex] : cellHeight * cellAspectScale * scale;
 
 			AABB2 glyphUVs = m_fontGlyphsSpriteSheet.GetSpriteUVs(glyphIndex);

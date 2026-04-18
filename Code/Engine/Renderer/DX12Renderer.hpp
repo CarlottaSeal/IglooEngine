@@ -472,6 +472,7 @@ protected:
 	SurfaceRadiosity* m_surfaceRadiosity = nullptr;
 	int m_radiositySettleFrames = 0;
 	bool m_radiosityConverged = false;
+	bool m_radiosityLightingDirty = false;
 
 	// DirectLight Update Pass
 	ID3D12PipelineState* m_directLightUpdatePSO = nullptr;

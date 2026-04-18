@@ -1511,7 +1511,8 @@ Texture* DX12Renderer::CreateTextureFromImage(Image const& image)
 {
 	Texture* newTexture = new Texture();
 	newTexture->m_dimensions = image.GetDimensions();
-	
+	newTexture->m_name = image.GetImageFilePath(); // so GetImageFilePath() on the texture returns the source path
+
 	newTexture->m_textureDescIndex = (int)m_loadedTextures.size();
 
 	GUARANTEE_OR_DIE(newTexture->m_textureDescIndex < 200, Stringf("Cannot create more than %d textures!", 200));
@@ -4143,6 +4144,7 @@ void DX12Renderer::BeginCardCapturePass()
 	// Check dirty flag for sun direction change - must be before dirtyCards check
 	if (m_giSystem->m_scene->m_sunDirectionDirty)
 	{
+		m_radiosityLightingDirty = true;
 		m_giSystem->m_scene->m_sunDirectionDirty = false;
 		DebuggerPrintf("[Sun] Direction changed, updating ShadowMap and DirectLight\n");
 		m_directionalShadowPass->Execute(m_commandList, m_constantBuffers[k_shadowConstantsSlot],
@@ -4171,6 +4173,7 @@ void DX12Renderer::BeginCardCapturePass()
 	// (shadow maps already handled above, every frame)
 	if (m_giSystem->m_scene->m_pointLightDirty)
 	{
+		m_radiosityLightingDirty = true;
 		m_giSystem->m_scene->m_pointLightDirty = false;
 
 		m_giSystem->UpdateCardMetadata();
@@ -5100,26 +5103,28 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
 	if (!m_surfaceRadiosity)
         return;
 
-	// Skip radiosity trace when lighting is unchanged
-	Scene* scene = m_giSystem->m_scene;
-	bool lightingDirty = scene->m_sunDirectionDirty || scene->m_pointLightDirty || !scene->m_dirtyCardIDs.empty();
-	if (!lightingDirty && m_radiosityConverged)
-		return;
-
-	// Allow a few extra frames after last change to let temporal accumulation converge
-	if (!lightingDirty)
-	{
-		m_radiositySettleFrames++;
-		if (m_radiositySettleFrames > 30)
-		{
-			m_radiosityConverged = true;
-			return;
-		}
-	}
-	else
+	// Consume dirty flag; reset convergence when lighting changes
+	if (m_radiosityLightingDirty)
 	{
 		m_radiositySettleFrames = 0;
 		m_radiosityConverged = false;
+		m_radiosityLightingDirty = false;
+	}
+
+	if (m_radiosityConverged)
+		return;
+
+	m_radiositySettleFrames++;
+
+	// Only dispatch every 10th frame to amortize cost
+	if (m_radiositySettleFrames % 10 != 0)
+		return;
+
+	// Converge after 30 dispatches (300 frames) without new dirty
+	if (m_radiositySettleFrames > 300)
+	{
+		m_radiosityConverged = true;
+		return;
 	}
 	CD3DX12_RESOURCE_BARRIER preRadiosityBarriers[] = {
 		CD3DX12_RESOURCE_BARRIER::Transition(m_globalSDFTexture,
@@ -5144,10 +5149,10 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
     constants.TraceMaxDistance = RadiosityConfig::TRACE_DISTANCE;       // 200.0
     constants.TraceMaxSteps = RadiosityConfig::TRACE_MAX_STEPS;         // 64
 
-    constants.TraceHitThreshold = 0.02f;
-    constants.RayBias = 0.5f;
+    constants.TraceHitThreshold = 0.15f;
+    constants.RayBias = 0.3f;
     constants.TemporalBlendFactor = RadiosityConfig::TEMPORAL_BLEND;    // 0.05
-    constants.SkyIntensity = 0.3f;
+    constants.SkyIntensity = 0.05f;
     // Global SDF 信息
     AABB3 sceneBounds = m_giSystem->m_scene->m_sceneBounds;
     Vec3 sceneCenter = (sceneBounds.m_maxs + sceneBounds.m_mins) * 0.5f;
