@@ -731,7 +731,7 @@ void VulkanRenderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
     unsigned int pcutbnByteOffset =
         m_immediateVBOForVertex_PCUTBN->AppendDataVulkan(verts, numVerts * sizeof(Vertex_PCUTBN));
 
-    VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
+    VkCommandBuffer cmd = GetCurrentDrawCmd();
 
     // Bind PCUTBN pipeline (or the deferred override if active)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1711,7 +1711,7 @@ void VulkanRenderer::BindVertexBuffer(VertexBuffer* vbo)
         return;
     }
 
-    VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
+    VkCommandBuffer cmd = GetCurrentDrawCmd();
     VkBuffer vertexBuffers[] = { vbo->m_vkBuffer };
     VkDeviceSize offsets[] = { 0 };
     vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
@@ -1731,7 +1731,7 @@ void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCoun
     // Bind the default pipeline if available
     if (m_graphicsPipeline != VK_NULL_HANDLE)
     {
-        VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
+        VkCommandBuffer cmd = GetCurrentDrawCmd();
 
         // Bind pipeline (or deferred PCU override)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1884,7 +1884,7 @@ void VulkanRenderer::BindIndexBuffer(IndexBuffer* ibo)
         return;
     }
 
-    VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
+    VkCommandBuffer cmd = GetCurrentDrawCmd();
     vkCmdBindIndexBuffer(cmd, ibo->m_vkBuffer, 0, VK_INDEX_TYPE_UINT32);
 }
 
@@ -1905,7 +1905,7 @@ void VulkanRenderer::DrawIndexBuffer(VertexBuffer* vbo, IndexBuffer* ibo, unsign
 
     if (pipelineToUse != VK_NULL_HANDLE)
     {
-        VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
+        VkCommandBuffer cmd = GetCurrentDrawCmd();
 
         // Bind pipeline
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineToUse);

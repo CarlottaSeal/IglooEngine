@@ -32,6 +32,7 @@ void VulkanDeferredPath::Init(VulkanRenderer* renderer)
     CreatePipelines();
     CreateQueryPool();
     CreatePerSwapResources();
+    CreateThreadResources();
 
     DebuggerPrintf("VulkanDeferredPath: initialized (%ux%u, %zu swap images, timestampPeriod=%.2f ns)\n",
         m_width, m_height, m_perSwap.size(), m_timestampPeriodNs);
@@ -42,6 +43,7 @@ void VulkanDeferredPath::Shutdown()
     if (!m_device) return;
     vkDeviceWaitIdle(m_device);
 
+    DestroyThreadResources();
     DestroyPerSwapResources();
 
     if (m_overlayPipeline)         vkDestroyPipeline(m_device, m_overlayPipeline, nullptr);
@@ -1142,17 +1144,54 @@ void VulkanDeferredPath::BeginGBuffer(VkCommandBuffer cmd, uint32_t swapImageIdx
     clears[3].color = { {0.05f, 0.05f, 0.07f, 1.0f} };
     rp.clearValueCount = 4; rp.pClearValues = clears;
 
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    const VkSubpassContents subpass0Contents = m_multithreadingEnabled
+        ? VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS
+        : VK_SUBPASS_CONTENTS_INLINE;
+    vkCmdBeginRenderPass(cmd, &rp, subpass0Contents);
 
     m_renderer->m_isRenderPassActive = true;
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gbufferPipeline);
+    if (m_multithreadingEnabled)
+    {
+        // Open the main-thread secondary, bind the gbuffer pipeline on it, redirect
+        // engine API draws into it via SetActiveRecordingTarget. Worker secondaries
+        // (threads 1..N-1) are opened by the caller via BeginThreadSecondary.
+        VkCommandBuffer mainSec = BeginThreadSecondary(0, swapImageIdx);
+        vkCmdBindPipeline(mainSec, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gbufferPipeline);
+        m_renderer->SetActiveRecordingTarget(mainSec);
+    }
+    else
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_gbufferPipeline);
+    }
     m_renderer->SetPipelineOverride(m_gbufferPipeline, m_gbufferPipelinePCUTBN);
 }
 
 void VulkanDeferredPath::EndGBufferAndRunLighting(VkCommandBuffer cmd, const DeferredLightConstants& lights)
 {
     const uint32_t base = (uint32_t)(m_renderer->m_currentFrame * 5);
+
+    if (m_multithreadingEnabled)
+    {
+        // End main secondary, restore primary as draw target, gather all secondaries
+        // recorded by the caller (main + workers), execute them in subpass 0.
+        m_renderer->SetActiveRecordingTarget(VK_NULL_HANDLE);
+        EndThreadSecondary(0);
+        const int f = (int)m_renderer->m_currentFrame;
+        VkCommandBuffer secondaries[kNumThreads];
+        int secCount = 0;
+        for (int t = 0; t < kNumThreads; ++t)
+        {
+            if (m_threads[t].begunThisFrame)
+            {
+                secondaries[secCount++] = m_threads[t].secondary[f];
+                m_threads[t].begunThisFrame = false;
+            }
+        }
+        if (secCount > 0)
+            vkCmdExecuteCommands(cmd, (uint32_t)secCount, secondaries);
+    }
+
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_queryPool, base + 1);
 
     m_renderer->SetPipelineOverride(VK_NULL_HANDLE, VK_NULL_HANDLE);
@@ -1272,6 +1311,118 @@ bool VulkanDeferredPath::TryGetLastFrameTimings(double& outGBufferMs, double& ou
     outGBufferMs  = m_lastGbufMs;
     outLightingMs = m_lastLightMs;
     return true;
+}
+
+void VulkanDeferredPath::CreateThreadResources()
+{
+    QueueFamilyIndices qfi = m_renderer->FindQueueFamilies(m_renderer->m_physicalDevice);
+    for (int t = 0; t < kNumThreads; ++t)
+    {
+        for (int f = 0; f < 2; ++f)
+        {
+            VkCommandPoolCreateInfo pci{};
+            pci.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            pci.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            pci.queueFamilyIndex = qfi.graphicsFamily.value();
+            if (vkCreateCommandPool(m_device, &pci, nullptr, &m_threads[t].pool[f]) != VK_SUCCESS)
+                ERROR_AND_DIE("VulkanDeferredPath: thread cmd pool creation failed");
+
+            VkCommandBufferAllocateInfo abi{};
+            abi.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            abi.commandPool        = m_threads[t].pool[f];
+            abi.level              = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+            abi.commandBufferCount = 1;
+            if (vkAllocateCommandBuffers(m_device, &abi, &m_threads[t].secondary[f]) != VK_SUCCESS)
+                ERROR_AND_DIE("VulkanDeferredPath: thread secondary alloc failed");
+        }
+    }
+}
+
+void VulkanDeferredPath::DestroyThreadResources()
+{
+    for (int t = 0; t < kNumThreads; ++t)
+    {
+        for (int f = 0; f < 2; ++f)
+        {
+            if (m_threads[t].pool[f]) vkDestroyCommandPool(m_device, m_threads[t].pool[f], nullptr);
+            m_threads[t].pool[f]      = VK_NULL_HANDLE;
+            m_threads[t].secondary[f] = VK_NULL_HANDLE;
+        }
+    }
+}
+
+VkCommandBuffer VulkanDeferredPath::BeginThreadSecondary(int threadIdx, uint32_t swapImageIdx)
+{
+    if (threadIdx < 0 || threadIdx >= kNumThreads)
+        ERROR_AND_DIE("VulkanDeferredPath::BeginThreadSecondary: bad threadIdx");
+    if (swapImageIdx >= m_perSwap.size())
+        ERROR_AND_DIE("VulkanDeferredPath::BeginThreadSecondary: swap idx out of range");
+
+    const int f = (int)m_renderer->m_currentFrame;
+    PerThread& tr = m_threads[threadIdx];
+
+    // Reset is safe: this slot's last submission has GPU-completed (engine waited the
+    // fence at frame start), so any cmd buffer recorded into this pool is no longer in use.
+    vkResetCommandPool(m_device, tr.pool[f], 0);
+
+    VkCommandBufferInheritanceInfo inh{};
+    inh.sType       = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    inh.renderPass  = m_deferredRenderPass;
+    inh.subpass     = 0;
+    inh.framebuffer = m_perSwap[swapImageIdx].framebuffer;
+
+    VkCommandBufferBeginInfo bi{};
+    bi.sType            = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags            = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT
+                        | VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    bi.pInheritanceInfo = &inh;
+
+    if (vkBeginCommandBuffer(tr.secondary[f], &bi) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanDeferredPath: secondary vkBeginCommandBuffer failed");
+    tr.begunThisFrame = true;
+
+    // Viewport / scissor are dynamic state per-cmd-buffer; explicitly set on the secondary
+    // (don't inherit from primary).
+    VkViewport vp{};
+    vp.x = 0.0f; vp.y = (float)m_height;
+    vp.width = (float)m_width; vp.height = -(float)m_height;
+    vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    vkCmdSetViewport(tr.secondary[f], 0, 1, &vp);
+    VkRect2D sc{ {0,0}, { m_width, m_height } };
+    vkCmdSetScissor(tr.secondary[f], 0, 1, &sc);
+
+    return tr.secondary[f];
+}
+
+void VulkanDeferredPath::EndThreadSecondary(int threadIdx)
+{
+    const int f = (int)m_renderer->m_currentFrame;
+    if (vkEndCommandBuffer(m_threads[threadIdx].secondary[f]) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanDeferredPath: secondary vkEndCommandBuffer failed");
+}
+
+void VulkanDeferredPath::RecordPreparedDraws(VkCommandBuffer secondary, const PreparedDraw* draws, int count)
+{
+    if (count <= 0) return;
+
+    // Pipeline is the same across all draws in this batch (chess pieces all PCUTBN).
+    vkCmdBindPipeline(secondary, VK_PIPELINE_BIND_POINT_GRAPHICS, draws[0].pipeline);
+    VkPipelineLayout layout = m_renderer->GetMainPipelineLayout();
+    VkDescriptorSet  set0   = m_renderer->GetCurrentSet0();
+
+    const VkDeviceSize zeroOffset = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        const PreparedDraw& d = draws[i];
+        const uint32_t dynOffsets[2] = { d.cameraDynamicOffset, d.modelDynamicOffset };
+        vkCmdBindDescriptorSets(secondary, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+            0, 1, &set0, 2, dynOffsets);
+        vkCmdPushConstants(secondary, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(VulkanRenderer::VkMaterialPC), &d.material);
+        vkCmdBindVertexBuffers(secondary, 0, 1, &d.vbo, &zeroOffset);
+        vkCmdBindIndexBuffer(secondary, d.ibo, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(secondary, d.indexCount, 1, 0, 0, 0);
+    }
 }
 
 #endif // ENGINE_VULKAN_RENDERER

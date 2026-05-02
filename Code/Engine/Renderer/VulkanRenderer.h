@@ -67,6 +67,16 @@ class VulkanRenderer
     friend class VulkanDeferredPath;
 
 public:
+    // Per-draw 16-byte material struct (matches DX12's MaterialConstants CB layout).
+    // Pushed via push constant; carries diffuse / normal / spec bindless atlas slot ids.
+    struct VkMaterialPC
+    {
+        int   DiffuseId  = 0;
+        int   NormalId   = 1;
+        int   SpecularId = 2;
+        float _pad       = 0.0f;
+    };
+
     VulkanRenderer(RendererConfig config);
     ~VulkanRenderer();
 
@@ -169,6 +179,14 @@ public:
     VkCommandBuffer GetCurrentCommandBuffer() const;
     VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
     uint32_t GetCurrentSwapImageIndex() const { return m_imageIndex; }
+
+    // Accessors for parallel command-buffer recording — workers capture state on the
+    // main thread and replay raw vkCmd* calls into per-thread secondaries.
+    uint32_t         GetCurrentCameraDynamicOffset() const { return m_currentCameraDynamicOffset; }
+    uint32_t         GetCurrentModelDynamicOffset()  const { return m_currentModelDynamicOffset; }
+    VkMaterialPC     GetCurrentMaterial()            const { return m_currentMaterial; }
+    VkDescriptorSet  GetCurrentSet0()                const { return m_descriptorSets[m_currentFrame]; }
+    VkPipelineLayout GetMainPipelineLayout()         const { return m_pipelineLayout; }
 
     // While set, subsequent draws of the matching vertex type use these pipelines
     // instead of m_graphicsPipeline / m_graphicsPipelinePCUTBN. layoutOverride, if
@@ -310,17 +328,6 @@ private:
     static constexpr uint32_t kCameraRingBufferSize = 64 * 1024;
     static constexpr uint32_t kModelRingBufferSize  = 64 * 1024;
 
-    // Bindless texture atlas: every Texture created on the Vulkan side gets a unique
-    // index into a 256-slot sampled-image array at descriptor binding 1. Per draw a
-    // 16-byte struct carries diffuse / normal / spec slot indices (matches DX12's
-    // MaterialConstants CB layout — declared locally to avoid include-chain coupling).
-    struct VkMaterialPC
-    {
-        int   DiffuseId  = 0;
-        int   NormalId   = 1;
-        int   SpecularId = 2;
-        float _pad       = 0.0f;
-    };
     static constexpr uint32_t kMaxBindlessTextures = 256;
     uint32_t     m_nextBindlessIndex = 0;
     VkMaterialPC m_currentMaterial   = {};
@@ -423,6 +430,21 @@ private:
     VkPipeline       m_pipelineOverridePCU    = VK_NULL_HANDLE;
     VkPipeline       m_pipelineOverridePCUTBN = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayoutOverride = VK_NULL_HANDLE;
+
+    // When non-null, draw-path vkCmd* calls record into this command buffer instead of
+    // the frame's primary. Lets VulkanDeferredPath redirect a subpass's draws into a
+    // secondary cmd buffer for vkCmdExecuteCommands / multithreaded recording.
+    // Render-pass-control commands (Begin/Next/EndRenderPass) always stay on the primary.
+    VkCommandBuffer  m_activeRecordingTarget  = VK_NULL_HANDLE;
+public:
+    void SetActiveRecordingTarget(VkCommandBuffer cmd) { m_activeRecordingTarget = cmd; }
+    VkCommandBuffer GetCurrentDrawCmd() const
+    {
+        return m_activeRecordingTarget != VK_NULL_HANDLE
+            ? m_activeRecordingTarget
+            : m_frameData[m_currentFrame].commandBuffer;
+    }
+private:
 };
 
 #endif // ENGINE_VULKAN_RENDERER

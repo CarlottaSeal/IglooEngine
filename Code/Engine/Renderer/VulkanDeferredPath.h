@@ -5,8 +5,7 @@
 #ifdef ENGINE_VULKAN_RENDERER
 #include <vulkan/vulkan.h>
 #include <vector>
-
-class VulkanRenderer;
+#include "Engine/Renderer/VulkanRenderer.h"
 
 // 8-point-light constants for the deferred lighting subpass. Binding: set 1, binding 3.
 struct DeferredPointLight
@@ -34,6 +33,33 @@ public:
 
     void BeginGBuffer(VkCommandBuffer cmd, uint32_t swapImageIdx);
     void EndGBufferAndRunLighting(VkCommandBuffer cmd, const DeferredLightConstants& lights);
+
+    // Multithreaded subpass-0 recording. When enabled, BeginGBuffer opens subpass 0 with
+    // SECONDARY contents and the caller drives recording via the per-thread secondaries:
+    //   thread 0 = main (engine-API draws via SetActiveRecordingTarget override)
+    //   thread 1..N-1 = worker threads (raw Vulkan recording)
+    // EndGBufferAndRunLighting then calls vkCmdExecuteCommands on the primary.
+    static constexpr int kNumThreads = 3; // 1 main + 2 workers
+    void SetMultithreadingEnabled(bool on) { m_multithreadingEnabled = on; }
+    bool IsMultithreadingEnabled() const   { return m_multithreadingEnabled; }
+    VkCommandBuffer BeginThreadSecondary(int threadIdx, uint32_t swapImageIdx);
+    void            EndThreadSecondary(int threadIdx);
+
+    // Pre-staged draw for worker-thread playback. Main thread captures all the per-draw
+    // state (model UBO offset, material indices, pipeline) at prepare time; worker
+    // threads replay vkCmd* sequences into their secondary cmd buffers using only this struct.
+    struct PreparedDraw
+    {
+        VkPipeline     pipeline           = VK_NULL_HANDLE;
+        VkBuffer       vbo                = VK_NULL_HANDLE;
+        VkBuffer       ibo                = VK_NULL_HANDLE;
+        uint32_t       indexCount         = 0;
+        uint32_t       cameraDynamicOffset = 0;
+        uint32_t       modelDynamicOffset  = 0;
+        VulkanRenderer::VkMaterialPC material;
+    };
+    void RecordPreparedDraws(VkCommandBuffer secondary, const PreparedDraw* draws, int count);
+    VkPipeline GetGBufferPCUTBNPipeline() const { return m_gbufferPipelinePCUTBN; }
 
     // Forward A/B path: a single-pass equivalent that evaluates the same Blinn-Phong
     // lighting per fragment with no G-buffer. Used to compare bandwidth / perf cost.
@@ -97,6 +123,19 @@ private:
     VkPipeline       m_forwardPipeline             = VK_NULL_HANDLE;
     VkPipeline       m_forwardPipelinePCUTBN       = VK_NULL_HANDLE;
     VkPipeline       m_overlayPipeline             = VK_NULL_HANDLE;
+
+    // Per-thread secondary cmd buffer + pool, doubled for in-flight frame slots so
+    // a slot's pool can be reset only after its last submission has GPU-completed.
+    struct PerThread
+    {
+        VkCommandPool   pool[2]      = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        VkCommandBuffer secondary[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+        bool            begunThisFrame = false;
+    };
+    PerThread m_threads[kNumThreads];
+    bool      m_multithreadingEnabled = false;
+    void CreateThreadResources();
+    void DestroyThreadResources();
 
     // Timestamp pool: 5 queries per in-flight frame slot.
     //   [0] top-of-pipe, [1] end-gbuffer, [2] end-lighting, [3] forward-start, [4] forward-end.

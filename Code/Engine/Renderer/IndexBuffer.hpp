@@ -47,6 +47,9 @@ public:
 
 	unsigned int GetSize();
 	unsigned int GetStride();
+#ifdef ENGINE_VULKAN_RENDERER
+	VkBuffer GetVkBuffer() const { return m_vkBuffer; }
+#endif
 
 protected:
 	ID3D11Device* m_device = nullptr;
