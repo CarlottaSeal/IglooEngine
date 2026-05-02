@@ -3995,7 +3995,7 @@ void DX12Renderer::RenderingCompositePass()
 	
     constants.AmbientIntensity = 0.0f;  // 设为0，ambient通过GI间接光来实现
     constants.AmbientColor = Vec3(0.0f, 0.0f, 0.0f);
-    constants.ShadowBias = 0.05f;  // Increased from 0.002 - needs to be proportional to scene scale
+    constants.ShadowBias = 0.005f;
     
     constants.LightWorldToCamera = m_directionalShadowPass->GetCachedLightWorldToCamera();
     constants.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
@@ -4134,7 +4134,7 @@ void DX12Renderer::BeginCardCapturePass()
 		shadowConsts.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
 		shadowConsts.LightRenderToClip = m_directionalShadowPass->GetCachedLightRenderToClip();
 		shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
-		shadowConsts.ShadowBias = 0.05f;
+		shadowConsts.ShadowBias = 0.005f;
 		shadowConsts.SoftnessFactor = 1.0f;
 		shadowConsts.LightSize = 3.f;
 		m_pointLightShadowPass->FillShadowConstants(shadowConsts);
@@ -4157,7 +4157,7 @@ void DX12Renderer::BeginCardCapturePass()
 			shadowConsts.LightCameraToRender = m_directionalShadowPass->GetCachedLightCameraToRender();
 			shadowConsts.LightRenderToClip = m_directionalShadowPass->GetCachedLightRenderToClip();
 			shadowConsts.ShadowMapSize = (float)SHADOW_MAP_SIZE;
-			shadowConsts.ShadowBias = 0.05f;
+			shadowConsts.ShadowBias = 0.005f;
 			shadowConsts.SoftnessFactor = 1.0f;
 			shadowConsts.LightSize = 3.f;
 			m_pointLightShadowPass->FillShadowConstants(shadowConsts);
@@ -5103,12 +5103,16 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
 	if (!m_surfaceRadiosity)
         return;
 
-	// Consume dirty flag; reset convergence when lighting changes
+	// Lights dirtied this frame → restart the convergence window AND force dispatch.
+	// Without the force flag, a light that dirties every frame (e.g. orbit point light)
+	// would keep settleFrames pinned at 1 and never hit the mod-10 gate.
+	bool forceDispatchThisFrame = false;
 	if (m_radiosityLightingDirty)
 	{
 		m_radiositySettleFrames = 0;
 		m_radiosityConverged = false;
 		m_radiosityLightingDirty = false;
+		forceDispatchThisFrame = true;
 	}
 
 	if (m_radiosityConverged)
@@ -5116,11 +5120,12 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
 
 	m_radiositySettleFrames++;
 
-	// Only dispatch every 10th frame to amortize cost
-	if (m_radiositySettleFrames % 10 != 0)
+	// Amortize: dispatch on forced frames, or every 10th frame in the settle window.
+	if (!forceDispatchThisFrame && m_radiositySettleFrames % 10 != 0)
 		return;
 
-	// Converge after 30 dispatches (300 frames) without new dirty
+	// Converge after 300 frames with no new dirty (settleFrames keeps climbing only
+	// while lighting is stable; dirty resets it back to 0).
 	if (m_radiositySettleFrames > 300)
 	{
 		m_radiosityConverged = true;
@@ -5146,11 +5151,19 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
     // Radiosity 追踪配置
     constants.RaysPerProbe = RadiosityConfig::RAYS_PER_PROBE;           // 16
     constants.ProbeSpacing = (float)RadiosityConfig::PROBE_SPACING;     // 4.0
-    constants.TraceMaxDistance = RadiosityConfig::TRACE_DISTANCE;       // 200.0
+    // Scale trace parameters to actual scene size. Hardcoded values (TraceMaxDistance=200,
+    // RayBias=0.3) were tuned for larger scenes and cause problems at this scale
+    // (scene ≈ 15 units; RayBias=0.3 pushes rays >1 voxel forward, through thin walls).
+    Vec3 sceneSize = m_giSystem->m_scene->m_sceneBounds.GetBoundsSize();
+    float sceneDiagonal = sceneSize.GetLength();
+    float voxelSize = sceneDiagonal / (float)GLOBAL_SDF_RESOLUTION;
+    constants.TraceMaxDistance = max(RadiosityConfig::TRACE_DISTANCE, sceneDiagonal * 1.1f);
     constants.TraceMaxSteps = RadiosityConfig::TRACE_MAX_STEPS;         // 64
 
-    constants.TraceHitThreshold = 0.15f;
-    constants.RayBias = 0.3f;
+    // HitThreshold = half a voxel; RayBias = half a voxel (enough to avoid self-hit,
+    // small enough to not punch through thin walls).
+    constants.TraceHitThreshold = voxelSize * 0.5f;
+    constants.RayBias = voxelSize * 0.5f;
     constants.TemporalBlendFactor = RadiosityConfig::TEMPORAL_BLEND;    // 0.05
     constants.SkyIntensity = 0.05f;
     // Global SDF 信息
@@ -5440,8 +5453,8 @@ void DX12Renderer::RenderingScreenProbeGatherPass()
     IntVec2 screenDims = m_config.m_window->GetClientDimensions();
     constants.ScreenWidth = screenDims.x;
     constants.ScreenHeight = screenDims.y;
-    constants.ProbeGridWidth = (screenDims.x + 7) / 8;   // 8 像素间距
-    constants.ProbeGridHeight = (screenDims.y + 7) / 8;
+    constants.ProbeGridWidth = (screenDims.x + SCREEN_PROBE_SPACING - 1) / SCREEN_PROBE_SPACING;
+    constants.ProbeGridHeight = (screenDims.y + SCREEN_PROBE_SPACING - 1) / SCREEN_PROBE_SPACING;
     // Probe 配置
     constants.ProbeSpacing = SCREEN_PROBE_SPACING;           // 8
     constants.RaysPerProbe = SCREEN_PROBE_RAYS;              // 128

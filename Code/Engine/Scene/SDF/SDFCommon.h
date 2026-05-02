@@ -42,14 +42,14 @@ struct VoxelVisibilityGPU
 
 struct MeshSDFInfoGPU
 {
-    Mat44    WorldToLocal;       
-    Mat44    LocalToWorld;       
-    Vec3     LocalBoundsMin;     
-    float    LocalToWorldScale;  
-    Vec3     LocalBoundsMax;     
-    uint32_t SDFTextureIndex;    
-    uint32_t CardStartIndex;     
-    uint32_t CardCount;          
-    uint32_t Padding0;           
-    uint32_t Padding1;           
+    Mat44    WorldToLocal;
+    Mat44    LocalToWorld;
+    Vec3     LocalBoundsMin;
+    float    LocalToWorldScale;
+    Vec3     LocalBoundsMax;
+    uint32_t SDFTextureIndex;
+    Vec3     WorldBoundsMin;     // Pre-computed world AABB for fast ray reject
+    uint32_t CardStartIndex;
+    Vec3     WorldBoundsMax;
+    uint32_t CardCount;
 };

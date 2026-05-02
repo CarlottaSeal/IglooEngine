@@ -104,12 +104,11 @@ void Scene::Update(float deltaTime)
             anyLightMoved = true;
             m_pointLightShadowDirty = true;
 
-            // Start an incremental card-scan job if none is running
-            if (!m_cardUpdateJobActive)
+            auto* light = static_cast<LightObject*>(object);
+
+            if (!m_cardUpdateJobActive || m_cardUpdateJob.light != light)
             {
-                auto* light = static_cast<LightObject*>(object);
                 m_cardUpdateJob.light    = light;
-                m_cardUpdateJob.bounds   = light->GetWorldBounds();
                 m_cardUpdateJob.objectIdx = 0;
                 m_cardUpdateJob.newCards.clear();
                 m_cardUpdateJob.objectIDs.clear();
@@ -118,6 +117,13 @@ void Scene::Update(float deltaTime)
                     m_cardUpdateJob.objectIDs.push_back(id);
                 m_cardUpdateJobActive = true;
             }
+            else
+            {
+                // Same light moved again mid-job: restart scan so we don't use stale bounds
+                m_cardUpdateJob.objectIdx = 0;
+                m_cardUpdateJob.newCards.clear();
+            }
+            m_cardUpdateJob.bounds = light->GetWorldBounds();  // always refresh to current pos
 
             object->ClearMoveFlag();
         }
@@ -171,22 +177,50 @@ void Scene::Update(float deltaTime)
         {
             // Scan complete — atomically swap old cards for new
             LightObject* light = job.light;
-            for (uint32_t oldCard : light->m_affectedCards)
-                RemoveLightFromCard(light->m_id, oldCard);
-
-            light->m_affectedCards = job.newCards;
-            for (uint32_t cardID : job.newCards)
+            int generalLightID = light->m_generalLightID;
+            if (generalLightID >= 0)
             {
-                SurfaceCard* card = GetSurfaceCardByID(cardID);
-                if (!card) continue;
-                MeshObject* obj = static_cast<MeshObject*>(GetSceneObject(card->m_meshObjectID));
-                if (obj)
+                uint32_t wordIndex = generalLightID / 32;
+                uint32_t bitIndex  = generalLightID & 31;
+                uint32_t bitMask   = (1u << bitIndex);
+
+                // Clear light bit from old cards' LightMask
+                for (uint32_t oldCard : light->m_affectedCards)
                 {
+                    RemoveLightFromCard(light->m_id, oldCard);
+                    SurfaceCard* card = GetSurfaceCardByID(oldCard);
+                    if (!card) continue;
+                    MeshObject* obj = static_cast<MeshObject*>(GetSceneObject(card->m_meshObjectID));
+                    if (!obj) continue;
                     CardInstanceData* instance = obj->GetCardInstance(card->m_templateIndex);
-                    if (instance) instance->m_isDirty = true;
+                    if (!instance) continue;
+                    instance->m_lightMask[wordIndex] &= ~bitMask;
+                    instance->m_isDirty = true;
                 }
-                card->m_pendingUpdate = true;
-                m_cardToLightObjects[cardID].push_back(light->m_id);
+
+                light->m_affectedCards = job.newCards;
+
+                // Set light bit on new cards' LightMask
+                for (uint32_t cardID : job.newCards)
+                {
+                    SurfaceCard* card = GetSurfaceCardByID(cardID);
+                    if (!card) continue;
+                    MeshObject* obj = static_cast<MeshObject*>(GetSceneObject(card->m_meshObjectID));
+                    if (!obj) continue;
+                    CardInstanceData* instance = obj->GetCardInstance(card->m_templateIndex);
+                    if (!instance) continue;
+                    instance->m_lightMask[wordIndex] |= bitMask;
+                    instance->m_isDirty = true;
+                    card->m_pendingUpdate = true;
+                    m_cardToLightObjects[cardID].push_back(light->m_id);
+                }
+            }
+            else
+            {
+                // Directional light: no mask bit to update, just swap tracking
+                for (uint32_t oldCard : light->m_affectedCards)
+                    RemoveLightFromCard(light->m_id, oldCard);
+                light->m_affectedCards = job.newCards;
             }
             m_pointLightDirty = true;
             m_cardUpdateJobActive = false;
@@ -1035,6 +1069,12 @@ void Scene::BuildMeshSDFInfos()
         info.LocalBoundsMin = bounds.m_mins;
         info.LocalBoundsMax = bounds.m_maxs;
 
+        // World-space AABB so ScreenProbe trace can reject the instance before
+        // paying for the WorldToLocal matrix transform.
+        AABB3 worldBounds = meshObj->GetWorldBounds();
+        info.WorldBoundsMin = worldBounds.m_mins;
+        info.WorldBoundsMax = worldBounds.m_maxs;
+
         info.CardCount = (uint32_t)meshObj->m_cardInstances.size();
         info.CardStartIndex = meshObj->m_cardInstances[0].m_surfaceCardId;
         // //Test
@@ -1288,14 +1328,14 @@ void Scene::RegisterCardsToLightSystem(uint32_t objectID)
             continue;
         
         AABB3 cardBounds = ComputeCardWorldBounds(instance, card);
-        
+
         for (auto* light : m_lightObjects)
         {
             AABB3 lightBounds = light->GetWorldBounds();
-            
+
             if (!DoAABBsOverlap3D(cardBounds, lightBounds))
                 continue;
-            
+
             if (light->GetLightType() == LIGHT_SPOT)
             {
                 Vec3 toCard = instance->m_worldOrigin - light->m_position;
@@ -1303,10 +1343,9 @@ void Scene::RegisterCardsToLightSystem(uint32_t objectID)
                 if (dot < light->m_outerDotThresholds)
                     continue;
             }
-            
-            // 使用 generalLightID（在 LightsArray 中的索引）而不是 scene object ID
+
             int generalLightID = light->m_generalLightID;
-            if (generalLightID < 0)  // 方向光没有 generalLightID，跳过
+            if (generalLightID < 0)
                 continue;
 
             uint32_t wordIndex = generalLightID / 32;
@@ -1316,8 +1355,6 @@ void Scene::RegisterCardsToLightSystem(uint32_t objectID)
             uint32_t lightID = light->GetID();
             m_cardToLightObjects[cardID].push_back(lightID);
             light->m_affectedCards.push_back(cardID);
-
-            DebuggerPrintf("[Scene]   Light %u (arrayIndex %d) affects card %u\n", lightID, generalLightID, cardID);
         }
         
         instance->m_isDirty = true;

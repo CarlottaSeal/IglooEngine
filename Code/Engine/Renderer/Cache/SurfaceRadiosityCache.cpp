@@ -77,6 +77,11 @@ void SurfaceRadiosity::Execute(ID3D12GraphicsCommandList* cmdList, ConstantBuffe
         DX12Helper::GetGPUDescriptorHandle(m_descriptorHeap, m_scuDescriptorSize, RADIOSITY_UAV_BASE);
     m_cmdList->SetComputeRootDescriptorTable(4, radiosityUavHandle);
 
+    // [5] CardIndexLookup SRV (t12) — O(1) tile lookup to replace per-ray linear scan
+    D3D12_GPU_DESCRIPTOR_HANDLE cardLookupHandle =
+        DX12Helper::GetGPUDescriptorHandle(m_descriptorHeap, m_scuDescriptorSize, CARD_INDEX_LOOKUP_SRV);
+    m_cmdList->SetComputeRootDescriptorTable(5, cardLookupHandle);
+
     // =========================================================================
     // Pass 1: RadiosityTrace (SimLumen: 每像素一条射线)
     // Input:  SurfaceCache (t0-t1), GlobalSDF (t10), VoxelLighting (t11)
@@ -444,11 +449,15 @@ void SurfaceRadiosity::CreateRootSignature()
     CD3DX12_DESCRIPTOR_RANGE srvRange2;
     srvRange2.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 20);  // t20-t27
 
-    // Range 3: Radiosity UAVs (u0 - u7)
+    // Range 3: CardIndexLookup SRV (t12) — O(1) atlas-tile → card-index lookup
+    CD3DX12_DESCRIPTOR_RANGE srvRangeCardLookup;
+    srvRangeCardLookup.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 12);
+
+    // Range 4: Radiosity UAVs (u0 - u7)
     CD3DX12_DESCRIPTOR_RANGE uavRange0;
     uavRange0.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 8, 0);  // u0-u7
 
-    CD3DX12_ROOT_PARAMETER rootParams[5];
+    CD3DX12_ROOT_PARAMETER rootParams[6];
 
     // [0] Constant Buffer (b0)
     rootParams[0].InitAsConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
@@ -464,6 +473,9 @@ void SurfaceRadiosity::CreateRootSignature()
 
     // [4] Radiosity UAVs (u0-u7)
     rootParams[4].InitAsDescriptorTable(1, &uavRange0, D3D12_SHADER_VISIBILITY_ALL);
+
+    // [5] CardIndexLookup SRV (t12)
+    rootParams[5].InitAsDescriptorTable(1, &srvRangeCardLookup, D3D12_SHADER_VISIBILITY_ALL);
 
     D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
 

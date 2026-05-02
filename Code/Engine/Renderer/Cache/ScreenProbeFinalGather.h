@@ -6,7 +6,7 @@
 #include <d3d12.h>
 
 struct GBufferData;
-static constexpr uint32_t SCREEN_PROBE_SPACING = 8;         // 每 8×8 屏幕像素一个 Probe
+static constexpr uint32_t SCREEN_PROBE_SPACING = 16;        // 每 16×16 屏幕像素一个 Probe (matches Lumen default)
 static constexpr uint32_t SCREEN_PROBE_RAYS = 64;           // 每 Probe 64 条光线
 static constexpr float MESH_SDF_TRACE_DISTANCE = 100.0f;    // Mesh SDF 追踪距离
 static constexpr float VOXEL_TRACE_DISTANCE = 500.0f;       // Voxel 追踪距离

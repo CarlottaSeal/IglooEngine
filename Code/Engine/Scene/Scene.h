@@ -165,7 +165,7 @@ public:
     };
     LightCardUpdateJob   m_cardUpdateJob;
     bool                 m_cardUpdateJobActive = false;
-    static constexpr int CARD_SCAN_BATCH = 5;   // GI objects per frame
+    static constexpr int CARD_SCAN_BATCH = 512;   // GI objects per frame
 
     void SetSunDirection(const Vec3& dir) { m_sunDirection = dir; m_sunDirectionDirty = true; }
     int m_numLights = 0;

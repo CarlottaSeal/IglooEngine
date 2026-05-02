@@ -910,9 +910,7 @@ void Renderer::SetMaterialConstants(const Texture* diffuseTex, const Texture* no
 	m_dx12Renderer->SetMaterialConstants(diffuseTex, normalTex, specularTex);
 #endif
 #ifdef ENGINE_VULKAN_RENDERER
-	UNUSED(diffuseTex);
-	UNUSED(normalTex);
-	UNUSED(specularTex);
+	m_vulkanRenderer->SetMaterialConstants(diffuseTex, normalTex, specularTex);
 #endif
 }
 

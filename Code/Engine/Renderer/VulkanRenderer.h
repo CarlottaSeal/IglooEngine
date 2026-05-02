@@ -60,8 +60,12 @@ struct FrameData
     VkFence inFlightFence;
 };
 
+class VulkanDeferredPath; // forward decl
+
 class VulkanRenderer
 {
+    friend class VulkanDeferredPath;
+
 public:
     VulkanRenderer(RendererConfig config);
     ~VulkanRenderer();
@@ -101,6 +105,7 @@ public:
     Texture* CreateTextureFromFile(char const* imageFilePath, bool usingMipmaps = false);
     Texture* GetTextureForFileName(const char* imageFilePath);
     void BindTexture(const Texture* texture, int slot = 0);
+    void SetMaterialConstants(const Texture* diffuseTex, const Texture* normalTex, const Texture* specTex);
 
     // Font functions
     BitmapFont* CreateOrGetBitmapFont(const char* bitmapFontFilePathWithNoExtension);
@@ -114,7 +119,7 @@ public:
     // Buffer functions
     VertexBuffer* CreateVertexBuffer(const unsigned int size, unsigned int stride);
     void BindVertexBuffer(VertexBuffer* vbo);
-    void DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCount);
+    void DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCount, unsigned int byteOffset = 0);
     void CopyCPUToGPU(const void* data, unsigned int size, VertexBuffer* vbo);
 
     IndexBuffer* CreateIndexBuffer(const unsigned int size, unsigned int stride);
@@ -163,6 +168,20 @@ public:
     VkPhysicalDevice GetPhysicalDevice() const { return m_physicalDevice; }
     VkCommandBuffer GetCurrentCommandBuffer() const;
     VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
+    uint32_t GetCurrentSwapImageIndex() const { return m_imageIndex; }
+
+    // While set, subsequent draws of the matching vertex type use these pipelines
+    // instead of m_graphicsPipeline / m_graphicsPipelinePCUTBN. layoutOverride, if
+    // non-null, replaces m_pipelineLayout for descriptor-set binds and push constants
+    // — necessary when the override pipeline declares additional descriptor sets that
+    // the engine's main layout doesn't, otherwise binds would be invalidated.
+    void SetPipelineOverride(VkPipeline pcuPipeline, VkPipeline pcutbnPipeline,
+                             VkPipelineLayout layoutOverride = VK_NULL_HANDLE)
+    {
+        m_pipelineOverridePCU    = pcuPipeline;
+        m_pipelineOverridePCUTBN = pcutbnPipeline;
+        m_pipelineLayoutOverride = layoutOverride;
+    }
 
 private:
     // Initialization functions
@@ -282,6 +301,31 @@ private:
     std::vector<VkDeviceMemory> m_modelUniformBuffersMemory;
     std::vector<void*> m_modelUniformBuffersMapped;
 
+    // Ring-buffer state for camera + model UBOs (dynamic offsets, reset each frame)
+    uint32_t m_minUboAlignment = 256;
+    uint32_t m_cameraRingOffset = 0;
+    uint32_t m_currentCameraDynamicOffset = 0;
+    uint32_t m_modelRingOffset = 0;
+    uint32_t m_currentModelDynamicOffset = 0;
+    static constexpr uint32_t kCameraRingBufferSize = 64 * 1024;
+    static constexpr uint32_t kModelRingBufferSize  = 64 * 1024;
+
+    // Bindless texture atlas: every Texture created on the Vulkan side gets a unique
+    // index into a 256-slot sampled-image array at descriptor binding 1. Per draw a
+    // 16-byte struct carries diffuse / normal / spec slot indices (matches DX12's
+    // MaterialConstants CB layout — declared locally to avoid include-chain coupling).
+    struct VkMaterialPC
+    {
+        int   DiffuseId  = 0;
+        int   NormalId   = 1;
+        int   SpecularId = 2;
+        float _pad       = 0.0f;
+    };
+    static constexpr uint32_t kMaxBindlessTextures = 256;
+    uint32_t     m_nextBindlessIndex = 0;
+    VkMaterialPC m_currentMaterial   = {};
+    void RegisterTextureBindless(Texture* tex);
+
     // Light Uniform Buffers (per frame)
     std::vector<VkBuffer> m_lightUniformBuffers;
     std::vector<VkDeviceMemory> m_lightUniformBuffersMemory;
@@ -374,6 +418,11 @@ private:
 #endif
 
     bool m_framebufferResized = false;
+
+    // Optional pipeline overrides per vertex type (set via SetPipelineOverride).
+    VkPipeline       m_pipelineOverridePCU    = VK_NULL_HANDLE;
+    VkPipeline       m_pipelineOverridePCUTBN = VK_NULL_HANDLE;
+    VkPipelineLayout m_pipelineLayoutOverride = VK_NULL_HANDLE;
 };
 
 #endif // ENGINE_VULKAN_RENDERER

@@ -95,7 +95,7 @@ void DebugObject::UpdateScreenObjects()
 
 void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) const
 {
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
     renderer->BindTexture(nullptr);
 #endif
 #ifdef ENGINE_DX12_RENDERER
@@ -119,7 +119,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
         {
             if (m_isText)
             {
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
                 renderer->BindTexture(&m_textFont->GetTexture());
 #endif
 #ifdef ENGINE_DX12_RENDERER
@@ -152,7 +152,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
 		{
             if (m_isText)
             {
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
                 renderer->BindTexture(&m_textFont->GetTexture());
 #endif
             	#ifdef ENGINE_DX12_RENDERER
@@ -167,7 +167,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
 		{
             if (m_isText)
             {
-				#ifdef ENGINE_DX11_RENDERER
+				#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
                 renderer->BindTexture(&m_textFont->GetTexture());
 				#endif
             	#ifdef ENGINE_DX12_RENDERER
@@ -227,7 +227,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
 		}*/
         if (m_isText)
         {
-			#ifdef ENGINE_DX11_RENDERER
+			#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
             renderer->BindTexture(&m_textFont->GetTexture());
 			#endif
         	#ifdef ENGINE_DX12_RENDERER
@@ -245,7 +245,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
     }
 
 	renderer->SetModelConstants();
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
 	renderer->BindTexture(nullptr);
 #endif
 #ifdef ENGINE_DX12_RENDERER
@@ -259,7 +259,7 @@ void DebugObject::RenderWorldObjects(Camera const& camera, Renderer* renderer) c
 void DebugObject::RenderScreenObjects(Camera const& camera, Renderer* renderer) const
 {
     UNUSED(camera)
-	#ifdef ENGINE_DX11_RENDERER
+	#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
     renderer->BindTexture(&m_textFont->GetTexture());
 	#endif
 	#ifdef ENGINE_DX12_RENDERER

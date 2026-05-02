@@ -176,9 +176,14 @@ void VulkanRenderer::Startup()
 
     CreateAndBindDefaultShader();
 
-    // Create immediate mode buffers
-    m_immediateVBO = CreateVertexBuffer(sizeof(Vertex_PCU) * 10000, sizeof(Vertex_PCU));
-    m_immediateVBOForVertex_PCUTBN = CreateVertexBuffer(sizeof(Vertex_PCUTBN) * 10000, sizeof(Vertex_PCUTBN));
+    // Create immediate mode ring buffers (matches DX12's 128 MB VERTEX_RING_BUFFER_SIZE).
+    // Each DrawVertexArray AppendDataVulkan's into this ring at an advancing offset, so
+    // multiple draws in the same frame keep their own data slot until ring wraps.
+    constexpr unsigned int kImmediateRingBytes = 128u * 1024u * 1024u;
+    m_immediateVBO = CreateVertexBuffer(kImmediateRingBytes, sizeof(Vertex_PCU));
+    m_immediateVBO->m_vkIsRingBuffer = true;
+    m_immediateVBOForVertex_PCUTBN = CreateVertexBuffer(kImmediateRingBytes, sizeof(Vertex_PCUTBN));
+    m_immediateVBOForVertex_PCUTBN->m_vkIsRingBuffer = true;
     m_immediateIBO = CreateIndexBuffer(sizeof(unsigned int) * 30000, sizeof(unsigned int));
 
     // Create constant buffers
@@ -431,12 +436,40 @@ void VulkanRenderer::BeginFrame()
     // Reset render pass state at the start of each frame
     m_isRenderPassActive = false;
 
-    // Reset bound textures to defaults for new frame
+    // Reset UBO ring buffer offsets and re-seed slot 0 of the model UBO every frame
+    // with identity + white. Otherwise any draw before a SetModelConstants in this frame
+    // (e.g. attract-mode ring) inherits the previous frame's leftover model (color tint, transform).
+    m_cameraRingOffset           = 0;
+    m_currentCameraDynamicOffset = 0;
+    m_modelRingOffset            = 0;
+    m_currentModelDynamicOffset  = 0;
+
+    if (!m_modelUniformBuffersMapped.empty() && m_modelUniformBuffersMapped[m_currentFrame])
+    {
+        ModelConstants identityModel;
+        identityModel.ModelToWorldTransform = Mat44();
+        identityModel.ModelColor[0] = 1.0f;
+        identityModel.ModelColor[1] = 1.0f;
+        identityModel.ModelColor[2] = 1.0f;
+        identityModel.ModelColor[3] = 1.0f;
+        memcpy(m_modelUniformBuffersMapped[m_currentFrame], &identityModel, sizeof(ModelConstants));
+
+        // Reserve slot 0 for the identity seed; SetModelConstants writes to slot 1 onwards.
+        const uint32_t alignedSlotSize =
+            (uint32_t)(((sizeof(ModelConstants) + m_minUboAlignment - 1) / m_minUboAlignment) * m_minUboAlignment);
+        m_modelRingOffset = alignedSlotSize;
+        m_currentModelDynamicOffset = 0; // any draw before SetModelConstants reads the identity slot
+    }
+
+    // Reset bound textures to defaults for new frame.
+    // With bindless we don't redo descriptor writes per-frame: the atlas is populated once at
+    // texture creation. Just reset the per-draw push-constant index back to 0 (default white).
     for (int i = 0; i < MAX_TEXTURE_SLOTS; ++i)
     {
         m_boundTextures[i] = nullptr;
     }
-    m_textureBindingDirty = true;
+    m_currentMaterial = {};
+    m_textureBindingDirty = false;
 
     vkWaitForFences(m_device, 1, &m_frameData[m_currentFrame].inFlightFence, VK_TRUE, UINT64_MAX);
 
@@ -594,36 +627,23 @@ void VulkanRenderer::BeginCamera(const Camera& camera)
     cameraConstants.CameraWorldPosition = camera.GetPosition();
     cameraConstants.padding = 0.0f;
 
-    // DEBUG: Print all camera matrices
-    static int debugCounter = 0;
-    if (debugCounter++ < 10)
+
+    // Write into the camera ring buffer at an aligned offset, then advance.
+    // The dynamic offset captured here is what subsequent draws bind via vkCmdBindDescriptorSets.
+    const uint32_t alignedSlotSize =
+        (uint32_t)(((sizeof(CameraConstants) + m_minUboAlignment - 1) / m_minUboAlignment) * m_minUboAlignment);
+
+    if (m_cameraRingOffset + alignedSlotSize > kCameraRingBufferSize)
     {
-        Mat44 proj = cameraConstants.RenderToClipTransform;
-        Mat44 view = cameraConstants.WorldToCameraTransform;
-        Mat44 c2r = cameraConstants.CameraToRenderTransform;
-
-        // Check if this is perspective (proj[11] == 1) or ortho (proj[15] == 1)
-        bool isPerspective = (proj.m_values[11] != 0.0f);
-
-        DebuggerPrintf("=== BeginCamera #%d (%s) ===\n", debugCounter, isPerspective ? "PERSPECTIVE" : "ORTHO");
-        DebuggerPrintf("  RenderToClip: [%.3f, %.3f, %.3f, %.3f] [%.3f, %.3f, %.3f, %.3f]\n",
-            proj.m_values[0], proj.m_values[5], proj.m_values[10], proj.m_values[11],
-            proj.m_values[12], proj.m_values[13], proj.m_values[14], proj.m_values[15]);
-        DebuggerPrintf("  CameraToRender diag: [%.3f, %.3f, %.3f, %.3f]\n",
-            c2r.m_values[0], c2r.m_values[5], c2r.m_values[10], c2r.m_values[15]);
-        DebuggerPrintf("  CamPos: (%.2f, %.2f, %.2f)\n",
-            cameraConstants.CameraWorldPosition.x,
-            cameraConstants.CameraWorldPosition.y,
-            cameraConstants.CameraWorldPosition.z);
+        DebuggerPrintf("BeginCamera: camera ring buffer overflow, wrapping (offset=%u size=%u)\n",
+            m_cameraRingOffset, alignedSlotSize);
+        m_cameraRingOffset = 0; // wrap; tolerable for debug, in production we'd grow the buffer
     }
 
-    // Debug: Check if uniform buffer is mapped
-    if (!m_cameraUniformBuffersMapped[m_currentFrame])
-    {
-        DebuggerPrintf("BeginCamera: Camera uniform buffer not mapped!\n");
-    }
-
-    memcpy(m_cameraUniformBuffersMapped[m_currentFrame], &cameraConstants, sizeof(CameraConstants));
+    uint8_t* dst = (uint8_t*)m_cameraUniformBuffersMapped[m_currentFrame] + m_cameraRingOffset;
+    memcpy(dst, &cameraConstants, sizeof(CameraConstants));
+    m_currentCameraDynamicOffset = m_cameraRingOffset;
+    m_cameraRingOffset += alignedSlotSize;
 
     // If no render pass is active, start one (for DebugRender calls)
     if (!m_isRenderPassActive)
@@ -653,14 +673,11 @@ void VulkanRenderer::BeginCamera(const Camera& camera)
 void VulkanRenderer::EndCamera(const Camera& camera)
 {
     UNUSED(camera);
-
-    // Only end render pass if one is active
-    if (m_isRenderPassActive)
-    {
-        VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
-        vkCmdEndRenderPass(cmd);
-        m_isRenderPassActive = false;
-    }
+    // Intentionally do NOT end the render pass here.
+    // Render pass uses LOAD_OP_CLEAR, so each vkCmdBeginRenderPass would wipe the
+    // framebuffer. Subsequent BeginCamera calls (DebugRenderWorld, DebugRenderScreen,
+    // DevConsole etc.) inside the same frame should accumulate into the same pass.
+    // EndFrame ends the render pass before queue submit.
 }
 
 void VulkanRenderer::SetViewport(const AABB2& normalizedViewport)
@@ -689,8 +706,8 @@ void VulkanRenderer::DrawVertexArray(int numVerts, const Vertex_PCU* verts)
     }
 
     unsigned int vertexBufferSize = numVerts * sizeof(Vertex_PCU);
-    CopyCPUToGPU(verts, vertexBufferSize, m_immediateVBO);
-    DrawVertexBuffer(m_immediateVBO, numVerts);
+    unsigned int byteOffset = m_immediateVBO->AppendDataVulkan(verts, vertexBufferSize);
+    DrawVertexBuffer(m_immediateVBO, numVerts, byteOffset);
 }
 
 void VulkanRenderer::DrawVertexArray(const std::vector<Vertex_PCUTBN>& verts)
@@ -710,13 +727,15 @@ void VulkanRenderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
         return;
     }
 
-    // Copy vertex data to immediate VBO for PCUTBN
-    CopyCPUToGPU(verts, numVerts * sizeof(Vertex_PCUTBN), m_immediateVBOForVertex_PCUTBN);
+    // Append vertex data to PCUTBN ring buffer; capture byte offset for the draw.
+    unsigned int pcutbnByteOffset =
+        m_immediateVBOForVertex_PCUTBN->AppendDataVulkan(verts, numVerts * sizeof(Vertex_PCUTBN));
 
     VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
 
-    // Bind PCUTBN pipeline
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipelinePCUTBN);
+    // Bind PCUTBN pipeline (or the deferred override if active)
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        m_pipelineOverridePCUTBN != VK_NULL_HANDLE ? m_pipelineOverridePCUTBN : m_graphicsPipelinePCUTBN);
 
     // Update texture descriptor sets if dirty
     if (m_textureBindingDirty && !m_descriptorSets.empty())
@@ -793,12 +812,16 @@ void VulkanRenderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
         m_textureBindingDirty = false;
     }
 
-    // Bind descriptor set
+    // Bind descriptor set with current camera+model dynamic offsets (binding 0, then binding 4).
     if (!m_descriptorSets.empty())
     {
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[m_currentFrame], 0, nullptr);
+        const uint32_t dynOffsets[2] = { m_currentCameraDynamicOffset, m_currentModelDynamicOffset };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout,
+            0, 1, &m_descriptorSets[m_currentFrame], 2, dynOffsets);
     }
+
+    vkCmdPushConstants(cmd, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(VkMaterialPC), &m_currentMaterial);
 
     // Set dynamic viewport and scissor
     VkViewport viewport{};
@@ -815,9 +838,9 @@ void VulkanRenderer::DrawVertexArray(int numVerts, const Vertex_PCUTBN* verts)
     scissor.extent = m_swapChainExtent;
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Bind vertex buffer
+    // Bind vertex buffer at the per-draw ring offset.
     VkBuffer vertexBuffers[] = { m_immediateVBOForVertex_PCUTBN->m_vkBuffer };
-    VkDeviceSize offsets[] = { 0 };
+    VkDeviceSize offsets[]   = { (VkDeviceSize)pcutbnByteOffset };
     vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
 
     // Draw
@@ -1133,6 +1156,7 @@ Texture* VulkanRenderer::CreateTextureFromImage(const Image& image, bool usingMi
     }
 
     m_loadedTextures.push_back(newTexture);
+    RegisterTextureBindless(newTexture);
     return newTexture;
 }
 
@@ -1262,6 +1286,7 @@ Texture* VulkanRenderer::CreateTextureFromData(char const* name, IntVec2 dimensi
     }
 
     m_loadedTextures.push_back(newTexture);
+    RegisterTextureBindless(newTexture);
     return newTexture;
 }
 
@@ -1292,29 +1317,85 @@ Texture* VulkanRenderer::GetTextureForFileName(const char* imageFilePath)
 
 void VulkanRenderer::BindTexture(const Texture* texture, int slot)
 {
-    if (slot < 0 || slot >= MAX_TEXTURE_SLOTS)
+    if (slot < 0 || slot >= MAX_TEXTURE_SLOTS) return;
+
+    const Texture* textureToBind = texture ? texture : m_defaultTexture;
+    m_boundTextures[slot] = textureToBind;
+
+    int idx = (textureToBind && textureToBind->m_vkDescriptorIndex >= 0)
+            ? textureToBind->m_vkDescriptorIndex : 0;
+    if (slot == 0)      m_currentMaterial.DiffuseId  = idx;
+    else if (slot == 1) m_currentMaterial.NormalId   = idx;
+    else if (slot == 2) m_currentMaterial.SpecularId = idx;
+}
+
+void VulkanRenderer::SetMaterialConstants(const Texture* diffuseTex, const Texture* normalTex, const Texture* specTex)
+{
+    m_currentMaterial.DiffuseId  = (diffuseTex && diffuseTex->m_vkDescriptorIndex >= 0) ? diffuseTex->m_vkDescriptorIndex : 0;
+    m_currentMaterial.NormalId   = (normalTex  && normalTex->m_vkDescriptorIndex  >= 0) ? normalTex->m_vkDescriptorIndex  : 1;
+    m_currentMaterial.SpecularId = (specTex    && specTex->m_vkDescriptorIndex    >= 0) ? specTex->m_vkDescriptorIndex    : 2;
+}
+
+void VulkanRenderer::RegisterTextureBindless(Texture* tex)
+{
+    if (!tex || tex->m_vkImageView == VK_NULL_HANDLE) return;
+    if (tex->m_vkDescriptorIndex >= 0) return; // already registered
+
+    if (m_nextBindlessIndex >= kMaxBindlessTextures)
     {
+        DebuggerPrintf("RegisterTextureBindless: atlas full (%u slots), texture '%s' will use slot 0 fallback\n",
+            kMaxBindlessTextures, tex->m_name.c_str());
+        tex->m_vkDescriptorIndex = 0;
         return;
     }
 
-    // Use default texture if nullptr is passed
-    const Texture* textureToBind = texture;
-    if (textureToBind == nullptr)
+    int idx = (int)m_nextBindlessIndex++;
+    tex->m_vkDescriptorIndex = idx;
+    DebuggerPrintf("Bindless register #%d  '%s'  view=0x%p\n",
+        idx, tex->m_name.c_str(), (void*)tex->m_vkImageView);
+
+    if (m_descriptorSets.empty()) return;
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imgInfo.imageView   = tex->m_vkImageView;
+    imgInfo.sampler     = tex->m_vkSampler ? tex->m_vkSampler : m_defaultSampler;
+
+    // Validation requires every slot the shader could statically access to be valid.
+    // The shader declares sampler2D g_textures[256] and indexes via a push constant —
+    // validation can't trace which slot will be picked, so it wants ALL 256 valid.
+    // Solution: when the very first texture is registered (idx 0 = default white),
+    // also fill every other slot with that default. Later RegisterTextureBindless calls
+    // overwrite their assigned slot only.
+    if (idx == 0)
     {
-        switch (slot)
+        std::vector<VkDescriptorImageInfo> all(kMaxBindlessTextures, imgInfo);
+        for (size_t f = 0; f < m_descriptorSets.size(); ++f)
         {
-        case 0: textureToBind = m_defaultTexture; break;
-        case 1: textureToBind = m_defaultNormalTexture; break;
-        case 2: textureToBind = m_defaultSpecTexture; break;
-        default: textureToBind = m_defaultTexture; break;
+            VkWriteDescriptorSet write{};
+            write.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet           = m_descriptorSets[f];
+            write.dstBinding       = 1;
+            write.dstArrayElement  = 0;
+            write.descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.descriptorCount  = kMaxBindlessTextures;
+            write.pImageInfo       = all.data();
+            vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
         }
+        return;
     }
 
-    // Only update if the texture actually changed
-    if (m_boundTextures[slot] != textureToBind)
+    for (size_t f = 0; f < m_descriptorSets.size(); ++f)
     {
-        m_boundTextures[slot] = textureToBind;
-        m_textureBindingDirty = true;
+        VkWriteDescriptorSet write{};
+        write.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet           = m_descriptorSets[f];
+        write.dstBinding       = 1;
+        write.dstArrayElement  = (uint32_t)idx;
+        write.descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.descriptorCount  = 1;
+        write.pImageInfo       = &imgInfo;
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
     }
 }
 
@@ -1636,7 +1717,7 @@ void VulkanRenderer::BindVertexBuffer(VertexBuffer* vbo)
     vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
 }
 
-void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCount)
+void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCount, unsigned int byteOffset)
 {
     if (!vbo || vertexCount == 0 || !m_isRenderPassActive)
     {
@@ -1647,27 +1728,14 @@ void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCoun
         return;
     }
 
-    // DEBUG: Count draw calls
-    static int drawCallCount = 0;
-    drawCallCount++;
-    if (drawCallCount <= 20)
-    {
-        DebuggerPrintf("DrawVertexBuffer: call #%d, vertexCount=%u\n", drawCallCount, vertexCount);
-    }
-
-    // Debug: Check if vertex buffer has valid data
-    if (!vbo->m_vkMappedPtr)
-    {
-        DebuggerPrintf("DrawVertexBuffer: VBO has no mapped memory! vertexCount=%u\n", vertexCount);
-    }
-
     // Bind the default pipeline if available
     if (m_graphicsPipeline != VK_NULL_HANDLE)
     {
         VkCommandBuffer cmd = m_frameData[m_currentFrame].commandBuffer;
 
-        // Bind pipeline
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipeline);
+        // Bind pipeline (or deferred PCU override)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            m_pipelineOverridePCU != VK_NULL_HANDLE ? m_pipelineOverridePCU : m_graphicsPipeline);
 
         // Update texture descriptor sets if dirty
         if (m_textureBindingDirty && !m_descriptorSets.empty())
@@ -1747,11 +1815,18 @@ void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCoun
             m_textureBindingDirty = false;
         }
 
-        // Bind descriptor set
+        // Bind descriptor set with current camera+model dynamic offsets (binding 0, then binding 4).
         if (!m_descriptorSets.empty())
         {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-                0, 1, &m_descriptorSets[m_currentFrame], 0, nullptr);
+            const uint32_t dynOffsets[2] = { m_currentCameraDynamicOffset, m_currentModelDynamicOffset };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout,
+                0, 1, &m_descriptorSets[m_currentFrame], 2, dynOffsets);
+        }
+
+        // Push diffuse atlas index for bindless texture sampling.
+        {
+            vkCmdPushConstants(cmd, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(VkMaterialPC), &m_currentMaterial);
         }
 
         // Set dynamic viewport and scissor
@@ -1771,8 +1846,10 @@ void VulkanRenderer::DrawVertexBuffer(VertexBuffer* vbo, unsigned int vertexCoun
         scissor.extent = m_swapChainExtent;
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-        // Bind vertex buffer
-        BindVertexBuffer(vbo);
+        // Bind vertex buffer at the per-draw ring offset (byteOffset = where AppendDataVulkan put this draw's data).
+        VkBuffer vertexBuffers[] = { vbo->m_vkBuffer };
+        VkDeviceSize offsets[]   = { (VkDeviceSize)byteOffset };
+        vkCmdBindVertexBuffers(cmd, 0, 1, vertexBuffers, offsets);
 
         // Draw
         vkCmdDraw(cmd, vertexCount, 1, 0, 0);
@@ -1820,12 +1897,11 @@ void VulkanRenderer::DrawIndexBuffer(VertexBuffer* vbo, IndexBuffer* ibo, unsign
         return;
     }
 
-    // Select pipeline based on vertex buffer stride
-    VkPipeline pipelineToUse = m_graphicsPipeline;
-    if (vbo->GetStride() == sizeof(Vertex_PCUTBN) && m_graphicsPipelinePCUTBN != VK_NULL_HANDLE)
-    {
-        pipelineToUse = m_graphicsPipelinePCUTBN;
-    }
+    // Select pipeline based on vertex buffer stride (or use the matching deferred override)
+    const bool isPcutbn = (vbo->GetStride() == sizeof(Vertex_PCUTBN));
+    VkPipeline pipelineToUse = isPcutbn ? m_graphicsPipelinePCUTBN : m_graphicsPipeline;
+    if (isPcutbn && m_pipelineOverridePCUTBN != VK_NULL_HANDLE) pipelineToUse = m_pipelineOverridePCUTBN;
+    if (!isPcutbn && m_pipelineOverridePCU    != VK_NULL_HANDLE) pipelineToUse = m_pipelineOverridePCU;
 
     if (pipelineToUse != VK_NULL_HANDLE)
     {
@@ -1912,11 +1988,18 @@ void VulkanRenderer::DrawIndexBuffer(VertexBuffer* vbo, IndexBuffer* ibo, unsign
             m_textureBindingDirty = false;
         }
 
-        // Bind descriptor set
+        // Bind descriptor set with current camera+model dynamic offsets (binding 0, then binding 4).
         if (!m_descriptorSets.empty())
         {
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-                0, 1, &m_descriptorSets[m_currentFrame], 0, nullptr);
+            const uint32_t dynOffsets[2] = { m_currentCameraDynamicOffset, m_currentModelDynamicOffset };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout,
+                0, 1, &m_descriptorSets[m_currentFrame], 2, dynOffsets);
+        }
+
+        // Push diffuse atlas index for bindless texture sampling.
+        {
+            vkCmdPushConstants(cmd, m_pipelineLayoutOverride ? m_pipelineLayoutOverride : m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, sizeof(VkMaterialPC), &m_currentMaterial);
         }
 
         // Set dynamic viewport and scissor
@@ -2163,7 +2246,21 @@ void VulkanRenderer::SetModelConstants(const Mat44& modelToWorldTransform, const
     modelConstants.ModelColor[2] = modelColor.b / 255.0f;
     modelConstants.ModelColor[3] = modelColor.a / 255.0f;
 
-    memcpy(m_modelUniformBuffersMapped[m_currentFrame], &modelConstants, sizeof(ModelConstants));
+    // Write into the model ring buffer at an aligned offset, then advance.
+    const uint32_t alignedSlotSize =
+        (uint32_t)(((sizeof(ModelConstants) + m_minUboAlignment - 1) / m_minUboAlignment) * m_minUboAlignment);
+
+    if (m_modelRingOffset + alignedSlotSize > kModelRingBufferSize)
+    {
+        DebuggerPrintf("SetModelConstants: model ring buffer overflow, wrapping (offset=%u size=%u)\n",
+            m_modelRingOffset, alignedSlotSize);
+        m_modelRingOffset = 0;
+    }
+
+    uint8_t* dst = (uint8_t*)m_modelUniformBuffersMapped[m_currentFrame] + m_modelRingOffset;
+    memcpy(dst, &modelConstants, sizeof(ModelConstants));
+    m_currentModelDynamicOffset = m_modelRingOffset;
+    m_modelRingOffset += alignedSlotSize;
 }
 
 void VulkanRenderer::SetShadowConstants(const Mat44& lightViewProjectionMatrix)
@@ -2404,12 +2501,19 @@ void VulkanRenderer::CreateAndBindDefaultShader()
     dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    // Pipeline layout with descriptor set layout
+    // Pipeline layout with descriptor set layout, plus a 4-byte push constant
+    // for the bindless diffuse texture index (per draw, fragment stage).
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushConstantRange.offset     = 0;
+    pushConstantRange.size       = sizeof(VkMaterialPC);
+
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipelineLayoutInfo.setLayoutCount = 1;
     pipelineLayoutInfo.pSetLayouts = &m_descriptorSetLayout;
-    pipelineLayoutInfo.pushConstantRangeCount = 0;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges    = &pushConstantRange;
 
     if (vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout) != VK_SUCCESS)
     {
@@ -2591,6 +2695,9 @@ void VulkanRenderer::PickPhysicalDevice()
     VkPhysicalDeviceProperties deviceProperties;
     vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProperties);
     DebuggerPrintf("Selected GPU: %s\n", deviceProperties.deviceName);
+    m_minUboAlignment = (uint32_t)deviceProperties.limits.minUniformBufferOffsetAlignment;
+    if (m_minUboAlignment < 1) m_minUboAlignment = 1;
+    DebuggerPrintf("minUniformBufferOffsetAlignment = %u\n", m_minUboAlignment);
 }
 
 void VulkanRenderer::CreateLogicalDevice()
@@ -2799,20 +2906,21 @@ void VulkanRenderer::CreateDescriptorSetLayout()
 {
     std::vector<VkDescriptorSetLayoutBinding> bindings;
 
-    // Binding 0: Uniform buffer for vertex shader (camera matrices, etc.)
+    // Binding 0: Dynamic uniform buffer for camera matrices (ring-buffered, per BeginCamera)
     VkDescriptorSetLayoutBinding uboLayoutBinding{};
     uboLayoutBinding.binding = 0;
-    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     uboLayoutBinding.descriptorCount = 1;
     uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     uboLayoutBinding.pImmutableSamplers = nullptr;
     bindings.push_back(uboLayoutBinding);
 
-    // Binding 1: Combined image sampler for diffuse texture
+    // Binding 1: Bindless texture atlas — array of 256 combined image samplers.
+    // Slot 0 is the default white texture; subsequent textures get unique indices.
     VkDescriptorSetLayoutBinding samplerLayoutBinding{};
     samplerLayoutBinding.binding = 1;
     samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerLayoutBinding.descriptorCount = 1;
+    samplerLayoutBinding.descriptorCount = kMaxBindlessTextures;
     samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     samplerLayoutBinding.pImmutableSamplers = nullptr;
     bindings.push_back(samplerLayoutBinding);
@@ -2835,10 +2943,10 @@ void VulkanRenderer::CreateDescriptorSetLayout()
     specSamplerBinding.pImmutableSamplers = nullptr;
     bindings.push_back(specSamplerBinding);
 
-    // Binding 4: Uniform buffer for model constants
+    // Binding 4: Dynamic uniform buffer for model constants (ring-buffered, per SetModelConstants)
     VkDescriptorSetLayoutBinding modelUboBinding{};
     modelUboBinding.binding = 4;
-    modelUboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    modelUboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     modelUboBinding.descriptorCount = 1;
     modelUboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     modelUboBinding.pImmutableSamplers = nullptr;
@@ -2871,22 +2979,13 @@ void VulkanRenderer::CreateDescriptorSetLayout()
     perFrameUboBinding.pImmutableSamplers = nullptr;
     bindings.push_back(perFrameUboBinding);
 
-    // Create binding flags for UPDATE_AFTER_BIND support
-    // Texture bindings (1, 2, 3) need to be updated after bind
-    std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
-    bindingFlags[1] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;  // diffuse
-    bindingFlags[2] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;  // normal
-    bindingFlags[3] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;  // specular
-
-    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
-    bindingFlagsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-    bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
-    bindingFlagsInfo.pBindingFlags = bindingFlags.data();
-
+    // No UPDATE_AFTER_BIND_BIT here — Vulkan forbids mixing it with UNIFORM_BUFFER_DYNAMIC
+    // (used at bindings 0 and 4 for camera/model ring buffers). All bindless texture writes
+    // happen during texture creation, BEFORE any draw uses the new slot, so update-after-bind
+    // semantics aren't required.
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.pNext = &bindingFlagsInfo;
-    layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    layoutInfo.flags = 0;
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
 
@@ -3023,10 +3122,11 @@ void VulkanRenderer::CreateDescriptorPool()
     dynamicUboPoolSize.descriptorCount = 50 * MAX_FRAMES_IN_FLIGHT;
     poolSizes.push_back(dynamicUboPoolSize);
 
-    // Combined image samplers - for textures (diffuse, normal, specular, shadow maps)
+    // Combined image samplers - bindless atlas needs kMaxBindlessTextures per descriptor set,
+    // plus a small surplus for normal/spec/shadow bindings still living at bindings 2,3,...
     VkDescriptorPoolSize samplerPoolSize{};
     samplerPoolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    samplerPoolSize.descriptorCount = 200 * MAX_FRAMES_IN_FLIGHT;  // Allow many textures
+    samplerPoolSize.descriptorCount = (kMaxBindlessTextures + 16) * MAX_FRAMES_IN_FLIGHT;
     poolSizes.push_back(samplerPoolSize);
 
     // Storage buffers - for compute shaders or large data
@@ -3035,15 +3135,15 @@ void VulkanRenderer::CreateDescriptorPool()
     storagePoolSize.descriptorCount = 20 * MAX_FRAMES_IN_FLIGHT;
     poolSizes.push_back(storagePoolSize);
 
-    // Input attachments - for subpass inputs
+    // Input attachments - for deferred subpass inputs (VulkanDeferredPath uses 3: albedo/normal/depth)
     VkDescriptorPoolSize inputAttachmentPoolSize{};
     inputAttachmentPoolSize.type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
-    inputAttachmentPoolSize.descriptorCount = 10 * MAX_FRAMES_IN_FLIGHT;
+    inputAttachmentPoolSize.descriptorCount = 16 * MAX_FRAMES_IN_FLIGHT;
     poolSizes.push_back(inputAttachmentPoolSize);
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT | VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
     poolInfo.maxSets = 500 * MAX_FRAMES_IN_FLIGHT;  // Maximum number of descriptor sets
@@ -3056,8 +3156,8 @@ void VulkanRenderer::CreateDescriptorPool()
 
 void VulkanRenderer::CreateUniformBuffers()
 {
-    // Camera uniform buffers
-    VkDeviceSize cameraBufferSize = sizeof(CameraConstants);
+    // Camera ring buffer (per frame). Each BeginCamera writes a fresh slot at an aligned offset.
+    VkDeviceSize cameraBufferSize = kCameraRingBufferSize;
     m_cameraUniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
     m_cameraUniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
     m_cameraUniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
@@ -3071,8 +3171,8 @@ void VulkanRenderer::CreateUniformBuffers()
         vkMapMemory(m_device, m_cameraUniformBuffersMemory[i], 0, cameraBufferSize, 0, &m_cameraUniformBuffersMapped[i]);
     }
 
-    // Model uniform buffers
-    VkDeviceSize modelBufferSize = sizeof(ModelConstants);
+    // Model ring buffer (per frame). Each SetModelConstants writes a fresh slot at an aligned offset.
+    VkDeviceSize modelBufferSize = kModelRingBufferSize;
     m_modelUniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
     m_modelUniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
     m_modelUniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
@@ -3085,7 +3185,7 @@ void VulkanRenderer::CreateUniformBuffers()
 
         vkMapMemory(m_device, m_modelUniformBuffersMemory[i], 0, modelBufferSize, 0, &m_modelUniformBuffersMapped[i]);
 
-        // Initialize with identity matrix and white color
+        // Seed slot 0 with identity model + white color so any draw before SetModelConstants is sane.
         ModelConstants defaultModel;
         defaultModel.ModelToWorldTransform = Mat44();
         defaultModel.ModelColor[0] = 1.0f;
@@ -3234,7 +3334,7 @@ void VulkanRenderer::CreateUniformBuffers()
     {
         std::vector<VkWriteDescriptorSet> descriptorWrites;
 
-        // Camera UBO (binding 0)
+        // Camera UBO (binding 0) - dynamic. Range = single struct; per-bind dynamic offset selects slot.
         VkDescriptorBufferInfo cameraBufferInfo{};
         cameraBufferInfo.buffer = m_cameraUniformBuffers[i];
         cameraBufferInfo.offset = 0;
@@ -3245,12 +3345,12 @@ void VulkanRenderer::CreateUniformBuffers()
         cameraWrite.dstSet = m_descriptorSets[i];
         cameraWrite.dstBinding = 0;
         cameraWrite.dstArrayElement = 0;
-        cameraWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        cameraWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         cameraWrite.descriptorCount = 1;
         cameraWrite.pBufferInfo = &cameraBufferInfo;
         descriptorWrites.push_back(cameraWrite);
 
-        // Model UBO (binding 4)
+        // Model UBO (binding 4) - dynamic. Range = single struct; per-bind dynamic offset selects slot.
         VkDescriptorBufferInfo modelBufferInfo{};
         modelBufferInfo.buffer = m_modelUniformBuffers[i];
         modelBufferInfo.offset = 0;
@@ -3261,7 +3361,7 @@ void VulkanRenderer::CreateUniformBuffers()
         modelWrite.dstSet = m_descriptorSets[i];
         modelWrite.dstBinding = 4;
         modelWrite.dstArrayElement = 0;
-        modelWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        modelWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         modelWrite.descriptorCount = 1;
         modelWrite.pBufferInfo = &modelBufferInfo;
         descriptorWrites.push_back(modelWrite);

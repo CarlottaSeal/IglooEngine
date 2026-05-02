@@ -452,6 +452,7 @@
     <ClCompile Include="Renderer\Texture.cpp" />
     <ClCompile Include="Renderer\VertexBuffer.cpp" />
     <ClCompile Include="Renderer\VulkanRenderer.cpp" />
+    <ClCompile Include="Renderer\VulkanDeferredPath.cpp" />
     <ClCompile Include="Renderer\VulkanMemoryPool.cpp" />
     <ClCompile Include="Save\DataStorage.cpp" />
     <ClCompile Include="Save\ISerializable.cpp" />
@@ -601,6 +602,7 @@
     <ClInclude Include="Renderer\Texture.hpp" />
     <ClInclude Include="Renderer\VertexBuffer.hpp" />
     <ClInclude Include="Renderer\VulkanRenderer.h" />
+    <ClInclude Include="Renderer\VulkanDeferredPath.h" />
     <ClInclude Include="Renderer\VulkanMemoryPool.hpp" />
     <ClInclude Include="Save\DataStorage.h" />
     <ClInclude Include="Save\ISerializable.h" />
