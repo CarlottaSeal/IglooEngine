@@ -32,7 +32,7 @@ Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI)
 - **Audio** — FMOD integration
 - **Mesh Loading** — OBJ and glTF/GLB via cgltf; BVH construction and per-mesh SDF generation at load time
 - **Particle System** — Configurable emitters with presets (fire, smoke, sparks, explosion)
-- **Dev Tools** — DevConsole, DebugRenderSystem, ImGui + ImPlot integration, 17 GI visualization modes
+- **Dev Tools** — DevConsole, DebugRenderSystem, ImGui + ImPlot integration, 15 GI visualization modes
 
 ---
 
@@ -65,7 +65,7 @@ Engine/Code/Engine/
 │   ├── GI/                 # GI orchestration and GBuffer
 │   │   ├── GISystem                # Top-level GI controller
 │   │   ├── GBufferData             # Albedo, Normal, Material, WorldPos, Depth
-│   │   └── GIVisualization         # 17 debug visualization modes
+│   │   └── GIVisualization         # 15 debug visualization modes
 │   └── DXR/                # DirectX Ray Tracing acceleration structures
 ├── Save/                   # Multi-format serialization + RLE compression
 ├── Scene/
@@ -164,10 +164,11 @@ A 64×64 `R32_UINT` **tile→card-index LUT** (16 KB in the default 64-pixel-til
 | 5. Mesh SDF Trace | MeshSDFTrace.hlsl | Short-range SDF sphere tracing (up to 100 units) |
 | 6. Voxel SDF Trace | VoxelSDFTrace.hlsl | Long-range global SDF trace (up to 500 units) |
 | 7. Radiance Composite | RadianceComposite.hlsl | Voxel sample at hit + per-ray distance AO (`saturate(closestHitDist / AO_RADIUS)`, packed in alpha) |
-| 8. Spatial Filter | SpatialFilter.hlsl | 4-neighbor cross bilateral filter (depth + normal weighted) |
-| 9. Oct Irradiance | OctIrradiance.hlsl | L2 SH (9 coeff/channel) low-pass projection + reconstruction |
+| 8. Temporal Accumulation | TemporalAccumulation.hlsl | Per-probe ping-pong history blend (α=0.1 EMA), firefly clamp, disocclusion-aware history weight |
+| 9. Spatial Filter | SpatialFilter.hlsl | 4-neighbor cross bilateral filter (depth + normal weighted) |
+| 9B. Oct Irradiance | OctIrradiance.hlsl | L2 SH (9 coeff/channel) low-pass projection + reconstruction |
 | 10. Final Gather | FinalGather.hlsl | 5-probe bilateral blend (depth + normal weights) → per-pixel irradiance + AO modulation `lerp(1, ao, AOStrength=0.5)` on indirect only |
-| 11. Screen Temporal | ScreenTemporal.hlsl | Temporal blend (α=0.05) for stability |
+| 11. Screen Temporal | ScreenSpaceTemporalFilter.hlsl | Per-pixel motion-aware temporal reprojection on full-resolution indirect, 1/π firefly clamp |
 
 ---
 
