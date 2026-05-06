@@ -21,7 +21,7 @@ Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI)
 ## Features
 
 - **DirectX 12 Renderer** — Deferred GBuffer pipeline, instanced indexed drawing, async compute queue, descriptor heap management, 128 MB ring buffers for vertex/index data
-- **Real-Time Global Illumination** — Surface cache atlas, screen-space probe system, surface radiosity, voxel irradiance volume, SDF ray tracing with BVH acceleration
+- **Real-Time Global Illumination** — Surface cache atlas, screen-space probe system, surface radiosity, voxel irradiance volume, software SDF sphere tracing (per-mesh SDFs are baked at load time using BVH-accelerated point-triangle distance queries; runtime tracing is texture-only, no BVH)
 - **Shadow System** — Directional PCF shadow maps (2048²) + omnidirectional point light cube shadow arrays (512² × 6 faces, up to 4 lights)
 - **DXR Support** — Bottom-level (per-mesh BLAS) and top-level (TLAS) acceleration structures for hardware ray tracing
 - **Math Library** — Vec2/3/4, Mat44, AABB2/3, OBB3, Sphere, Frustum, Plane, Capsule, Euler angles, Hermite/Bezier splines, BSP tree, BVH
@@ -56,7 +56,7 @@ Engine/Code/Engine/
 │   ├── Cache/              # Surface cache, shadow passes, screen probes
 │   │   ├── SurfaceCache            # 4096² atlas with 6 layer types
 │   │   ├── SurfaceCard             # Per-mesh card templates + instances
-│   │   ├── CardBVH                 # BVH for card spatial queries
+│   │   ├── CardBVH                 # Legacy: spatial-query class from earlier exploration; runtime path uses linear FindBestCard over the 6 cards per mesh (O(6) constant)
 │   │   ├── DirectionalShadowPass   # PCF directional shadows
 │   │   ├── PointLightShadowPass    # Cube array point light shadows
 │   │   ├── SurfaceRadiosityCache   # Radiosity probe grid on surface cache
