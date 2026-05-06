@@ -2,7 +2,7 @@
 
 A modular C++/DirectX 12 game engine with a real-time global illumination system, deferred rendering pipeline, custom math library, UI framework, multi-threaded job system, and cross-format serialization.
 
-Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI) — a real-time GI thesis project at SMU Guildhall.
+Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI) — a real-time GI thesis project at SMU Guildhall. The Vulkan rendering backend has been split out into its own repository, [Tessera](https://github.com/CarlottaSeal/Tessera), where it continues to evolve as a tile-deferred + forward-A/B Vulkan engine; this Igloo repo is now the DirectX 12 backend.
 
 ![Protogame3D](https://github.com/user-attachments/assets/277793ea-8406-4806-b880-9dcf2a65661f)
 *Protogame3D*
@@ -32,7 +32,7 @@ Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI)
 - **Audio** — FMOD integration
 - **Mesh Loading** — OBJ and glTF/GLB via cgltf; BVH construction and per-mesh SDF generation at load time
 - **Particle System** — Configurable emitters with presets (fire, smoke, sparks, explosion)
-- **Dev Tools** — DevConsole, DebugRenderSystem, ImGui + ImPlot integration, 19 GI visualization modes
+- **Dev Tools** — DevConsole, DebugRenderSystem, ImGui + ImPlot integration, 17 GI visualization modes
 
 ---
 
@@ -65,9 +65,8 @@ Engine/Code/Engine/
 │   ├── GI/                 # GI orchestration and GBuffer
 │   │   ├── GISystem                # Top-level GI controller
 │   │   ├── GBufferData             # Albedo, Normal, Material, WorldPos, Depth
-│   │   └── GIVisualization         # 19 debug visualization modes
-│   ├── DXR/                # DirectX Ray Tracing acceleration structures
-│   └── VulkanRenderer      # Vulkan backend (alternate)
+│   │   └── GIVisualization         # 17 debug visualization modes
+│   └── DXR/                # DirectX Ray Tracing acceleration structures
 ├── Save/                   # Multi-format serialization + RLE compression
 ├── Scene/
 │   ├── Scene               # Entity container, GI registration, dirty tracking
@@ -113,14 +112,14 @@ The `DX12Renderer` manages the full DirectX 12 device lifecycle: swap chain, com
 | Order | Pass | Type | Trigger |
 |-------|------|------|---------|
 | 1 | Directional Shadow Map (2048²) | Rasterization | On sun change |
-| 2 | Point Light Cube Shadow (512² × 24) | Rasterization | Every frame |
+| 2 | Point Light Cube Shadow (512² × 24) | Rasterization | On light or geometry change (Execute called every frame, internally early-outs unless dirty) |
 | 3 | GBuffer | Rasterization | Every frame |
-| 4 | Card Capture (dirty only) | Rasterization | On geometry change |
-| 5 | DirectLight Update | Compute | On light change |
-| 6 | Combine Surface Cache | Compute | After update |
-| 7 | Build Voxel Visibility | Compute | Periodic |
-| 8 | Inject Voxel Lighting | Compute | Periodic |
-| 9 | Surface Radiosity (Trace + Filter + SH) | Compute | Every frame |
+| 4 | Card Capture (dirty only) | Rasterization | On geometry change (per-card dirty flag) |
+| 5 | DirectLight Update | Compute | On light change (sun or any point light) |
+| 6 | Build Voxel Visibility | Compute | On geometry change (gated by `m_needsRebuildGlobalLighting`) |
+| 7 | Inject Voxel Lighting | Compute | Every frame |
+| 8 | Surface Radiosity (Trace + Filter + SH) | Compute | Force dispatch on lighting dirty; otherwise every 10th settle frame; converges and stops after ~300 stable frames |
+| 9 | Combine Surface Cache | Compute | On lighting dirty (gated by `m_combinedDirty`, set whenever DirectLight or radiosity wrote new data; skipped when both stable) |
 | 10 | Screen Probes (11 passes) | Compute | Every frame |
 | 11 | Screen-Space Temporal Filter | Compute | Every frame |
 | 12 | Final Composite | Full-screen PS | Every frame |
@@ -137,33 +136,37 @@ The `DX12Renderer` manages the full DirectX 12 device lifecycle: swap chain, com
 
 ### Surface Cache
 
-A 4096×4096 texture atlas with 6 layers, capturing surface attributes via axis-aligned card projection:
+A 4096×4096 `Texture2DArray` with 6 layers, capturing surface attributes via axis-aligned card projection. Because `Texture2DArray` requires a single shared format across all slices, every layer is bound as `R16G16B16A16_FLOAT` even when a layer's content semantically only needs RGBA8:
 
-| Layer | Contents | Format |
-|-------|----------|--------|
-| 0 | Albedo | RGBA8 |
-| 1 | World-Space Normal | RGBA16F |
-| 2 | Material (roughness/metallic/AO) | RGBA8 |
-| 3 | Direct Light | RGBA16F |
-| 4 | Indirect Light (from radiosity) | RGBA16F |
-| 5 | Combined Light | RGBA16F |
+| Layer | Contents | Stored Format | Semantic Format |
+|-------|----------|---------------|-----------------|
+| 0 | Albedo | RGBA16F | RGBA8 |
+| 1 | World-Space Normal | RGBA16F | RGBA16F |
+| 2 | Material (roughness/metallic/AO) | RGBA16F | RGBA8 |
+| 3 | Direct Light (HDR irradiance) | RGBA16F | RGBA16F |
+| 4 | Indirect Light from radiosity (HDR irradiance) | RGBA16F | RGBA16F |
+| 5 | Combined Light (HDR outgoing radiance) | RGBA16F | RGBA16F |
 
-Each mesh generates six axis-aligned **surface cards** (±X, ±Y, ±Z). Cards store a 128-bit light mask (four `uint32`) to efficiently skip unaffected lights during relighting. A dirty-card queue prioritized by `1 / (1 + distance × 0.1)` ensures nearest surfaces are relighted first within a per-frame budget.
+Total atlas footprint is `4096² × 8 bytes × 6 = 768 MiB`. Splitting Albedo and Material out as separate `R8G8B8A8_UNORM` Texture2D resources is queued as a future memory optimization (~233 MiB savings, no quality cost).
+
+Each mesh generates six axis-aligned **surface cards** (±X, ±Y, ±Z). Cards store a 128-bit light mask packed as `uint32_t LightMask[4]` to efficiently skip unaffected lights during shader-side relighting. When a light moves, `Scene::RegisterLightInfluence` rebuilds the mask via AABB-vs-AABB overlap (plus a cone cosine test for spot lights, since their AABB over-bounds the actual cone). Per-card distance priority (`1 / (1 + distance × 0.1)`) is computed for ordering; a per-frame card budget is design intent listed as future work, currently the DirectLight Update dispatch is bulk over the active card set with the LUT below short-circuiting empty atlas tiles.
+
+A 64×64 `R32_UINT` **tile→card-index LUT** (16 KB in the default 64-pixel-tile config; dimensions track `atlas_size / m_tileSize`) replaces the original O(n) per-thread linear card search in DirectLight Update with a single `Texture2D.Load`, dropping per-light-change cost from ~33 ms to ~2 ms. The same LUT is reused as an O(1) tile-occupancy early-out by the surface radiosity passes.
 
 ### Screen Probe System (11 compute passes)
 
 | Pass | Shader | Key Operation |
 |------|--------|---------------|
-| 1. Probe Placement | ProbePlacement.hlsl | 8×8 pixel grid, depth-based world position |
-| 2. BRDF PDF | BRDFPDFGeneration.hlsl | Cosine-weighted Lambertian distribution |
-| 3. Lighting PDF | LightingPDFGeneration.hlsl | History reprojection from previous frame |
-| 4. Sample Directions | SampleDirections.hlsl | 64 rays/probe via joint PDF |
+| 1. Probe Placement | ProbePlacement.hlsl | 16×16 pixel grid (matches Lumen's `ScreenProbeDownsampleFactor=16`), depth-based world position |
+| 2. BRDF PDF | BRDFPDFGeneration.hlsl | Analytic SH projection of clamped cosine lobe (Lambertian) |
+| 3. Lighting PDF | LightingPDFGeneration.hlsl | 32 Fibonacci hemisphere samples reprojected into previous frame, SH-projected by cosine-weighted luminance |
+| 4. Sample Directions | GenerateSampleDirections.hlsl | 64 rays/probe on fixed octahedral 8×8 grid; per-direction PDF combines BRDF + lighting via MIS power heuristic (β=2) |
 | 5. Mesh SDF Trace | MeshSDFTrace.hlsl | Short-range SDF sphere tracing (up to 100 units) |
 | 6. Voxel SDF Trace | VoxelSDFTrace.hlsl | Long-range global SDF trace (up to 500 units) |
-| 7. Radiance Composite | RadianceComposite.hlsl | Blend voxel + surface cache at hit points |
-| 8. Spatial Filter | SpatialFilter.hlsl | Bilateral filter (depth + normal weighted) |
-| 9. Oct Irradiance | OctIrradiance.hlsl | SH projection per probe |
-| 10. Final Gather | FinalGather.hlsl | 4-probe blend → per-pixel irradiance |
+| 7. Radiance Composite | RadianceComposite.hlsl | Voxel sample at hit + per-ray distance AO (`saturate(closestHitDist / AO_RADIUS)`, packed in alpha) |
+| 8. Spatial Filter | SpatialFilter.hlsl | 4-neighbor cross bilateral filter (depth + normal weighted) |
+| 9. Oct Irradiance | OctIrradiance.hlsl | L2 SH (9 coeff/channel) low-pass projection + reconstruction |
+| 10. Final Gather | FinalGather.hlsl | 5-probe bilateral blend (depth + normal weights) → per-pixel irradiance + AO modulation `lerp(1, ao, AOStrength=0.5)` on indirect only |
 | 11. Screen Temporal | ScreenTemporal.hlsl | Temporal blend (α=0.05) for stability |
 
 ---
