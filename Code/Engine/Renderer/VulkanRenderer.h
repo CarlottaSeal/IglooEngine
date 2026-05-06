@@ -326,7 +326,9 @@ private:
     uint32_t m_modelRingOffset = 0;
     uint32_t m_currentModelDynamicOffset = 0;
     static constexpr uint32_t kCameraRingBufferSize = 64 * 1024;
-    static constexpr uint32_t kModelRingBufferSize  = 64 * 1024;
+    // Aligned slot is 256 B on the user's hardware; sized to fit the F4 stress mode's
+    // peak draw count (4096 pieces ~ 1 MB, kept at 4 MB for headroom).
+    static constexpr uint32_t kModelRingBufferSize  = 4 * 1024 * 1024;
 
     static constexpr uint32_t kMaxBindlessTextures = 256;
     uint32_t     m_nextBindlessIndex = 0;

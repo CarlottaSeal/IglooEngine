@@ -5,6 +5,7 @@
 #ifdef ENGINE_VULKAN_RENDERER
 #include <vulkan/vulkan.h>
 #include <vector>
+#include <chrono>
 #include "Engine/Renderer/VulkanRenderer.h"
 
 // 8-point-light constants for the deferred lighting subpass. Binding: set 1, binding 3.
@@ -72,6 +73,11 @@ public:
 
     bool TryGetLastFrameTimings(double& outGBufferMs, double& outLightingMs);
     bool TryGetLastForwardMs(double& outForwardMs);
+
+    // Wall-clock CPU time spent recording subpass 0 (BeginGBuffer entry through
+    // the end of EndGBufferAndRunLighting's pre-vkCmdNextSubpass work), 64-frame
+    // rolling average. Use to compare MT OFF vs MT ON.
+    double GetCpuRecAvgMs() const { return m_cpuRecAvgMs; }
 
     VkPipelineLayout GetGBufferPipelineLayout() const { return m_gbufferPipelineLayout; }
 
@@ -151,6 +157,13 @@ private:
     bool        m_forwardTimingValid = false;
 
     void ResetSlotAndReadPrevious(VkCommandBuffer cmd, TimingMode newMode);
+
+    static constexpr int kCpuRecRingSize = 64;
+    std::chrono::steady_clock::time_point m_cpuRecStart;
+    double                                m_cpuRecRing[kCpuRecRingSize] = {};
+    int                                   m_cpuRecRingHead              = 0;
+    int                                   m_cpuRecRingFilled            = 0;
+    double                                m_cpuRecAvgMs                 = 0.0;
 
     void CreateRenderPass();
     void CreatePerSwapResources(); // creates G-buffer images + framebuffer + set1 for every swap image

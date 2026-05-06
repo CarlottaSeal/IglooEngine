@@ -254,7 +254,7 @@ void DevConsole::Render_Openfull(AABB2 const& bounds, Renderer& renderer, Bitmap
 	renderer.SetModelConstants(m_config.m_camera->GetCameraToRenderTransform(),Rgba8::WHITE);
 
 	std::vector<Vertex_PCU> consoleQuadVerts;
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
 	renderer.BindTexture(nullptr);
 #endif
 	#ifdef ENGINE_DX12_RENDERER
@@ -307,7 +307,7 @@ void DevConsole::Render_Openfull(AABB2 const& bounds, Renderer& renderer, Bitmap
 		prevBoxMin.y += textDimensions.y;
 	}
 
-#ifdef ENGINE_DX11_RENDERER
+#if defined(ENGINE_DX11_RENDERER) || defined(ENGINE_VULKAN_RENDERER)
 	renderer.BindTexture(&font.GetTexture());
 #endif
 #ifdef ENGINE_DX12_RENDERER

@@ -4165,6 +4165,7 @@ void DX12Renderer::BeginCardCapturePass()
 		}
 
 		UpdateDirectLightPass();
+		m_combinedDirty = true;
 	}
 
 	// Point light changed: full GI update (throttled in Scene::Update).
@@ -4183,6 +4184,7 @@ void DX12Renderer::BeginCardCapturePass()
 			D3D12_RESOURCE_STATE_COMMON);
 
 		UpdateDirectLightPass();
+		m_combinedDirty = true;
 	}
 
 	const std::vector<uint32_t>& dirtyCards = m_giSystem->GetDirtyCards();
@@ -5079,12 +5081,19 @@ void DX12Renderer::CreateCombineSurfaceCacheResources()
 
 void DX12Renderer::RenderingCombineSurfaceCachePass()
 {
+	// Skip when nothing has changed since last Combine. DirectLightUpdate and the
+	// SurfaceRadiosity dispatch both set m_combinedDirty; in steady state with stable
+	// lighting (after radiosity converges) neither runs and we have no work here.
+	if (!m_combinedDirty)
+		return;
+
 	uint32_t maxRes = 0;
 	for (const auto& meta : m_giSystem->m_cardMetadataCPU)
 	{
 		maxRes = max(maxRes, max(meta.m_resolutionX, meta.m_resolutionY));
 	}
 	m_combineSurfaceCache->Execute(m_commandList, &m_surfaceCache, m_giSystem->m_scene->m_nextCardID, maxRes);
+	m_combinedDirty = false;
 }
 
 void DX12Renderer::CreateSurfaceCacheRadiosityResources()
@@ -5199,6 +5208,7 @@ void DX12Renderer::RenderingSurfaceCacheRadiosityPass()
     ConstantBuffer* radiosityCB = m_constantBuffers[k_surfaceRadiosityConstantsSlot];
     radiosityCB->AppendData(&constants, sizeof(SurfaceRadiosityConstants), 0);
     m_surfaceRadiosity->Execute(m_commandList, radiosityCB, constants, &m_surfaceCache);
+    m_combinedDirty = true;
 }
 
 void DX12Renderer::CreateDirectLightUpdateResources()

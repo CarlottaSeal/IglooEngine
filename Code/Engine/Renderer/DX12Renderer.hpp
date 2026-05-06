@@ -473,6 +473,7 @@ protected:
 	int m_radiositySettleFrames = 0;
 	bool m_radiosityConverged = false;
 	bool m_radiosityLightingDirty = false;
+	bool m_combinedDirty = false;  // set when DirectLight or Indirect (radiosity) wrote to atlas; cleared after Combine pass runs
 
 	// DirectLight Update Pass
 	ID3D12PipelineState* m_directLightUpdatePSO = nullptr;

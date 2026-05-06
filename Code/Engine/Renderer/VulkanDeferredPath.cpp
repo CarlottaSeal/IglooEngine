@@ -9,6 +9,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <unordered_set>
 
 namespace
 {
@@ -386,7 +387,11 @@ void VulkanDeferredPath::CreatePerSwapResources()
     const size_t numSwap = m_renderer->m_swapChainImageViews.size();
     m_perSwap.resize(numSwap);
 
-    auto makeImg = [&](VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
+    // Per-swap copies are deduped because alloc params are identical across swap images;
+    // log only the first occurrence per attachment name to DebuggerPrintf (Test E receipt).
+    std::unordered_set<std::string> loggedAttachments;
+
+    auto makeImg = [&](const char* attName, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                        VkImage& img, VkImageView& view, VkDeviceMemory& mem)
     {
         VkImageCreateInfo ic{};
@@ -419,6 +424,21 @@ void VulkanDeferredPath::CreatePerSwapResources()
             ERROR_AND_DIE("VulkanDeferredPath: vkAllocateMemory failed");
         vkBindImageMemory(m_device, img, mem, 0);
 
+        // Receipts for the transient-attachment talking point: did the driver actually
+        // give us a LAZILY_ALLOCATED heap, or did we fall through to DEVICE_LOCAL?
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(m_renderer->m_physicalDevice, &memProps);
+        const VkMemoryPropertyFlags pf = memProps.memoryTypes[alloc.memoryTypeIndex].propertyFlags;
+        const uint32_t heapIdx         = memProps.memoryTypes[alloc.memoryTypeIndex].heapIndex;
+        const bool isLazy              = (pf & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) != 0;
+        if (loggedAttachments.insert(attName).second)
+        {
+            DebuggerPrintf("[gbuffer] %s -> memType=%u heap=%u size=%.2f MB lazy=%s\n",
+                attName, alloc.memoryTypeIndex, heapIdx,
+                (double)memReq.size / (1024.0 * 1024.0),
+                isLazy ? "YES" : "NO");
+        }
+
         VkImageViewCreateInfo iv{};
         iv.sType        = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         iv.image        = img;
@@ -444,11 +464,11 @@ void VulkanDeferredPath::CreatePerSwapResources()
     {
         PerSwap& s = m_perSwap[i];
 
-        makeImg(VK_FORMAT_R8G8B8A8_UNORM,           kColorTransient, VK_IMAGE_ASPECT_COLOR_BIT,
+        makeImg("gAlbedo", VK_FORMAT_R8G8B8A8_UNORM,           kColorTransient, VK_IMAGE_ASPECT_COLOR_BIT,
                 s.gAlbedoImage, s.gAlbedoView, s.gAlbedoMem);
-        makeImg(VK_FORMAT_A2B10G10R10_UNORM_PACK32, kColorTransient, VK_IMAGE_ASPECT_COLOR_BIT,
+        makeImg("gNormal", VK_FORMAT_A2B10G10R10_UNORM_PACK32, kColorTransient, VK_IMAGE_ASPECT_COLOR_BIT,
                 s.gNormalImage, s.gNormalView, s.gNormalMem);
-        makeImg(VK_FORMAT_D32_SFLOAT,               kDepthTransient, VK_IMAGE_ASPECT_DEPTH_BIT,
+        makeImg("gDepth",  VK_FORMAT_D32_SFLOAT,               kDepthTransient, VK_IMAGE_ASPECT_DEPTH_BIT,
                 s.gDepthImage,  s.gDepthView,  s.gDepthMem);
 
         VkImageView views[4] = {
@@ -1121,6 +1141,7 @@ void VulkanDeferredPath::ResetSlotAndReadPrevious(VkCommandBuffer cmd, TimingMod
 
 void VulkanDeferredPath::BeginGBuffer(VkCommandBuffer cmd, uint32_t swapImageIdx)
 {
+    m_cpuRecStart = std::chrono::steady_clock::now();
     g_currentSwapImageIdx = swapImageIdx;
     if (swapImageIdx >= m_perSwap.size())
         ERROR_AND_DIE("VulkanDeferredPath: swap image index out of range");
@@ -1195,6 +1216,17 @@ void VulkanDeferredPath::EndGBufferAndRunLighting(VkCommandBuffer cmd, const Def
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_queryPool, base + 1);
 
     m_renderer->SetPipelineOverride(VK_NULL_HANDLE, VK_NULL_HANDLE);
+
+    {
+        auto end = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - m_cpuRecStart).count();
+        m_cpuRecRing[m_cpuRecRingHead] = ms;
+        m_cpuRecRingHead = (m_cpuRecRingHead + 1) % kCpuRecRingSize;
+        if (m_cpuRecRingFilled < kCpuRecRingSize) ++m_cpuRecRingFilled;
+        double sum = 0.0;
+        for (int i = 0; i < m_cpuRecRingFilled; ++i) sum += m_cpuRecRing[i];
+        m_cpuRecAvgMs = sum / (double)m_cpuRecRingFilled;
+    }
 
     memcpy(m_lightUBOMapped, &lights, sizeof(DeferredLightConstants));
 
