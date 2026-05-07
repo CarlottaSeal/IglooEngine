@@ -208,6 +208,29 @@ private:
     void CreateSurface();
     void PickPhysicalDevice();
     void CreateLogicalDevice();
+    void LoadRayTracingFunctions();
+    void QueryRayTracingProperties();
+
+public:
+    // KHR ray tracing function pointers — populated in LoadRayTracingFunctions
+    // after vkCreateDevice. nullptr if device doesn't support RT.
+    PFN_vkCreateAccelerationStructureKHR              pfnCreateAccelerationStructureKHR              = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR             pfnDestroyAccelerationStructureKHR             = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR       pfnGetAccelerationStructureBuildSizesKHR       = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR           pfnCmdBuildAccelerationStructuresKHR           = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR    pfnGetAccelerationStructureDeviceAddressKHR    = nullptr;
+    PFN_vkCreateRayTracingPipelinesKHR                pfnCreateRayTracingPipelinesKHR                = nullptr;
+    PFN_vkGetRayTracingShaderGroupHandlesKHR          pfnGetRayTracingShaderGroupHandlesKHR          = nullptr;
+    PFN_vkCmdTraceRaysKHR                             pfnCmdTraceRaysKHR                             = nullptr;
+    PFN_vkGetBufferDeviceAddressKHR                   pfnGetBufferDeviceAddressKHR                   = nullptr;
+
+    // RT properties (queried in QueryRayTracingProperties).
+    // rtProperties.shaderGroupHandleSize / shaderGroupBaseAlignment etc. used to build SBTs.
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR    m_rtProperties{};
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR m_asProperties{};
+    bool                                               m_supportsRayTracing = false;
+
+private:
     void CreateSwapChain();
     void CreateImageViews();
     void CreateRenderPass();
@@ -417,7 +440,14 @@ private:
 
     // Device extensions
     const std::vector<const char*> m_deviceExtensions = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        // KHR ray tracing — required for HW RT (DXR equivalent).
+        // BDA + deferred-host-ops are required by acceleration_structure per spec.
+        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+        VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
     };
 
 #ifdef ENGINE_DEBUG_RENDER

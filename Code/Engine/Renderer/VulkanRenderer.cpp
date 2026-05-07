@@ -2732,6 +2732,31 @@ void VulkanRenderer::CreateLogicalDevice()
     descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     descriptorIndexingFeatures.descriptorBindingPartiallyBound = VK_TRUE;
 
+    // KHR ray tracing — chained after descriptor indexing.
+    // BDA is required by AS spec; AS underlies RT pipeline + ray query.
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures{};
+    bdaFeatures.sType                = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    bdaFeatures.bufferDeviceAddress  = VK_TRUE;
+
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
+    asFeatures.sType                 = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    asFeatures.accelerationStructure = VK_TRUE;
+
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
+    rtPipelineFeatures.sType              = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    rtPipelineFeatures.rayTracingPipeline = VK_TRUE;
+
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    rayQueryFeatures.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeatures.rayQuery = VK_TRUE;
+
+    // pNext chain: features2 -> descriptorIndexing -> BDA -> AS -> rtPipeline -> rayQuery
+    descriptorIndexingFeatures.pNext = &bdaFeatures;
+    bdaFeatures.pNext                = &asFeatures;
+    asFeatures.pNext                 = &rtPipelineFeatures;
+    rtPipelineFeatures.pNext         = &rayQueryFeatures;
+    rayQueryFeatures.pNext           = nullptr;
+
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     deviceFeatures2.features = deviceFeatures;
@@ -2771,6 +2796,59 @@ void VulkanRenderer::CreateLogicalDevice()
     vkGetDeviceQueue(m_device, indices.transferFamily.value(), 0, &m_transferQueue);
 
     DebuggerPrintf("Vulkan logical device created successfully! (device = 0x%p)\n", m_device);
+
+    // RT extensions are now in m_deviceExtensions; load function pointers + properties.
+    LoadRayTracingFunctions();
+    QueryRayTracingProperties();
+}
+
+void VulkanRenderer::LoadRayTracingFunctions()
+{
+    pfnCreateAccelerationStructureKHR              = (PFN_vkCreateAccelerationStructureKHR)              vkGetDeviceProcAddr(m_device, "vkCreateAccelerationStructureKHR");
+    pfnDestroyAccelerationStructureKHR             = (PFN_vkDestroyAccelerationStructureKHR)             vkGetDeviceProcAddr(m_device, "vkDestroyAccelerationStructureKHR");
+    pfnGetAccelerationStructureBuildSizesKHR       = (PFN_vkGetAccelerationStructureBuildSizesKHR)       vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureBuildSizesKHR");
+    pfnCmdBuildAccelerationStructuresKHR           = (PFN_vkCmdBuildAccelerationStructuresKHR)           vkGetDeviceProcAddr(m_device, "vkCmdBuildAccelerationStructuresKHR");
+    pfnGetAccelerationStructureDeviceAddressKHR    = (PFN_vkGetAccelerationStructureDeviceAddressKHR)    vkGetDeviceProcAddr(m_device, "vkGetAccelerationStructureDeviceAddressKHR");
+    pfnCreateRayTracingPipelinesKHR                = (PFN_vkCreateRayTracingPipelinesKHR)                vkGetDeviceProcAddr(m_device, "vkCreateRayTracingPipelinesKHR");
+    pfnGetRayTracingShaderGroupHandlesKHR          = (PFN_vkGetRayTracingShaderGroupHandlesKHR)          vkGetDeviceProcAddr(m_device, "vkGetRayTracingShaderGroupHandlesKHR");
+    pfnCmdTraceRaysKHR                             = (PFN_vkCmdTraceRaysKHR)                             vkGetDeviceProcAddr(m_device, "vkCmdTraceRaysKHR");
+    pfnGetBufferDeviceAddressKHR                   = (PFN_vkGetBufferDeviceAddressKHR)                   vkGetDeviceProcAddr(m_device, "vkGetBufferDeviceAddressKHR");
+
+    m_supportsRayTracing =
+        pfnCreateAccelerationStructureKHR              != nullptr &&
+        pfnGetAccelerationStructureBuildSizesKHR       != nullptr &&
+        pfnCmdBuildAccelerationStructuresKHR           != nullptr &&
+        pfnGetAccelerationStructureDeviceAddressKHR    != nullptr &&
+        pfnCreateRayTracingPipelinesKHR                != nullptr &&
+        pfnGetRayTracingShaderGroupHandlesKHR          != nullptr &&
+        pfnCmdTraceRaysKHR                             != nullptr;
+
+    DebuggerPrintf("VulkanRenderer: ray tracing support = %s\n",
+                   m_supportsRayTracing ? "YES" : "NO");
+}
+
+void VulkanRenderer::QueryRayTracingProperties()
+{
+    m_rtProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+    m_asProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+    m_rtProperties.pNext = &m_asProperties;
+
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &m_rtProperties;
+
+    vkGetPhysicalDeviceProperties2(m_physicalDevice, &props2);
+
+    if (m_supportsRayTracing)
+    {
+        DebuggerPrintf("VulkanRenderer: RT shaderGroupHandleSize=%u, shaderGroupBaseAlignment=%u, maxRayRecursionDepth=%u\n",
+                       m_rtProperties.shaderGroupHandleSize,
+                       m_rtProperties.shaderGroupBaseAlignment,
+                       m_rtProperties.maxRayRecursionDepth);
+        DebuggerPrintf("VulkanRenderer: AS maxGeometryCount=%llu, maxInstanceCount=%llu\n",
+                       (unsigned long long)m_asProperties.maxGeometryCount,
+                       (unsigned long long)m_asProperties.maxInstanceCount);
+    }
 }
 
 void VulkanRenderer::CreateSwapChain()
