@@ -429,10 +429,13 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
 
     // Albedo G-buffer: closesthit writes baseColor here; raygen multiplies
     // it back after spatially filtering the un-modulated lighting.
+    // Miss writes 1.0 so sky pixels survive the multiply.
     bindings[16].binding         = 16;
     bindings[16].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[16].descriptorCount = 1;
-    bindings[16].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    bindings[16].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+                                 | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                                 | VK_SHADER_STAGE_MISS_BIT_KHR;
 
     // Texture array slots may be unbound (Sponza has fewer than kMaxRTTextures);
     // PARTIALLY_BOUND_BIT lets validation accept that.
