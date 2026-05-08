@@ -383,7 +383,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[2].binding         = 2;
     bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[2].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
     for (int b = 3; b <= 6; ++b) {
         bindings[b].binding         = (uint32_t)b;
