@@ -10,33 +10,6 @@
 #include <cstring>
 #include <vector>
 
-// =====================================================================
-// VulkanRTPath — Vulkan KHR ray tracing path. Boilerplate skeleton;
-// individual builds (BLAS / TLAS / RT pipeline / SBT / TraceRays) are
-// stubbed with TODO markers. The skeleton documents the dataflow + the
-// engine-side function-pointer wiring (m_renderer->pfn*).
-//
-// Design references:
-//   - VK_KHR_acceleration_structure / VK_KHR_ray_tracing_pipeline / VK_KHR_ray_query
-//   - Sascha Willems' raytracingbasic sample (single triangle)
-//   - NVIDIA's nvpro-samples/vk_raytracing_tutorial_KHR
-//
-// Implementation order (next session):
-//   1. CreateOutputImage  — allocate VK_FORMAT_R8G8B8A8_UNORM storage image,
-//      transition to GENERAL layout, create view.
-//   2. BuildBLAS          — geometry desc with triangle data, query build sizes,
-//      allocate AS buffer + scratch, vkCmdBuildAccelerationStructuresKHR.
-//   3. BuildTLAS          — instance buffer with VkAccelerationStructureInstanceKHR
-//      array, geometry desc with INSTANCES type, build via same path as BLAS.
-//   4. CreateRTPipeline   — shader stages (rgen/rchit/rmiss),
-//      shader groups (general/triangles_hit/miss), VkRayTracingPipelineCreateInfoKHR.
-//   5. CreateSBT          — query handles via vkGetRayTracingShaderGroupHandlesKHR,
-//      pack into HOST_VISIBLE buffer with shaderGroupBaseAlignment between regions.
-//   6. TraceRays          — bind pipeline + descriptor, vkCmdTraceRaysKHR with
-//      raygen/miss/hit/callable region addresses + width/height/1.
-//
-// =====================================================================
-
 void VulkanRTPath::Init(VulkanRenderer* renderer)
 {
     m_renderer = renderer;
@@ -75,6 +48,15 @@ void VulkanRTPath::Shutdown()
     m_cameraUBOMem    = VK_NULL_HANDLE;
     m_cameraUBOMapped = nullptr;
 
+    if (m_matColorsBuf) vkDestroyBuffer(m_device, m_matColorsBuf, nullptr);
+    if (m_matColorsMem) vkFreeMemory(m_device, m_matColorsMem, nullptr);
+    if (m_triMatIdsBuf) vkDestroyBuffer(m_device, m_triMatIdsBuf, nullptr);
+    if (m_triMatIdsMem) vkFreeMemory(m_device, m_triMatIdsMem, nullptr);
+    m_matColorsBuf = VK_NULL_HANDLE;
+    m_matColorsMem = VK_NULL_HANDLE;
+    m_triMatIdsBuf = VK_NULL_HANDLE;
+    m_triMatIdsMem = VK_NULL_HANDLE;
+
     if (m_oneShotPool) vkDestroyCommandPool(m_device, m_oneShotPool, nullptr);
     m_oneShotPool = VK_NULL_HANDLE;
 
@@ -84,7 +66,6 @@ void VulkanRTPath::Shutdown()
 
 void VulkanRTPath::OnSwapchainResized()
 {
-    // TODO: resize output image to new extent.
 }
 
 VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
@@ -93,19 +74,17 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
                                    uint32_t        indexCount)
 {
     VulkanBLAS blas{};
-    const VkDeviceSize vertexBufSize = vertexCount * sizeof(float) * 3;  // vec3 positions
+    const VkDeviceSize vertexBufSize = vertexCount * sizeof(float) * 3;
     const VkDeviceSize indexBufSize  = indexCount * sizeof(uint32_t);
 
-    // Both buffers need: AS build input | shader device address (so AS build
-    // can read them via VkDeviceAddress) | host-coherent (we memcpy in).
     const VkBufferUsageFlags asInputUsage =
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const VkMemoryPropertyFlags hostCoherent =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-    // Vertex buffer.
     CreateAndAllocateBuffer(vertexBufSize,
                             asInputUsage | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                             hostCoherent,
@@ -117,7 +96,6 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
         vkUnmapMemory(m_device, blas.vertexMem);
     }
 
-    // Index buffer.
     CreateAndAllocateBuffer(indexBufSize,
                             asInputUsage | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                             hostCoherent,
@@ -132,7 +110,6 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
     const VkDeviceAddress vbAddr = GetBufferDeviceAddress(blas.vertexBuf);
     const VkDeviceAddress ibAddr = GetBufferDeviceAddress(blas.indexBuf);
 
-    // Geometry desc (single triangles geometry per BLAS for the demo).
     VkAccelerationStructureGeometryTrianglesDataKHR triangles{};
     triangles.sType                       = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
     triangles.vertexFormat                = VK_FORMAT_R32G32B32_SFLOAT;
@@ -141,7 +118,7 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
     triangles.maxVertex                   = vertexCount - 1;
     triangles.indexType                   = VK_INDEX_TYPE_UINT32;
     triangles.indexData.deviceAddress     = ibAddr;
-    triangles.transformData.deviceAddress = 0;        // identity, no per-geometry transform
+    triangles.transformData.deviceAddress = 0;
 
     VkAccelerationStructureGeometryKHR geometry{};
     geometry.sType                  = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -168,7 +145,6 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
         &primitiveCount,
         &sizes);
 
-    // AS storage buffer (sized exactly accelerationStructureSize).
     CreateAndAllocateBuffer(sizes.accelerationStructureSize,
                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -183,7 +159,6 @@ VulkanBLAS VulkanRTPath::BuildBLAS(const float*    vertexPositions,
     if (m_renderer->pfnCreateAccelerationStructureKHR(m_device, &asci, nullptr, &blas.handle) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::BuildBLAS: pfnCreateAccelerationStructureKHR failed");
 
-    // Scratch buffer for the build itself.
     VkBuffer       scratchBuf = VK_NULL_HANDLE;
     VkDeviceMemory scratchMem = VK_NULL_HANDLE;
     CreateAndAllocateBuffer(sizes.buildScratchSize,
@@ -222,7 +197,6 @@ VulkanTLAS VulkanRTPath::BuildTLAS(const std::vector<VkAccelerationStructureInst
 
     const VkDeviceSize instBufSize = sizeof(VkAccelerationStructureInstanceKHR) * instances.size();
 
-    // Instance buffer must be SHADER_DEVICE_ADDRESS + AS_BUILD_INPUT.
     CreateAndAllocateBuffer(instBufSize,
                             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -332,8 +306,6 @@ void VulkanRTPath::DestroyTLAS(VulkanTLAS& tlas)
     tlas = {};
 }
 
-// ---------- shader module from file -------------------------------------
-
 static std::vector<char> LoadFile(const char* path)
 {
     FILE* f = nullptr;
@@ -362,14 +334,11 @@ static VkShaderModule CreateShaderModuleFromSPV(VkDevice device, const std::vect
 
 void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
                                     const char* rchitSpvPath,
-                                    const char* rmissSpvPath)
+                                    const char* rmissSpvPath,
+                                    const char* rshadowMissSpvPath)
 {
-    // ----- Descriptor set layout -----
-    // Bindings match raygen.rgen layout(set=0, binding=N):
-    //   0: storage image       (raygen writes)
-    //   1: acceleration struct (TLAS)
-    //   2: uniform buffer      (camera matrices)
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    // Bindings 0..6: storage image / TLAS / camera UBO / VB / IB / matColors / triMatIds.
+    VkDescriptorSetLayoutBinding bindings[7]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[0].descriptorCount = 1;
@@ -385,9 +354,16 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
+    for (int b = 3; b <= 6; ++b) {
+        bindings[b].binding         = (uint32_t)b;
+        bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[b].descriptorCount = 1;
+        bindings[b].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    }
+
     VkDescriptorSetLayoutCreateInfo dsl{};
     dsl.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl.bindingCount = 3;
+    dsl.bindingCount = 7;
     dsl.pBindings    = bindings;
     if (vkCreateDescriptorSetLayout(m_device, &dsl, nullptr, &m_setLayout) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateRTPipeline: vkCreateDescriptorSetLayout failed");
@@ -399,15 +375,16 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     if (vkCreatePipelineLayout(m_device, &plci, nullptr, &m_pipelineLayout) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateRTPipeline: vkCreatePipelineLayout failed");
 
-    // ----- Shader modules -----
-    auto rgenSpv  = LoadFile(rgenSpvPath);
-    auto rchitSpv = LoadFile(rchitSpvPath);
-    auto rmissSpv = LoadFile(rmissSpvPath);
-    VkShaderModule rgen  = CreateShaderModuleFromSPV(m_device, rgenSpv);
-    VkShaderModule rchit = CreateShaderModuleFromSPV(m_device, rchitSpv);
-    VkShaderModule rmiss = CreateShaderModuleFromSPV(m_device, rmissSpv);
+    auto rgenSpv      = LoadFile(rgenSpvPath);
+    auto rchitSpv     = LoadFile(rchitSpvPath);
+    auto rmissSpv     = LoadFile(rmissSpvPath);
+    auto rshadowSpv   = LoadFile(rshadowMissSpvPath);
+    VkShaderModule rgen        = CreateShaderModuleFromSPV(m_device, rgenSpv);
+    VkShaderModule rchit       = CreateShaderModuleFromSPV(m_device, rchitSpv);
+    VkShaderModule rmiss       = CreateShaderModuleFromSPV(m_device, rmissSpv);
+    VkShaderModule rshadowMiss = CreateShaderModuleFromSPV(m_device, rshadowSpv);
 
-    VkPipelineShaderStageCreateInfo stages[3]{};
+    VkPipelineShaderStageCreateInfo stages[4]{};
     stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage  = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
     stages[0].module = rgen;
@@ -420,61 +397,64 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     stages[2].stage  = VK_SHADER_STAGE_MISS_BIT_KHR;
     stages[2].module = rmiss;
     stages[2].pName  = "main";
+    stages[3].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[3].stage  = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[3].module = rshadowMiss;
+    stages[3].pName  = "main";
 
-    // ----- Shader groups -----
-    // Group 0: general (raygen)   stage index 0
-    // Group 1: triangles hit      closesthit = stage index 1
-    // Group 2: general (miss)     stage index 2
-    VkRayTracingShaderGroupCreateInfoKHR groups[3]{};
-    for (int i = 0; i < 3; ++i) {
+    // Groups: rgen / triangles-hit / primary-miss / shadow-miss.
+    VkRayTracingShaderGroupCreateInfoKHR groups[4]{};
+    for (int i = 0; i < 4; ++i) {
         groups[i].sType = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
         groups[i].generalShader      = VK_SHADER_UNUSED_KHR;
         groups[i].closestHitShader   = VK_SHADER_UNUSED_KHR;
         groups[i].anyHitShader       = VK_SHADER_UNUSED_KHR;
         groups[i].intersectionShader = VK_SHADER_UNUSED_KHR;
     }
-    groups[0].type           = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[0].generalShader  = 0;
-    groups[1].type           = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[0].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[0].generalShader    = 0;
+    groups[1].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
     groups[1].closestHitShader = 1;
-    groups[2].type           = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-    groups[2].generalShader  = 2;
+    groups[2].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[2].generalShader    = 2;
+    groups[3].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[3].generalShader    = 3;
 
     VkRayTracingPipelineCreateInfoKHR rtci{};
     rtci.sType                        = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    rtci.stageCount                   = 3;
+    rtci.stageCount                   = 4;
     rtci.pStages                      = stages;
-    rtci.groupCount                   = 3;
+    rtci.groupCount                   = 4;
     rtci.pGroups                      = groups;
-    rtci.maxPipelineRayRecursionDepth = 1;       // primary rays only
+    rtci.maxPipelineRayRecursionDepth = 2;
     rtci.layout                       = m_pipelineLayout;
     if (m_renderer->pfnCreateRayTracingPipelinesKHR(
             m_device, VK_NULL_HANDLE, VK_NULL_HANDLE,
             1, &rtci, nullptr, &m_rtPipeline) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateRTPipeline: pfnCreateRayTracingPipelinesKHR failed");
 
-    vkDestroyShaderModule(m_device, rgen,  nullptr);
-    vkDestroyShaderModule(m_device, rchit, nullptr);
-    vkDestroyShaderModule(m_device, rmiss, nullptr);
+    vkDestroyShaderModule(m_device, rgen,        nullptr);
+    vkDestroyShaderModule(m_device, rchit,       nullptr);
+    vkDestroyShaderModule(m_device, rmiss,       nullptr);
+    vkDestroyShaderModule(m_device, rshadowMiss, nullptr);
 
-    // ----- Camera UBO (host-mapped, persistently) -----
-    const VkDeviceSize cameraUBOSize = sizeof(float) * 16 * 2;   // viewInv + projInv
+    const VkDeviceSize cameraUBOSize = sizeof(float) * 16 * 2;
     CreateAndAllocateBuffer(cameraUBOSize,
                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                             m_cameraUBO, m_cameraUBOMem);
     vkMapMemory(m_device, m_cameraUBOMem, 0, cameraUBOSize, 0, &m_cameraUBOMapped);
 
-    // ----- Descriptor pool + set -----
-    VkDescriptorPoolSize poolSizes[3]{};
-    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;            poolSizes[0].descriptorCount = 1;
+    VkDescriptorPoolSize poolSizes[4]{};
+    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 1;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[1].descriptorCount = 1;
-    poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;           poolSizes[2].descriptorCount = 1;
+    poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
+    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 4;
 
     VkDescriptorPoolCreateInfo poolCi{};
     poolCi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolCi.maxSets       = 1;
-    poolCi.poolSizeCount = 3;
+    poolCi.poolSizeCount = 4;
     poolCi.pPoolSizes    = poolSizes;
     if (vkCreateDescriptorPool(m_device, &poolCi, nullptr, &m_descriptorPool) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateRTPipeline: vkCreateDescriptorPool failed");
@@ -490,32 +470,29 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
 
 void VulkanRTPath::CreateSBT()
 {
-    // Per Vulkan spec: each "region" (raygen / miss / hit / callable) has a
-    // base address aligned to shaderGroupBaseAlignment, with each handle
-    // padded up to shaderGroupHandleAlignment within the region.
-    // For our 3-group layout (raygen=1, miss=1, hit=1) each region is 1 handle.
-    const uint32_t handleSize    = m_renderer->m_rtProperties.shaderGroupHandleSize;
-    const uint32_t handleAlign   = m_renderer->m_rtProperties.shaderGroupHandleAlignment;
-    const uint32_t baseAlign     = m_renderer->m_rtProperties.shaderGroupBaseAlignment;
+    // Each region's base aligned to shaderGroupBaseAlignment; entries within
+    // a region stride by alignUp(handleSize, handleAlignment).
+    const uint32_t handleSize   = m_renderer->m_rtProperties.shaderGroupHandleSize;
+    const uint32_t handleAlign  = m_renderer->m_rtProperties.shaderGroupHandleAlignment;
+    const uint32_t baseAlign    = m_renderer->m_rtProperties.shaderGroupBaseAlignment;
     auto alignUp = [](uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); };
-    const uint32_t handleStride  = alignUp(handleSize, handleAlign);
+    const uint32_t handleStride = alignUp(handleSize, handleAlign);
 
-    // 3 regions × 1 handle each, but each region's BASE must be baseAlign-aligned.
-    // Layout in buffer: [raygen | pad | miss | pad | hit].
+    const uint32_t raygenSize  = handleStride;
+    const uint32_t missSize    = handleStride * 2;
+    const uint32_t hitSize     = handleStride;
+
     const uint32_t raygenOffset = 0;
-    const uint32_t missOffset   = alignUp(raygenOffset + handleStride, baseAlign);
-    const uint32_t hitOffset    = alignUp(missOffset   + handleStride, baseAlign);
-    const VkDeviceSize sbtSize  = hitOffset + handleStride;
+    const uint32_t missOffset   = alignUp(raygenOffset + raygenSize, baseAlign);
+    const uint32_t hitOffset    = alignUp(missOffset   + missSize,   baseAlign);
+    const VkDeviceSize sbtSize  = hitOffset + hitSize;
 
-    // Get all 3 handles in one call (buffer of N * handleSize bytes).
-    std::vector<uint8_t> handleStorage(handleSize * 3);
+    std::vector<uint8_t> handleStorage(handleSize * 4);
     if (m_renderer->pfnGetRayTracingShaderGroupHandlesKHR(
-            m_device, m_rtPipeline, 0, 3,
+            m_device, m_rtPipeline, 0, 4,
             handleStorage.size(), handleStorage.data()) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateSBT: pfnGetRayTracingShaderGroupHandlesKHR failed");
 
-    // SBT buffer: HOST_VISIBLE for first cut (driver may not be optimal but
-    // works on every implementation; use device-local + staging copy for prod).
     CreateAndAllocateBuffer(sbtSize,
                             VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR |
                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -526,29 +503,60 @@ void VulkanRTPath::CreateSBT()
     void* mapped = nullptr;
     vkMapMemory(m_device, m_sbt.memory, 0, sbtSize, 0, &mapped);
     uint8_t* dst = (uint8_t*)mapped;
-    memcpy(dst + raygenOffset, handleStorage.data() + 0 * handleSize, handleSize);
-    memcpy(dst + missOffset,   handleStorage.data() + 2 * handleSize, handleSize);  // group idx 2 = miss
-    memcpy(dst + hitOffset,    handleStorage.data() + 1 * handleSize, handleSize);  // group idx 1 = hit
+    memcpy(dst + raygenOffset,                  handleStorage.data() + 0 * handleSize, handleSize);
+    memcpy(dst + missOffset + 0 * handleStride, handleStorage.data() + 2 * handleSize, handleSize);
+    memcpy(dst + missOffset + 1 * handleStride, handleStorage.data() + 3 * handleSize, handleSize);
+    memcpy(dst + hitOffset,                     handleStorage.data() + 1 * handleSize, handleSize);
     vkUnmapMemory(m_device, m_sbt.memory);
 
     const VkDeviceAddress sbtAddr = GetBufferDeviceAddress(m_sbt.buffer);
 
-    m_sbt.raygenRegion.deviceAddress = sbtAddr + raygenOffset;
-    m_sbt.raygenRegion.stride        = handleStride;
-    m_sbt.raygenRegion.size          = handleStride;     // raygen size MUST equal stride per spec
-
-    m_sbt.missRegion.deviceAddress   = sbtAddr + missOffset;
-    m_sbt.missRegion.stride          = handleStride;
-    m_sbt.missRegion.size            = handleStride;
-
-    m_sbt.hitRegion.deviceAddress    = sbtAddr + hitOffset;
-    m_sbt.hitRegion.stride           = handleStride;
-    m_sbt.hitRegion.size             = handleStride;
-
-    m_sbt.callableRegion = {};   // unused
+    // raygen.size MUST equal stride per spec.
+    m_sbt.raygenRegion = { sbtAddr + raygenOffset, handleStride, raygenSize };
+    m_sbt.missRegion   = { sbtAddr + missOffset,   handleStride, missSize };
+    m_sbt.hitRegion    = { sbtAddr + hitOffset,    handleStride, hitSize };
+    m_sbt.callableRegion = {};
 }
 
-void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas)
+void VulkanRTPath::SetMaterialBuffers(const float*    matColorsRGB, uint32_t numMaterials,
+                                      const uint32_t* triMatIds,    uint32_t numTriangles)
+{
+    if (m_matColorsBuf) { vkDestroyBuffer(m_device, m_matColorsBuf, nullptr); m_matColorsBuf = VK_NULL_HANDLE; }
+    if (m_matColorsMem) { vkFreeMemory(m_device, m_matColorsMem, nullptr);    m_matColorsMem = VK_NULL_HANDLE; }
+    if (m_triMatIdsBuf) { vkDestroyBuffer(m_device, m_triMatIdsBuf, nullptr); m_triMatIdsBuf = VK_NULL_HANDLE; }
+    if (m_triMatIdsMem) { vkFreeMemory(m_device, m_triMatIdsMem, nullptr);    m_triMatIdsMem = VK_NULL_HANDLE; }
+
+    const VkMemoryPropertyFlags hostCoherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    const VkDeviceSize matSize = numMaterials * sizeof(float) * 3;
+    CreateAndAllocateBuffer(matSize,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            hostCoherent,
+                            m_matColorsBuf, m_matColorsMem);
+    {
+        void* mapped = nullptr;
+        vkMapMemory(m_device, m_matColorsMem, 0, matSize, 0, &mapped);
+        memcpy(mapped, matColorsRGB, (size_t)matSize);
+        vkUnmapMemory(m_device, m_matColorsMem);
+    }
+
+    const VkDeviceSize idSize = numTriangles * sizeof(uint32_t);
+    CreateAndAllocateBuffer(idSize,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            hostCoherent,
+                            m_triMatIdsBuf, m_triMatIdsMem);
+    {
+        void* mapped = nullptr;
+        vkMapMemory(m_device, m_triMatIdsMem, 0, idSize, 0, &mapped);
+        memcpy(mapped, triMatIds, (size_t)idSize);
+        vkUnmapMemory(m_device, m_triMatIdsMem);
+    }
+}
+
+void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& geomBLAS)
 {
     m_lastBoundTLAS = tlas.handle;
 
@@ -566,7 +574,17 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas)
     uboInfo.offset = 0;
     uboInfo.range  = VK_WHOLE_SIZE;
 
-    VkWriteDescriptorSet writes[3]{};
+    VkDescriptorBufferInfo vbInfo{};
+    vbInfo.buffer = geomBLAS.vertexBuf;
+    vbInfo.offset = 0;
+    vbInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo ibInfo{};
+    ibInfo.buffer = geomBLAS.indexBuf;
+    ibInfo.offset = 0;
+    ibInfo.range  = VK_WHOLE_SIZE;
+
+    VkWriteDescriptorSet writes[7]{};
     writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet          = m_descriptorSet;
     writes[0].dstBinding      = 0;
@@ -588,7 +606,45 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas)
     writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     writes[2].pBufferInfo     = &uboInfo;
 
-    vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
+    writes[3].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet          = m_descriptorSet;
+    writes[3].dstBinding      = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo     = &vbInfo;
+
+    writes[4].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet          = m_descriptorSet;
+    writes[4].dstBinding      = 4;
+    writes[4].descriptorCount = 1;
+    writes[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[4].pBufferInfo     = &ibInfo;
+
+    VkDescriptorBufferInfo matInfo{};
+    matInfo.buffer = m_matColorsBuf;
+    matInfo.offset = 0;
+    matInfo.range  = VK_WHOLE_SIZE;
+
+    VkDescriptorBufferInfo triMatInfo{};
+    triMatInfo.buffer = m_triMatIdsBuf;
+    triMatInfo.offset = 0;
+    triMatInfo.range  = VK_WHOLE_SIZE;
+
+    writes[5].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[5].dstSet          = m_descriptorSet;
+    writes[5].dstBinding      = 5;
+    writes[5].descriptorCount = 1;
+    writes[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[5].pBufferInfo     = &matInfo;
+
+    writes[6].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[6].dstSet          = m_descriptorSet;
+    writes[6].dstBinding      = 6;
+    writes[6].descriptorCount = 1;
+    writes[6].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[6].pBufferInfo     = &triMatInfo;
+
+    vkUpdateDescriptorSets(m_device, 7, writes, 0, nullptr);
 }
 
 void VulkanRTPath::UpdateCameraVectors(const float eye[3],
@@ -613,25 +669,24 @@ void VulkanRTPath::RecreateOutput(uint32_t width, uint32_t height)
     vkDeviceWaitIdle(m_device);
     CreateOutputImage(width, height);
 
-    // Re-emit binding 0 (storage image) with the new view; binding 1/2 unchanged
-    // but re-write all three for safety. Caller must have called
-    // UpdateDescriptors at least once already so m_lastBoundTLAS is valid.
-    if (m_lastBoundTLAS)
+    if (m_descriptorSet)
     {
-        VulkanTLAS dummy;
-        dummy.handle = m_lastBoundTLAS;
-        UpdateDescriptors(dummy);
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.imageView   = m_outputImageView;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w{};
+        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet          = m_descriptorSet;
+        w.dstBinding      = 0;
+        w.descriptorCount = 1;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w.pImageInfo      = &imgInfo;
+        vkUpdateDescriptorSets(m_device, 1, &w, 0, nullptr);
     }
 }
 
 void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height)
 {
-    // Storage images need to be in GENERAL during the pipeline's writes.
-    // Caller (App / Game::Render) is responsible for transitioning OUT to
-    // TRANSFER_SRC for the post-trace blit. We assume the image is in GENERAL
-    // when this is called — a one-time UNDEFINED -> GENERAL barrier must be
-    // issued by the caller right after CreateOutputImage / RecreateOutput.
-
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
@@ -645,12 +700,11 @@ void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t heigh
 }
 
 void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
-                                   uint32_t swapW, uint32_t swapH)
+                                   uint32_t swapW, uint32_t swapH,
+                                   VkImageLayout finalLayout)
 {
     VkImage swapImage = m_renderer->m_swapChainImages[m_renderer->m_imageIndex];
 
-    // Barrier 1: output image — make raygen writes visible to transfer reads.
-    // Layout stays GENERAL.
     VkImageMemoryBarrier outBarrier{};
     outBarrier.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     outBarrier.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
@@ -666,10 +720,8 @@ void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &outBarrier);
 
-    // Barrier 2: swapchain image — UNDEFINED -> TRANSFER_DST. Using UNDEFINED
-    // as old layout means contents discarded, which is fine because we're
-    // about to overwrite every pixel via blit. Avoids needing to track
-    // PRESENT_SRC layout per swap image.
+    // UNDEFINED → TRANSFER_DST: discards the previous swap content, which is
+    // fine since we're overwriting every pixel via blit.
     VkImageMemoryBarrier swapToDst{};
     swapToDst.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     swapToDst.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -685,9 +737,6 @@ void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &swapToDst);
 
-    // Blit: 1:1 region copy, NEAREST filter. Sizes might differ if RT output
-    // resolution doesn't match swapchain exactly — Vulkan validation tolerates
-    // size mismatch with linear/nearest filter.
     VkImageBlit region{};
     region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.srcOffsets[0]  = { 0, 0, 0 };
@@ -700,24 +749,26 @@ void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
                    swapImage,    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &region, VK_FILTER_NEAREST);
 
-    // Barrier 3: swapchain image -> PRESENT_SRC_KHR for vkQueuePresentKHR.
-    VkImageMemoryBarrier swapToPresent{};
-    swapToPresent.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    swapToPresent.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    swapToPresent.newLayout        = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    swapToPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapToPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    swapToPresent.image            = swapImage;
-    swapToPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    swapToPresent.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
-    swapToPresent.dstAccessMask    = 0;
+    const bool toColorAttach = (finalLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkImageMemoryBarrier swapEnd{};
+    swapEnd.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    swapEnd.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    swapEnd.newLayout        = finalLayout;
+    swapEnd.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapEnd.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapEnd.image            = swapImage;
+    swapEnd.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    swapEnd.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
+    swapEnd.dstAccessMask    = toColorAttach
+                               ? (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                               : 0;
     vkCmdPipelineBarrier(cmd,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &swapToPresent);
+                         toColorAttach
+                             ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                             : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &swapEnd);
 }
-
-// ----- Helpers -----
 
 void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
 {
@@ -725,9 +776,6 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     m_outputWidth  = width;
     m_outputHeight = height;
 
-    // R8G8B8A8 is fine for first-cut tone-mapped output; switch to RGBA16F later
-    // if HDR accumulation needed. STORAGE for raygen imageStore, TRANSFER_SRC
-    // so we can blit to swapchain after TraceRays.
     VkImageCreateInfo ic{};
     ic.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ic.imageType     = VK_IMAGE_TYPE_2D;
@@ -764,10 +812,8 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (vkCreateImageView(m_device, &iv, nullptr, &m_outputImageView) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: vkCreateImageView failed");
 
-    // One-shot UNDEFINED -> GENERAL transition so first TraceRays' imageStore
-    // is valid. After this returns, the image stays in GENERAL forever (we
-    // only barrier between SHADER_WRITE and TRANSFER_READ during the blit,
-    // never re-layout-transition).
+    // UNDEFINED → GENERAL once at create time; after this we only do
+    // SHADER_WRITE → TRANSFER_READ memory barriers, no layout transitions.
     {
         VkCommandBuffer initCmd = BeginOneShotCmd();
         VkImageMemoryBarrier b{};
@@ -885,8 +931,6 @@ void VulkanRTPath::EndAndSubmitOneShotCmd(VkCommandBuffer cmd)
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &cmd;
 
-    // Synchronous: wait on a fence so AS build is done before we destroy
-    // the scratch buffer right after. Init-time only; not perf-critical.
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkFence fence = VK_NULL_HANDLE;
