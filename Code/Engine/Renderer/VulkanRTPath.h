@@ -87,7 +87,12 @@ public:
                              const float right[3],
                              const float up[3],
                              float fovTan,
-                             float aspect);
+                             float aspect,
+                             uint32_t frameId,
+                             uint32_t numLights);
+
+    // 8 floats per light: vec4(pos.xyz, intensity), vec4(color.rgb, _pad).
+    void SetLights(const float* lightData, uint32_t numLights);
 
     void RecreateOutput(uint32_t width, uint32_t height);
 
@@ -135,6 +140,9 @@ private:
     VkDeviceMemory m_matTexSlotMem   = VK_NULL_HANDLE;
     VkBuffer       m_matNormalSlotBuf = VK_NULL_HANDLE;
     VkDeviceMemory m_matNormalSlotMem = VK_NULL_HANDLE;
+
+    VkBuffer       m_lightsBuf       = VK_NULL_HANDLE;
+    VkDeviceMemory m_lightsMem       = VK_NULL_HANDLE;
 
     struct LoadedTexture {
         VkImage        image = VK_NULL_HANDLE;

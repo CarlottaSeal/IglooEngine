@@ -367,8 +367,8 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     // 0: storage image, 1: TLAS, 2: camera UBO,
     // 3: VB, 4: IB, 5: matColors, 6: triMatIds,
     // 7: bindless textures, 8: matTexSlot, 9: uvCoords, 10: uvIndices,
-    // 11: matNormalSlot.
-    constexpr uint32_t kBindingCount = 12;
+    // 11: matNormalSlot, 12: lights.
+    constexpr uint32_t kBindingCount = 13;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -397,7 +397,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[7].descriptorCount = kMaxRTTextures;
     bindings[7].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
-    for (int b = 8; b <= 11; ++b) {
+    for (int b = 8; b <= 12; ++b) {
         bindings[b].binding         = (uint32_t)b;
         bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[b].descriptorCount = 1;
@@ -491,7 +491,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     vkDestroyShaderModule(m_device, rmiss,       nullptr);
     vkDestroyShaderModule(m_device, rshadowMiss, nullptr);
 
-    const VkDeviceSize cameraUBOSize = sizeof(float) * 16 * 2;
+    const VkDeviceSize cameraUBOSize = sizeof(float) * 4 * 5;   // 5 vec4: 4 camera + 1 misc
     CreateAndAllocateBuffer(cameraUBOSize,
                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -502,7 +502,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 1;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[1].descriptorCount = 1;
     poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
-    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 8;
+    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 9;
     poolSizes[4].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = kMaxRTTextures;
 
     VkDescriptorPoolCreateInfo poolCi{};
@@ -809,6 +809,22 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
     }
 }
 
+void VulkanRTPath::SetLights(const float* lightData, uint32_t numLights)
+{
+    if (m_lightsBuf) { vkDestroyBuffer(m_device, m_lightsBuf, nullptr); m_lightsBuf = VK_NULL_HANDLE; }
+    if (m_lightsMem) { vkFreeMemory(m_device, m_lightsMem, nullptr);    m_lightsMem = VK_NULL_HANDLE; }
+
+    const VkDeviceSize size = (VkDeviceSize)numLights * sizeof(float) * 8;   // 2 vec4 per light
+    CreateAndAllocateBuffer(size,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            m_lightsBuf, m_lightsMem);
+    void* mapped = nullptr;
+    vkMapMemory(m_device, m_lightsMem, 0, size, 0, &mapped);
+    memcpy(mapped, lightData, (size_t)size);
+    vkUnmapMemory(m_device, m_lightsMem);
+}
+
 void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& geomBLAS)
 {
     m_lastBoundTLAS = tlas.handle;
@@ -901,7 +917,7 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
 
     // Bindings 7..10 are owned by SetTextures / SetUVs and may be unbound
     // until those are called. Skip writes for any that aren't ready yet.
-    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf && m_matNormalSlotBuf)
+    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf && m_matNormalSlotBuf && m_lightsBuf)
     {
         std::vector<VkDescriptorImageInfo> texInfos(m_textures.size());
         for (size_t i = 0; i < m_textures.size(); ++i) {
@@ -913,8 +929,9 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         VkDescriptorBufferInfo uvCoordInfo{ m_uvCoordsBuf,     0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo uvIdxInfo  { m_uvIdxBuf,        0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo matNormalInfo{ m_matNormalSlotBuf, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo lightsInfo{ m_lightsBuf, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet extraWrites[5]{};
+        VkWriteDescriptorSet extraWrites[6]{};
         extraWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         extraWrites[0].dstSet          = m_descriptorSet;
         extraWrites[0].dstBinding      = 7;
@@ -950,7 +967,14 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         extraWrites[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         extraWrites[4].pBufferInfo     = &matNormalInfo;
 
-        vkUpdateDescriptorSets(m_device, 5, extraWrites, 0, nullptr);
+        extraWrites[5].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        extraWrites[5].dstSet          = m_descriptorSet;
+        extraWrites[5].dstBinding      = 12;
+        extraWrites[5].descriptorCount = 1;
+        extraWrites[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        extraWrites[5].pBufferInfo     = &lightsInfo;
+
+        vkUpdateDescriptorSets(m_device, 6, extraWrites, 0, nullptr);
     }
 }
 
@@ -959,14 +983,19 @@ void VulkanRTPath::UpdateCameraVectors(const float eye[3],
                                        const float right[3],
                                        const float up[3],
                                        float fovTan,
-                                       float aspect)
+                                       float aspect,
+                                       uint32_t frameId,
+                                       uint32_t numLights)
 {
     if (!m_cameraUBOMapped) return;
-    float ubo[16] = {
+    union { uint32_t u; float f; } u2f0, u2f1;
+    u2f0.u = frameId;   u2f1.u = numLights;
+    float ubo[20] = {
         eye[0],     eye[1],     eye[2],     aspect,
         forward[0], forward[1], forward[2], fovTan,
         right[0],   right[1],   right[2],   0.f,
         up[0],      up[1],      up[2],      0.f,
+        u2f0.f,     u2f1.f,     0.f,        0.f,
     };
     memcpy(m_cameraUBOMapped, ubo, sizeof(ubo));
 }
