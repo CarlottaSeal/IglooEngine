@@ -417,6 +417,10 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
         bindings[b].descriptorCount = 1;
         bindings[b].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
     }
+    // Reservoirs (13, 14) also visible to raygen so the post-TAA spatial
+    // filter can sample neighbor normals/depths without a separate G-buffer.
+    bindings[13].stageFlags |= VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[14].stageFlags |= VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
     bindings[15].binding         = 15;
     bindings[15].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
