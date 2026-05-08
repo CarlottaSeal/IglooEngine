@@ -15,9 +15,14 @@ Image::Image(char const* imageFilePath)
 
 	int width, height, channels;
 	unsigned char* imageData = stbi_load(fullPath.c_str(), &width, &height, &channels, 4); // 加载图像为 RGBA
+	DebuggerPrintf("[Image] path='%s' data=%p w=%d h=%d ch=%d reason='%s'\n",
+	               fullPath.c_str(), (void*)imageData, width, height, channels,
+	               imageData ? "ok" : (stbi_failure_reason() ? stbi_failure_reason() : "(null)"));
 	if (channels != 3 && channels != 4)
 	{
-		ERROR_AND_DIE("Dies");
+		ERROR_AND_DIE(Stringf("Image '%s' has %d channels (need 3 or 4); stbi: %s",
+		                      fullPath.c_str(), channels,
+		                      imageData ? "loaded" : (stbi_failure_reason() ? stbi_failure_reason() : "no data")));
 	}
 
 	if (imageData == nullptr) 

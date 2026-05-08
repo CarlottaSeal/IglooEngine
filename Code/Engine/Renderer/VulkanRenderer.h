@@ -65,6 +65,7 @@ class VulkanDeferredPath; // forward decl
 class VulkanRenderer
 {
     friend class VulkanDeferredPath;
+    friend class VulkanRTPath;
 
 public:
     // Per-draw 16-byte material struct (matches DX12's MaterialConstants CB layout).
