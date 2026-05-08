@@ -84,6 +84,15 @@ void VulkanRTPath::Shutdown()
     if (m_textureSampler) vkDestroySampler(m_device, m_textureSampler, nullptr);
     m_textureSampler = VK_NULL_HANDLE;
 
+    if (m_lightsBuf)    vkDestroyBuffer(m_device, m_lightsBuf, nullptr);
+    if (m_lightsMem)    vkFreeMemory(m_device, m_lightsMem, nullptr);
+    if (m_reservoirBuf) vkDestroyBuffer(m_device, m_reservoirBuf, nullptr);
+    if (m_reservoirMem) vkFreeMemory(m_device, m_reservoirMem, nullptr);
+    m_lightsBuf    = VK_NULL_HANDLE;
+    m_lightsMem    = VK_NULL_HANDLE;
+    m_reservoirBuf = VK_NULL_HANDLE;
+    m_reservoirMem = VK_NULL_HANDLE;
+
     if (m_oneShotPool) vkDestroyCommandPool(m_device, m_oneShotPool, nullptr);
     m_oneShotPool = VK_NULL_HANDLE;
 
@@ -367,8 +376,8 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     // 0: storage image, 1: TLAS, 2: camera UBO,
     // 3: VB, 4: IB, 5: matColors, 6: triMatIds,
     // 7: bindless textures, 8: matTexSlot, 9: uvCoords, 10: uvIndices,
-    // 11: matNormalSlot, 12: lights.
-    constexpr uint32_t kBindingCount = 13;
+    // 11: matNormalSlot, 12: lights, 13: reservoirs.
+    constexpr uint32_t kBindingCount = 14;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -397,7 +406,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[7].descriptorCount = kMaxRTTextures;
     bindings[7].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
-    for (int b = 8; b <= 12; ++b) {
+    for (int b = 8; b <= 13; ++b) {
         bindings[b].binding         = (uint32_t)b;
         bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[b].descriptorCount = 1;
@@ -502,7 +511,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 1;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[1].descriptorCount = 1;
     poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
-    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 9;
+    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 10;
     poolSizes[4].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = kMaxRTTextures;
 
     VkDescriptorPoolCreateInfo poolCi{};
@@ -917,7 +926,7 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
 
     // Bindings 7..10 are owned by SetTextures / SetUVs and may be unbound
     // until those are called. Skip writes for any that aren't ready yet.
-    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf && m_matNormalSlotBuf && m_lightsBuf)
+    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf && m_matNormalSlotBuf && m_lightsBuf && m_reservoirBuf)
     {
         std::vector<VkDescriptorImageInfo> texInfos(m_textures.size());
         for (size_t i = 0; i < m_textures.size(); ++i) {
@@ -930,8 +939,9 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         VkDescriptorBufferInfo uvIdxInfo  { m_uvIdxBuf,        0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo matNormalInfo{ m_matNormalSlotBuf, 0, VK_WHOLE_SIZE };
         VkDescriptorBufferInfo lightsInfo{ m_lightsBuf, 0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo reservoirInfo{ m_reservoirBuf, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet extraWrites[6]{};
+        VkWriteDescriptorSet extraWrites[7]{};
         extraWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         extraWrites[0].dstSet          = m_descriptorSet;
         extraWrites[0].dstBinding      = 7;
@@ -974,7 +984,14 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         extraWrites[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         extraWrites[5].pBufferInfo     = &lightsInfo;
 
-        vkUpdateDescriptorSets(m_device, 6, extraWrites, 0, nullptr);
+        extraWrites[6].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        extraWrites[6].dstSet          = m_descriptorSet;
+        extraWrites[6].dstBinding      = 13;
+        extraWrites[6].descriptorCount = 1;
+        extraWrites[6].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        extraWrites[6].pBufferInfo     = &reservoirInfo;
+
+        vkUpdateDescriptorSets(m_device, 7, extraWrites, 0, nullptr);
     }
 }
 
@@ -1166,6 +1183,21 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
                              0, 0, nullptr, 0, nullptr, 1, &b);
+        EndAndSubmitOneShotCmd(initCmd);
+    }
+
+    // Reservoir SSBO: 16B per pixel. Zero-init so the first frame's read
+    // sees M=0 (no prior sample), avoiding garbage history.
+    if (m_reservoirBuf) { vkDestroyBuffer(m_device, m_reservoirBuf, nullptr); m_reservoirBuf = VK_NULL_HANDLE; }
+    if (m_reservoirMem) { vkFreeMemory(m_device, m_reservoirMem, nullptr);    m_reservoirMem = VK_NULL_HANDLE; }
+    const VkDeviceSize reservoirSize = (VkDeviceSize)width * (VkDeviceSize)height * 16;
+    CreateAndAllocateBuffer(reservoirSize,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                            m_reservoirBuf, m_reservoirMem);
+    {
+        VkCommandBuffer initCmd = BeginOneShotCmd();
+        vkCmdFillBuffer(initCmd, m_reservoirBuf, 0, reservoirSize, 0u);
         EndAndSubmitOneShotCmd(initCmd);
     }
 }

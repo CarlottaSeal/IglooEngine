@@ -144,6 +144,11 @@ private:
     VkBuffer       m_lightsBuf       = VK_NULL_HANDLE;
     VkDeviceMemory m_lightsMem       = VK_NULL_HANDLE;
 
+    // ReSTIR reservoir SSBO: 16 bytes per pixel { int lightIdx, float wsum, int M, _pad }.
+    // Sized to output extent; recreated on RecreateOutput.
+    VkBuffer       m_reservoirBuf    = VK_NULL_HANDLE;
+    VkDeviceMemory m_reservoirMem    = VK_NULL_HANDLE;
+
     struct LoadedTexture {
         VkImage        image = VK_NULL_HANDLE;
         VkDeviceMemory mem   = VK_NULL_HANDLE;
