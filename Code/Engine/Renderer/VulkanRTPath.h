@@ -93,6 +93,13 @@ public:
     // must transition + blit to swapchain after this call.
     void TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
+    // Issues a raygen-write -> transfer-read barrier on the output image,
+    // transitions the current swapchain image UNDEFINED -> TRANSFER_DST,
+    // blits, then transitions to PRESENT_SRC_KHR. Reads m_currentFrame /
+    // m_imageIndex / m_swapChainImages off the friend renderer.
+    // Call immediately after TraceRays, before VulkanRenderer::EndFrame.
+    void BlitToSwapImage(VkCommandBuffer cmd, uint32_t swapW, uint32_t swapH);
+
     VkImage     GetOutputImage() const { return m_outputImage; }
     VkImageView GetOutputImageView() const { return m_outputImageView; }
 

@@ -634,6 +634,79 @@ void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t heigh
                                    width, height, 1);
 }
 
+void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
+                                   uint32_t swapW, uint32_t swapH)
+{
+    VkImage swapImage = m_renderer->m_swapChainImages[m_renderer->m_imageIndex];
+
+    // Barrier 1: output image — make raygen writes visible to transfer reads.
+    // Layout stays GENERAL.
+    VkImageMemoryBarrier outBarrier{};
+    outBarrier.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    outBarrier.oldLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    outBarrier.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+    outBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    outBarrier.image            = m_outputImage;
+    outBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    outBarrier.srcAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+    outBarrier.dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &outBarrier);
+
+    // Barrier 2: swapchain image — UNDEFINED -> TRANSFER_DST. Using UNDEFINED
+    // as old layout means contents discarded, which is fine because we're
+    // about to overwrite every pixel via blit. Avoids needing to track
+    // PRESENT_SRC layout per swap image.
+    VkImageMemoryBarrier swapToDst{};
+    swapToDst.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    swapToDst.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+    swapToDst.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    swapToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapToDst.image            = swapImage;
+    swapToDst.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    swapToDst.srcAccessMask    = 0;
+    swapToDst.dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &swapToDst);
+
+    // Blit: 1:1 region copy, NEAREST filter. Sizes might differ if RT output
+    // resolution doesn't match swapchain exactly — Vulkan validation tolerates
+    // size mismatch with linear/nearest filter.
+    VkImageBlit region{};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffsets[0]  = { 0, 0, 0 };
+    region.srcOffsets[1]  = { (int32_t)m_outputWidth, (int32_t)m_outputHeight, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstOffsets[0]  = { 0, 0, 0 };
+    region.dstOffsets[1]  = { (int32_t)swapW, (int32_t)swapH, 1 };
+    vkCmdBlitImage(cmd,
+                   m_outputImage, VK_IMAGE_LAYOUT_GENERAL,
+                   swapImage,    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   1, &region, VK_FILTER_NEAREST);
+
+    // Barrier 3: swapchain image -> PRESENT_SRC_KHR for vkQueuePresentKHR.
+    VkImageMemoryBarrier swapToPresent{};
+    swapToPresent.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    swapToPresent.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    swapToPresent.newLayout        = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    swapToPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapToPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    swapToPresent.image            = swapImage;
+    swapToPresent.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    swapToPresent.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
+    swapToPresent.dstAccessMask    = 0;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &swapToPresent);
+}
+
 // ----- Helpers -----
 
 void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
@@ -681,11 +754,28 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (vkCreateImageView(m_device, &iv, nullptr, &m_outputImageView) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: vkCreateImageView failed");
 
-    // Transition UNDEFINED -> GENERAL so first frame's imageStore is valid.
-    // Storage images live in GENERAL during the entire RT pipeline lifetime;
-    // we only transition to TRANSFER_SRC during the post-trace blit, then back.
-    // This needs a one-shot cmd buffer; defer to per-frame transition for now —
-    // first TraceRays will issue the UNDEFINED->GENERAL barrier.
+    // One-shot UNDEFINED -> GENERAL transition so first TraceRays' imageStore
+    // is valid. After this returns, the image stays in GENERAL forever (we
+    // only barrier between SHADER_WRITE and TRANSFER_READ during the blit,
+    // never re-layout-transition).
+    {
+        VkCommandBuffer initCmd = BeginOneShotCmd();
+        VkImageMemoryBarrier b{};
+        b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout        = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image            = m_outputImage;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.srcAccessMask    = 0;
+        b.dstAccessMask    = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(initCmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             0, 0, nullptr, 0, nullptr, 1, &b);
+        EndAndSubmitOneShotCmd(initCmd);
+    }
 }
 
 void VulkanRTPath::DestroyOutputImage()
