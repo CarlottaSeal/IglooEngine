@@ -121,6 +121,12 @@ private:
     VkImageView    m_historyImageView= VK_NULL_HANDLE;
     VkDeviceMemory m_historyImageMem = VK_NULL_HANDLE;
 
+    // Albedo G-buffer (rgba8 storage). Closesthit writes baseColor; raygen
+    // multiplies after filtering the un-modulated lighting term.
+    VkImage        m_albedoImage     = VK_NULL_HANDLE;
+    VkImageView    m_albedoImageView = VK_NULL_HANDLE;
+    VkDeviceMemory m_albedoImageMem  = VK_NULL_HANDLE;
+
     VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline            m_rtPipeline     = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_setLayout      = VK_NULL_HANDLE;
@@ -167,6 +173,15 @@ private:
     VkSampler                  m_textureSampler = VK_NULL_HANDLE;
 
     VkAccelerationStructureKHR m_lastBoundTLAS = VK_NULL_HANDLE;
+
+    // Prev-frame camera cache for raygen reprojection.
+    bool  m_havePrevCam     = false;
+    float m_prevEye[3]      = {0};
+    float m_prevForward[3]  = {0};
+    float m_prevRight[3]    = {0};
+    float m_prevUp[3]       = {0};
+    float m_prevFovTan      = 0.f;
+    float m_prevAspect      = 0.f;
 
     VkCommandPool m_oneShotPool = VK_NULL_HANDLE;
 

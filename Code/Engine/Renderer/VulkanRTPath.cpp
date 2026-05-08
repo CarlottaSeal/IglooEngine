@@ -381,8 +381,8 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     // 3: VB, 4: IB, 5: matColors, 6: triMatIds,
     // 7: bindless textures, 8: matTexSlot, 9: uvCoords, 10: uvIndices,
     // 11: matNormalSlot, 12: lights, 13/14: reservoirs ping-pong,
-    // 15: TAA history.
-    constexpr uint32_t kBindingCount = 16;
+    // 15: TAA history, 16: albedo G-buffer.
+    constexpr uint32_t kBindingCount = 17;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -426,6 +426,13 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[15].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[15].descriptorCount = 1;
     bindings[15].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+
+    // Albedo G-buffer: closesthit writes baseColor here; raygen multiplies
+    // it back after spatially filtering the un-modulated lighting.
+    bindings[16].binding         = 16;
+    bindings[16].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[16].descriptorCount = 1;
+    bindings[16].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
     // Texture array slots may be unbound (Sponza has fewer than kMaxRTTextures);
     // PARTIALLY_BOUND_BIT lets validation accept that.
@@ -514,7 +521,8 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     vkDestroyShaderModule(m_device, rmiss,       nullptr);
     vkDestroyShaderModule(m_device, rshadowMiss, nullptr);
 
-    const VkDeviceSize cameraUBOSize = sizeof(float) * 4 * 5;   // 5 vec4: 4 camera + 1 misc
+    // 9 vec4: 5 current (4 cam basis + 1 misc) + 4 prev frame cam (no misc).
+    const VkDeviceSize cameraUBOSize = sizeof(float) * 4 * 9;
     CreateAndAllocateBuffer(cameraUBOSize,
                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
@@ -522,7 +530,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     vkMapMemory(m_device, m_cameraUBOMem, 0, cameraUBOSize, 0, &m_cameraUBOMapped);
 
     VkDescriptorPoolSize poolSizes[5]{};
-    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 2;
+    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 3;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[1].descriptorCount = 1;
     poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
     poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 11;
@@ -958,8 +966,11 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         VkDescriptorImageInfo historyInfo{};
         historyInfo.imageView   = m_historyImageView;
         historyInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo albedoInfo{};
+        albedoInfo.imageView    = m_albedoImageView;
+        albedoInfo.imageLayout  = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet extraWrites[9]{};
+        VkWriteDescriptorSet extraWrites[10]{};
         extraWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         extraWrites[0].dstSet          = m_descriptorSet;
         extraWrites[0].dstBinding      = 7;
@@ -1023,7 +1034,14 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         extraWrites[8].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         extraWrites[8].pImageInfo      = &historyInfo;
 
-        vkUpdateDescriptorSets(m_device, 9, extraWrites, 0, nullptr);
+        extraWrites[9].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        extraWrites[9].dstSet          = m_descriptorSet;
+        extraWrites[9].dstBinding      = 16;
+        extraWrites[9].descriptorCount = 1;
+        extraWrites[9].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        extraWrites[9].pImageInfo      = &albedoInfo;
+
+        vkUpdateDescriptorSets(m_device, 10, extraWrites, 0, nullptr);
     }
 }
 
@@ -1037,20 +1055,41 @@ void VulkanRTPath::UpdateCameraVectors(const float eye[3],
                                        uint32_t numLights)
 {
     if (!m_cameraUBOMapped) return;
-    // Bias both uint bit patterns into normal-float range (OR with 2.0f's
-    // exponent bits). GPUs that flush denormals would otherwise zero out
-    // small uints reinterpreted as float, breaking frameId-driven RNG.
     union { uint32_t u; float f; } u2f0, u2f1;
     u2f0.u = frameId   | 0x40000000u;
     u2f1.u = numLights | 0x40000000u;
-    float ubo[20] = {
+
+    // First frame: prev = current (no real history); afterward use cache.
+    const float* peye   = m_havePrevCam ? m_prevEye     : eye;
+    const float* pfwd   = m_havePrevCam ? m_prevForward : forward;
+    const float* prgt   = m_havePrevCam ? m_prevRight   : right;
+    const float* pup    = m_havePrevCam ? m_prevUp      : up;
+    const float pFovTan = m_havePrevCam ? m_prevFovTan  : fovTan;
+    const float pAspect = m_havePrevCam ? m_prevAspect  : aspect;
+
+    float ubo[36] = {
         eye[0],     eye[1],     eye[2],     aspect,
         forward[0], forward[1], forward[2], fovTan,
         right[0],   right[1],   right[2],   0.f,
         up[0],      up[1],      up[2],      0.f,
         u2f0.f,     u2f1.f,     0.f,        0.f,
+        peye[0],    peye[1],    peye[2],    pAspect,
+        pfwd[0],    pfwd[1],    pfwd[2],    pFovTan,
+        prgt[0],    prgt[1],    prgt[2],    0.f,
+        pup[0],     pup[1],     pup[2],     0.f,
     };
     memcpy(m_cameraUBOMapped, ubo, sizeof(ubo));
+
+    // Cache current as next frame's prev.
+    for (int i = 0; i < 3; ++i) {
+        m_prevEye[i]     = eye[i];
+        m_prevForward[i] = forward[i];
+        m_prevRight[i]   = right[i];
+        m_prevUp[i]      = up[i];
+    }
+    m_prevFovTan = fovTan;
+    m_prevAspect = aspect;
+    m_havePrevCam = true;
 }
 
 void VulkanRTPath::RecreateOutput(uint32_t width, uint32_t height)
@@ -1201,15 +1240,12 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (vkCreateImageView(m_device, &iv, nullptr, &m_outputImageView) != VK_SUCCESS)
         ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: vkCreateImageView failed");
 
-    // History image (TAA): RGBA16F so mid-step accumulation has headroom.
-    if (m_historyImageView) { vkDestroyImageView(m_device, m_historyImageView, nullptr); m_historyImageView = VK_NULL_HANDLE; }
-    if (m_historyImage)     { vkDestroyImage(m_device, m_historyImage, nullptr);         m_historyImage     = VK_NULL_HANDLE; }
-    if (m_historyImageMem)  { vkFreeMemory(m_device, m_historyImageMem, nullptr);        m_historyImageMem  = VK_NULL_HANDLE; }
+    auto allocStorageImage = [&](VkFormat fmt, VkImage& img, VkDeviceMemory& mem, VkImageView& view, const char* what)
     {
         VkImageCreateInfo ic{};
         ic.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ic.imageType     = VK_IMAGE_TYPE_2D;
-        ic.format        = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ic.format        = fmt;
         ic.extent        = { width, height, 1 };
         ic.mipLevels     = 1;
         ic.arrayLayers   = 1;
@@ -1218,36 +1254,45 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT;
         ic.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(m_device, &ic, nullptr, &m_historyImage) != VK_SUCCESS)
-            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: history vkCreateImage failed");
+        if (vkCreateImage(m_device, &ic, nullptr, &img) != VK_SUCCESS)
+            ERROR_AND_DIE(Stringf("VulkanRTPath::CreateOutputImage: %s vkCreateImage failed", what));
 
         VkMemoryRequirements memReq;
-        vkGetImageMemoryRequirements(m_device, m_historyImage, &memReq);
+        vkGetImageMemoryRequirements(m_device, img, &memReq);
         VkMemoryAllocateInfo alloc{};
         alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         alloc.allocationSize  = memReq.size;
         alloc.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(m_device, &alloc, nullptr, &m_historyImageMem) != VK_SUCCESS)
-            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: history vkAllocateMemory failed");
-        vkBindImageMemory(m_device, m_historyImage, m_historyImageMem, 0);
+        if (vkAllocateMemory(m_device, &alloc, nullptr, &mem) != VK_SUCCESS)
+            ERROR_AND_DIE(Stringf("VulkanRTPath::CreateOutputImage: %s vkAllocateMemory failed", what));
+        vkBindImageMemory(m_device, img, mem, 0);
 
         VkImageViewCreateInfo iv{};
         iv.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        iv.image      = m_historyImage;
+        iv.image      = img;
         iv.viewType   = VK_IMAGE_VIEW_TYPE_2D;
-        iv.format     = VK_FORMAT_R16G16B16A16_SFLOAT;
+        iv.format     = fmt;
         iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         iv.subresourceRange.levelCount = 1;
         iv.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(m_device, &iv, nullptr, &m_historyImageView) != VK_SUCCESS)
-            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: history vkCreateImageView failed");
-    }
+        if (vkCreateImageView(m_device, &iv, nullptr, &view) != VK_SUCCESS)
+            ERROR_AND_DIE(Stringf("VulkanRTPath::CreateOutputImage: %s vkCreateImageView failed", what));
+    };
 
-    // UNDEFINED → GENERAL transitions for both images.
+    if (m_historyImageView) { vkDestroyImageView(m_device, m_historyImageView, nullptr); m_historyImageView = VK_NULL_HANDLE; }
+    if (m_historyImage)     { vkDestroyImage(m_device, m_historyImage, nullptr);         m_historyImage     = VK_NULL_HANDLE; }
+    if (m_historyImageMem)  { vkFreeMemory(m_device, m_historyImageMem, nullptr);        m_historyImageMem  = VK_NULL_HANDLE; }
+    if (m_albedoImageView)  { vkDestroyImageView(m_device, m_albedoImageView, nullptr);  m_albedoImageView  = VK_NULL_HANDLE; }
+    if (m_albedoImage)      { vkDestroyImage(m_device, m_albedoImage, nullptr);          m_albedoImage      = VK_NULL_HANDLE; }
+    if (m_albedoImageMem)   { vkFreeMemory(m_device, m_albedoImageMem, nullptr);         m_albedoImageMem   = VK_NULL_HANDLE; }
+    allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_historyImage, m_historyImageMem, m_historyImageView, "history");
+    allocStorageImage(VK_FORMAT_R8G8B8A8_UNORM,      m_albedoImage,  m_albedoImageMem,  m_albedoImageView,  "albedo");
+
+    // UNDEFINED → GENERAL transitions for output, history, and albedo.
     {
         VkCommandBuffer initCmd = BeginOneShotCmd();
-        VkImageMemoryBarrier bs[2]{};
-        for (int i = 0; i < 2; ++i) {
+        VkImageMemoryBarrier bs[3]{};
+        for (int i = 0; i < 3; ++i) {
             bs[i].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             bs[i].oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
             bs[i].newLayout        = VK_IMAGE_LAYOUT_GENERAL;
@@ -1259,10 +1304,11 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         }
         bs[0].image = m_outputImage;
         bs[1].image = m_historyImage;
+        bs[2].image = m_albedoImage;
         vkCmdPipelineBarrier(initCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, nullptr, 0, nullptr, 2, bs);
+                             0, 0, nullptr, 0, nullptr, 3, bs);
         EndAndSubmitOneShotCmd(initCmd);
     }
 
@@ -1299,12 +1345,18 @@ void VulkanRTPath::DestroyOutputImage()
     if (m_historyImageView) vkDestroyImageView(m_device, m_historyImageView, nullptr);
     if (m_historyImage)     vkDestroyImage(m_device, m_historyImage, nullptr);
     if (m_historyImageMem)  vkFreeMemory(m_device, m_historyImageMem, nullptr);
+    if (m_albedoImageView)  vkDestroyImageView(m_device, m_albedoImageView, nullptr);
+    if (m_albedoImage)      vkDestroyImage(m_device, m_albedoImage, nullptr);
+    if (m_albedoImageMem)   vkFreeMemory(m_device, m_albedoImageMem, nullptr);
     m_outputImageView  = VK_NULL_HANDLE;
     m_outputImage      = VK_NULL_HANDLE;
     m_outputImageMem   = VK_NULL_HANDLE;
     m_historyImageView = VK_NULL_HANDLE;
     m_historyImage     = VK_NULL_HANDLE;
     m_historyImageMem  = VK_NULL_HANDLE;
+    m_albedoImageView  = VK_NULL_HANDLE;
+    m_albedoImage      = VK_NULL_HANDLE;
+    m_albedoImageMem   = VK_NULL_HANDLE;
 }
 
 uint32_t VulkanRTPath::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props)
