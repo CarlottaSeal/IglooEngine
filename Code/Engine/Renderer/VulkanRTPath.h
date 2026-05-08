@@ -68,6 +68,18 @@ public:
     void SetMaterialBuffers(const float*    matColorsRGB, uint32_t numMaterials,
                             const uint32_t* triMatIds,    uint32_t numTriangles);
 
+    // uvCoords: 2 floats per UV vertex. uvIndices: 3 uints per triangle.
+    void SetUVs(const float*    uvCoords,   uint32_t numUVs,
+                const uint32_t* uvIndices,  uint32_t numTriangles);
+
+    // Loads TGAs from disk into a bindless texture array (binding 7).
+    // matTexSlot[mat] = -1 means "no texture; use matColors instead".
+    // Up to kMaxRTTextures unique textures supported.
+    void SetTextures(const std::vector<std::string>& texturePaths,
+                     const int32_t* matTexSlot, uint32_t numMaterials);
+
+    static constexpr uint32_t kMaxRTTextures = 32;
+
     void UpdateCameraVectors(const float eye[3],
                              const float forward[3],
                              const float right[3],
@@ -112,6 +124,21 @@ private:
     VkDeviceMemory m_matColorsMem    = VK_NULL_HANDLE;
     VkBuffer       m_triMatIdsBuf    = VK_NULL_HANDLE;
     VkDeviceMemory m_triMatIdsMem    = VK_NULL_HANDLE;
+
+    VkBuffer       m_uvCoordsBuf     = VK_NULL_HANDLE;
+    VkDeviceMemory m_uvCoordsMem     = VK_NULL_HANDLE;
+    VkBuffer       m_uvIdxBuf        = VK_NULL_HANDLE;
+    VkDeviceMemory m_uvIdxMem        = VK_NULL_HANDLE;
+    VkBuffer       m_matTexSlotBuf   = VK_NULL_HANDLE;
+    VkDeviceMemory m_matTexSlotMem   = VK_NULL_HANDLE;
+
+    struct LoadedTexture {
+        VkImage        image = VK_NULL_HANDLE;
+        VkDeviceMemory mem   = VK_NULL_HANDLE;
+        VkImageView    view  = VK_NULL_HANDLE;
+    };
+    std::vector<LoadedTexture> m_textures;
+    VkSampler                  m_textureSampler = VK_NULL_HANDLE;
 
     VkAccelerationStructureKHR m_lastBoundTLAS = VK_NULL_HANDLE;
 
