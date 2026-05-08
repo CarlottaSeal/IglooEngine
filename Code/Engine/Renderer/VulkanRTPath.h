@@ -79,9 +79,16 @@ public:
     // CreateRTPipeline + CreateOutputImage are all done.
     void UpdateDescriptors(const VulkanTLAS& tlas);
 
-    // Per-frame: copy 2 column-major mat4s (view-inverse, proj-inverse) to
-    // the host-mapped camera UBO. 128 bytes total.
-    void UpdateCamera(const float* viewInverse_4x4, const float* projInverse_4x4);
+    // Per-frame: write explicit camera basis + projection params into the
+    // host-mapped UBO. Avoids matrix-convention pitfalls between engine
+    // (row-vector / x-fwd, y-left, z-up) and GLSL (column-vector). Layout
+    // matches CameraUBO in raygen.rgen — 4 vec4, 64 bytes total.
+    void UpdateCameraVectors(const float eye[3],
+                             const float forward[3],
+                             const float right[3],
+                             const float up[3],
+                             float fovTan,
+                             float aspect);
 
     // Recreate output storage image at the given extent. Called once at
     // startup, again on swapchain resize. Re-runs UpdateDescriptors-equivalent

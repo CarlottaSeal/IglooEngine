@@ -591,11 +591,21 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas)
     vkUpdateDescriptorSets(m_device, 3, writes, 0, nullptr);
 }
 
-void VulkanRTPath::UpdateCamera(const float* viewInverse_4x4, const float* projInverse_4x4)
+void VulkanRTPath::UpdateCameraVectors(const float eye[3],
+                                       const float forward[3],
+                                       const float right[3],
+                                       const float up[3],
+                                       float fovTan,
+                                       float aspect)
 {
     if (!m_cameraUBOMapped) return;
-    memcpy((uint8_t*)m_cameraUBOMapped + 0,            viewInverse_4x4, sizeof(float) * 16);
-    memcpy((uint8_t*)m_cameraUBOMapped + 16 * sizeof(float), projInverse_4x4, sizeof(float) * 16);
+    float ubo[16] = {
+        eye[0],     eye[1],     eye[2],     aspect,
+        forward[0], forward[1], forward[2], fovTan,
+        right[0],   right[1],   right[2],   0.f,
+        up[0],      up[1],      up[2],      0.f,
+    };
+    memcpy(m_cameraUBOMapped, ubo, sizeof(ubo));
 }
 
 void VulkanRTPath::RecreateOutput(uint32_t width, uint32_t height)
