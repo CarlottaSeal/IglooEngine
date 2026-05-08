@@ -73,12 +73,14 @@ public:
                 const uint32_t* uvIndices,  uint32_t numTriangles);
 
     // Loads TGAs from disk into a bindless texture array (binding 7).
-    // matTexSlot[mat] = -1 means "no texture; use matColors instead".
+    // matDiffuseSlot[mat] / matNormalSlot[mat] = -1 means "no texture".
     // Up to kMaxRTTextures unique textures supported.
     void SetTextures(const std::vector<std::string>& texturePaths,
-                     const int32_t* matTexSlot, uint32_t numMaterials);
+                     const int32_t* matDiffuseSlot,
+                     const int32_t* matNormalSlot,
+                     uint32_t numMaterials);
 
-    static constexpr uint32_t kMaxRTTextures = 32;
+    static constexpr uint32_t kMaxRTTextures = 64;
 
     void UpdateCameraVectors(const float eye[3],
                              const float forward[3],
@@ -131,6 +133,8 @@ private:
     VkDeviceMemory m_uvIdxMem        = VK_NULL_HANDLE;
     VkBuffer       m_matTexSlotBuf   = VK_NULL_HANDLE;
     VkDeviceMemory m_matTexSlotMem   = VK_NULL_HANDLE;
+    VkBuffer       m_matNormalSlotBuf = VK_NULL_HANDLE;
+    VkDeviceMemory m_matNormalSlotMem = VK_NULL_HANDLE;
 
     struct LoadedTexture {
         VkImage        image = VK_NULL_HANDLE;

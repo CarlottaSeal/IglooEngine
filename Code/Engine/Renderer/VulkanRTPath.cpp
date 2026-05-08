@@ -62,14 +62,18 @@ void VulkanRTPath::Shutdown()
     if (m_uvCoordsMem)   vkFreeMemory(m_device, m_uvCoordsMem, nullptr);
     if (m_uvIdxBuf)      vkDestroyBuffer(m_device, m_uvIdxBuf, nullptr);
     if (m_uvIdxMem)      vkFreeMemory(m_device, m_uvIdxMem, nullptr);
-    if (m_matTexSlotBuf) vkDestroyBuffer(m_device, m_matTexSlotBuf, nullptr);
-    if (m_matTexSlotMem) vkFreeMemory(m_device, m_matTexSlotMem, nullptr);
-    m_uvCoordsBuf   = VK_NULL_HANDLE;
-    m_uvCoordsMem   = VK_NULL_HANDLE;
-    m_uvIdxBuf      = VK_NULL_HANDLE;
-    m_uvIdxMem      = VK_NULL_HANDLE;
-    m_matTexSlotBuf = VK_NULL_HANDLE;
-    m_matTexSlotMem = VK_NULL_HANDLE;
+    if (m_matTexSlotBuf)    vkDestroyBuffer(m_device, m_matTexSlotBuf, nullptr);
+    if (m_matTexSlotMem)    vkFreeMemory(m_device, m_matTexSlotMem, nullptr);
+    if (m_matNormalSlotBuf) vkDestroyBuffer(m_device, m_matNormalSlotBuf, nullptr);
+    if (m_matNormalSlotMem) vkFreeMemory(m_device, m_matNormalSlotMem, nullptr);
+    m_uvCoordsBuf      = VK_NULL_HANDLE;
+    m_uvCoordsMem      = VK_NULL_HANDLE;
+    m_uvIdxBuf         = VK_NULL_HANDLE;
+    m_uvIdxMem         = VK_NULL_HANDLE;
+    m_matTexSlotBuf    = VK_NULL_HANDLE;
+    m_matTexSlotMem    = VK_NULL_HANDLE;
+    m_matNormalSlotBuf = VK_NULL_HANDLE;
+    m_matNormalSlotMem = VK_NULL_HANDLE;
 
     for (auto& t : m_textures) {
         if (t.view)  vkDestroyImageView(m_device, t.view, nullptr);
@@ -362,9 +366,9 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
 {
     // 0: storage image, 1: TLAS, 2: camera UBO,
     // 3: VB, 4: IB, 5: matColors, 6: triMatIds,
-    // 7: bindless diffuse textures, 8: matTexSlot,
-    // 9: uvCoords, 10: uvIndices.
-    constexpr uint32_t kBindingCount = 11;
+    // 7: bindless textures, 8: matTexSlot, 9: uvCoords, 10: uvIndices,
+    // 11: matNormalSlot.
+    constexpr uint32_t kBindingCount = 12;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -393,7 +397,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[7].descriptorCount = kMaxRTTextures;
     bindings[7].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
-    for (int b = 8; b <= 10; ++b) {
+    for (int b = 8; b <= 11; ++b) {
         bindings[b].binding         = (uint32_t)b;
         bindings[b].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[b].descriptorCount = 1;
@@ -498,7 +502,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;              poolSizes[0].descriptorCount = 1;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; poolSizes[1].descriptorCount = 1;
     poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;             poolSizes[2].descriptorCount = 1;
-    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 7;
+    poolSizes[3].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;             poolSizes[3].descriptorCount = 8;
     poolSizes[4].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;     poolSizes[4].descriptorCount = kMaxRTTextures;
 
     VkDescriptorPoolCreateInfo poolCi{};
@@ -643,7 +647,9 @@ void VulkanRTPath::SetUVs(const float* uvCoords, uint32_t numUVs,
 }
 
 void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
-                               const int32_t* matTexSlot, uint32_t numMaterials)
+                               const int32_t* matDiffuseSlot,
+                               const int32_t* matNormalSlot,
+                               uint32_t numMaterials)
 {
     GUARANTEE_OR_DIE(texturePaths.size() <= kMaxRTTextures,
                      "VulkanRTPath::SetTextures: texture count exceeds kMaxRTTextures");
@@ -654,8 +660,10 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
         if (t.mem)   vkFreeMemory(m_device, t.mem, nullptr);
     }
     m_textures.clear();
-    if (m_matTexSlotBuf) { vkDestroyBuffer(m_device, m_matTexSlotBuf, nullptr); m_matTexSlotBuf = VK_NULL_HANDLE; }
-    if (m_matTexSlotMem) { vkFreeMemory(m_device, m_matTexSlotMem, nullptr);    m_matTexSlotMem = VK_NULL_HANDLE; }
+    if (m_matTexSlotBuf)    { vkDestroyBuffer(m_device, m_matTexSlotBuf, nullptr);    m_matTexSlotBuf    = VK_NULL_HANDLE; }
+    if (m_matTexSlotMem)    { vkFreeMemory(m_device, m_matTexSlotMem, nullptr);       m_matTexSlotMem    = VK_NULL_HANDLE; }
+    if (m_matNormalSlotBuf) { vkDestroyBuffer(m_device, m_matNormalSlotBuf, nullptr); m_matNormalSlotBuf = VK_NULL_HANDLE; }
+    if (m_matNormalSlotMem) { vkFreeMemory(m_device, m_matNormalSlotMem, nullptr);    m_matNormalSlotMem = VK_NULL_HANDLE; }
 
     if (!m_textureSampler)
     {
@@ -785,8 +793,19 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
     {
         void* mapped = nullptr;
         vkMapMemory(m_device, m_matTexSlotMem, 0, matSize, 0, &mapped);
-        memcpy(mapped, matTexSlot, (size_t)matSize);
+        memcpy(mapped, matDiffuseSlot, (size_t)matSize);
         vkUnmapMemory(m_device, m_matTexSlotMem);
+    }
+
+    CreateAndAllocateBuffer(matSize,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            m_matNormalSlotBuf, m_matNormalSlotMem);
+    {
+        void* mapped = nullptr;
+        vkMapMemory(m_device, m_matNormalSlotMem, 0, matSize, 0, &mapped);
+        memcpy(mapped, matNormalSlot, (size_t)matSize);
+        vkUnmapMemory(m_device, m_matNormalSlotMem);
     }
 }
 
@@ -882,7 +901,7 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
 
     // Bindings 7..10 are owned by SetTextures / SetUVs and may be unbound
     // until those are called. Skip writes for any that aren't ready yet.
-    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf)
+    if (!m_textures.empty() && m_matTexSlotBuf && m_uvCoordsBuf && m_uvIdxBuf && m_matNormalSlotBuf)
     {
         std::vector<VkDescriptorImageInfo> texInfos(m_textures.size());
         for (size_t i = 0; i < m_textures.size(); ++i) {
@@ -890,11 +909,12 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
             texInfos[i].imageView   = m_textures[i].view;
             texInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
-        VkDescriptorBufferInfo matTexInfo{ m_matTexSlotBuf, 0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo uvCoordInfo{ m_uvCoordsBuf,  0, VK_WHOLE_SIZE };
-        VkDescriptorBufferInfo uvIdxInfo  { m_uvIdxBuf,     0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo matTexInfo{ m_matTexSlotBuf,    0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo uvCoordInfo{ m_uvCoordsBuf,     0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo uvIdxInfo  { m_uvIdxBuf,        0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo matNormalInfo{ m_matNormalSlotBuf, 0, VK_WHOLE_SIZE };
 
-        VkWriteDescriptorSet extraWrites[4]{};
+        VkWriteDescriptorSet extraWrites[5]{};
         extraWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         extraWrites[0].dstSet          = m_descriptorSet;
         extraWrites[0].dstBinding      = 7;
@@ -923,7 +943,14 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         extraWrites[3].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         extraWrites[3].pBufferInfo     = &uvIdxInfo;
 
-        vkUpdateDescriptorSets(m_device, 4, extraWrites, 0, nullptr);
+        extraWrites[4].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        extraWrites[4].dstSet          = m_descriptorSet;
+        extraWrites[4].dstBinding      = 11;
+        extraWrites[4].descriptorCount = 1;
+        extraWrites[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        extraWrites[4].pBufferInfo     = &matNormalInfo;
+
+        vkUpdateDescriptorSets(m_device, 5, extraWrites, 0, nullptr);
     }
 }
 
