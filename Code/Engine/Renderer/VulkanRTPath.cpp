@@ -1267,7 +1267,9 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (m_reservoirMem)  { vkFreeMemory(m_device, m_reservoirMem,  nullptr);    m_reservoirMem  = VK_NULL_HANDLE; }
     if (m_reservoirBuf2) { vkDestroyBuffer(m_device, m_reservoirBuf2, nullptr); m_reservoirBuf2 = VK_NULL_HANDLE; }
     if (m_reservoirMem2) { vkFreeMemory(m_device, m_reservoirMem2, nullptr);    m_reservoirMem2 = VK_NULL_HANDLE; }
-    const VkDeviceSize reservoirSize = (VkDeviceSize)width * (VkDeviceSize)height * 16;
+    // 32 bytes per pixel: { int lightIdx, float wsum, int M, int _pad,
+    //                       vec3 normal, float depth }.
+    const VkDeviceSize reservoirSize = (VkDeviceSize)width * (VkDeviceSize)height * 32;
     const VkBufferUsageFlags resUsage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     CreateAndAllocateBuffer(reservoirSize, resUsage,
