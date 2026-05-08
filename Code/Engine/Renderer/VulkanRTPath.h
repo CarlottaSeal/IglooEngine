@@ -115,6 +115,12 @@ private:
     uint32_t       m_outputWidth     = 0;
     uint32_t       m_outputHeight    = 0;
 
+    // TAA history (RGBA16F storage image, GENERAL layout). Raygen reads
+    // prev-frame color, blends with new, writes back.
+    VkImage        m_historyImage    = VK_NULL_HANDLE;
+    VkImageView    m_historyImageView= VK_NULL_HANDLE;
+    VkDeviceMemory m_historyImageMem = VK_NULL_HANDLE;
+
     VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline            m_rtPipeline     = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_setLayout      = VK_NULL_HANDLE;
@@ -144,10 +150,13 @@ private:
     VkBuffer       m_lightsBuf       = VK_NULL_HANDLE;
     VkDeviceMemory m_lightsMem       = VK_NULL_HANDLE;
 
-    // ReSTIR reservoir SSBO: 16 bytes per pixel { int lightIdx, float wsum, int M, _pad }.
-    // Sized to output extent; recreated on RecreateOutput.
+    // ReSTIR reservoir SSBOs: 16 bytes per pixel. Two buffers ping-pong for
+    // spatial reuse (so neighbor reads see last frame's data, not partially-
+    // written current frame). Shader picks read/write half via frameId & 1.
     VkBuffer       m_reservoirBuf    = VK_NULL_HANDLE;
     VkDeviceMemory m_reservoirMem    = VK_NULL_HANDLE;
+    VkBuffer       m_reservoirBuf2   = VK_NULL_HANDLE;
+    VkDeviceMemory m_reservoirMem2   = VK_NULL_HANDLE;
 
     struct LoadedTexture {
         VkImage        image = VK_NULL_HANDLE;
