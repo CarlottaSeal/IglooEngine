@@ -146,6 +146,19 @@ private:
     VkImageView    m_atrousPongView  = VK_NULL_HANDLE;
     VkDeviceMemory m_atrousPongMem   = VK_NULL_HANDLE;
 
+    // SVGF moments (rgba16f): r=M1, g=M2, b=accumulated sample count.
+    // Persistent across frames — raygen samples at reprojected pixel.
+    VkImage        m_momentsImage     = VK_NULL_HANDLE;
+    VkImageView    m_momentsImageView = VK_NULL_HANDLE;
+    VkDeviceMemory m_momentsImageMem  = VK_NULL_HANDLE;
+
+    // Material-ID G-buffer (R32UI). closesthit stamps the hit triangle's
+    // material id; raygen compares prev-frame matId at the reprojected
+    // pixel against current matId to reject cross-material history.
+    VkImage        m_matIdImage      = VK_NULL_HANDLE;
+    VkImageView    m_matIdImageView  = VK_NULL_HANDLE;
+    VkDeviceMemory m_matIdImageMem   = VK_NULL_HANDLE;
+
     // Compute pipelines + descriptor machinery for the denoise chain.
     VkPipelineLayout      m_atrousPipelineLayout    = VK_NULL_HANDLE;
     VkPipeline            m_atrousPipeline          = VK_NULL_HANDLE;
