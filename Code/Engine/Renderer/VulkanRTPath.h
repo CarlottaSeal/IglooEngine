@@ -98,6 +98,15 @@ public:
 
     void TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
+    // Loads atrous.comp + composite.comp, builds compute pipelines + DSs.
+    // Call once after CreateRTPipeline. Image bindings reference the output /
+    // history / albedo / ping / pong images created by RecreateOutput.
+    void CreateDenoisePipelines(const char* atrousSpvPath, const char* compositeSpvPath);
+
+    // Run the atrous chain (3 passes: stride 1, 2, 4) + composite. Caller
+    // must have already submitted TraceRays in the same cmd buffer.
+    void RunDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32_t frameId);
+
     // finalLayout = COLOR_ATTACHMENT_OPTIMAL when an overlay pass loads after.
     void BlitToSwapImage(VkCommandBuffer cmd, uint32_t swapW, uint32_t swapH,
                          VkImageLayout finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -126,6 +135,31 @@ private:
     VkImage        m_albedoImage     = VK_NULL_HANDLE;
     VkImageView    m_albedoImageView = VK_NULL_HANDLE;
     VkDeviceMemory m_albedoImageMem  = VK_NULL_HANDLE;
+
+    // A-Trous ping-pong buffers (rgba16f, GENERAL). Compute passes filter
+    // history → ping → pong → ping → ...; final composite reads the last
+    // pass and modulates by albedo into outImage.
+    VkImage        m_atrousPing      = VK_NULL_HANDLE;
+    VkImageView    m_atrousPingView  = VK_NULL_HANDLE;
+    VkDeviceMemory m_atrousPingMem   = VK_NULL_HANDLE;
+    VkImage        m_atrousPong      = VK_NULL_HANDLE;
+    VkImageView    m_atrousPongView  = VK_NULL_HANDLE;
+    VkDeviceMemory m_atrousPongMem   = VK_NULL_HANDLE;
+
+    // Compute pipelines + descriptor machinery for the denoise chain.
+    VkPipelineLayout      m_atrousPipelineLayout    = VK_NULL_HANDLE;
+    VkPipeline            m_atrousPipeline          = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_atrousDescSetLayout     = VK_NULL_HANDLE;
+    VkDescriptorPool      m_atrousDescPool          = VK_NULL_HANDLE;
+    VkDescriptorSet       m_atrousSet_HtoPing       = VK_NULL_HANDLE;
+    VkDescriptorSet       m_atrousSet_PingToPong    = VK_NULL_HANDLE;
+    VkDescriptorSet       m_atrousSet_PongToPing    = VK_NULL_HANDLE;
+
+    VkPipelineLayout      m_compositePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            m_compositePipeline       = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_compositeDescSetLayout  = VK_NULL_HANDLE;
+    VkDescriptorPool      m_compositeDescPool       = VK_NULL_HANDLE;
+    VkDescriptorSet       m_compositeSet            = VK_NULL_HANDLE;
 
     VkPipelineLayout      m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline            m_rtPipeline     = VK_NULL_HANDLE;

@@ -97,6 +97,23 @@ void VulkanRTPath::Shutdown()
     m_reservoirBuf2 = VK_NULL_HANDLE;
     m_reservoirMem2 = VK_NULL_HANDLE;
 
+    if (m_atrousPipeline)         vkDestroyPipeline(m_device, m_atrousPipeline, nullptr);
+    if (m_atrousPipelineLayout)   vkDestroyPipelineLayout(m_device, m_atrousPipelineLayout, nullptr);
+    if (m_atrousDescSetLayout)    vkDestroyDescriptorSetLayout(m_device, m_atrousDescSetLayout, nullptr);
+    if (m_atrousDescPool)         vkDestroyDescriptorPool(m_device, m_atrousDescPool, nullptr);
+    if (m_compositePipeline)      vkDestroyPipeline(m_device, m_compositePipeline, nullptr);
+    if (m_compositePipelineLayout)vkDestroyPipelineLayout(m_device, m_compositePipelineLayout, nullptr);
+    if (m_compositeDescSetLayout) vkDestroyDescriptorSetLayout(m_device, m_compositeDescSetLayout, nullptr);
+    if (m_compositeDescPool)      vkDestroyDescriptorPool(m_device, m_compositeDescPool, nullptr);
+    m_atrousPipeline           = VK_NULL_HANDLE;
+    m_atrousPipelineLayout     = VK_NULL_HANDLE;
+    m_atrousDescSetLayout      = VK_NULL_HANDLE;
+    m_atrousDescPool           = VK_NULL_HANDLE;
+    m_compositePipeline        = VK_NULL_HANDLE;
+    m_compositePipelineLayout  = VK_NULL_HANDLE;
+    m_compositeDescSetLayout   = VK_NULL_HANDLE;
+    m_compositeDescPool        = VK_NULL_HANDLE;
+
     if (m_oneShotPool) vkDestroyCommandPool(m_device, m_oneShotPool, nullptr);
     m_oneShotPool = VK_NULL_HANDLE;
 
@@ -1130,6 +1147,248 @@ void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t heigh
                                    width, height, 1);
 }
 
+// Push constants for atrous (must match GLSL):
+struct AtrousPushConstants {
+    int32_t  stride;
+    uint32_t frameId;
+};
+
+void VulkanRTPath::CreateDenoisePipelines(const char* atrousSpvPath, const char* compositeSpvPath)
+{
+    // ----- Atrous: 5 bindings -----
+    VkDescriptorSetLayoutBinding atrousBindings[5]{};
+    // 0: in image (rgba16f), 1: out image (rgba16f), 4: albedo (rgba8)
+    atrousBindings[0].binding         = 0;
+    atrousBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atrousBindings[0].descriptorCount = 1;
+    atrousBindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    atrousBindings[1].binding         = 1;
+    atrousBindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atrousBindings[1].descriptorCount = 1;
+    atrousBindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    atrousBindings[2].binding         = 2;
+    atrousBindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    atrousBindings[2].descriptorCount = 1;
+    atrousBindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    atrousBindings[3].binding         = 3;
+    atrousBindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    atrousBindings[3].descriptorCount = 1;
+    atrousBindings[3].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    atrousBindings[4].binding         = 4;
+    atrousBindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atrousBindings[4].descriptorCount = 1;
+    atrousBindings[4].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslAtrous{};
+    dslAtrous.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslAtrous.bindingCount = 5;
+    dslAtrous.pBindings    = atrousBindings;
+    if (vkCreateDescriptorSetLayout(m_device, &dslAtrous, nullptr, &m_atrousDescSetLayout) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: atrous DSL failed");
+
+    VkPushConstantRange pcAtrous{};
+    pcAtrous.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcAtrous.offset     = 0;
+    pcAtrous.size       = sizeof(AtrousPushConstants);
+
+    VkPipelineLayoutCreateInfo plAtrous{};
+    plAtrous.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plAtrous.setLayoutCount         = 1;
+    plAtrous.pSetLayouts            = &m_atrousDescSetLayout;
+    plAtrous.pushConstantRangeCount = 1;
+    plAtrous.pPushConstantRanges    = &pcAtrous;
+    if (vkCreatePipelineLayout(m_device, &plAtrous, nullptr, &m_atrousPipelineLayout) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: atrous pipelineLayout failed");
+
+    auto atrousSpv = LoadFile(atrousSpvPath);
+    VkShaderModule atrousMod = CreateShaderModuleFromSPV(m_device, atrousSpv);
+    VkComputePipelineCreateInfo cpAtrous{};
+    cpAtrous.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpAtrous.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpAtrous.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpAtrous.stage.module = atrousMod;
+    cpAtrous.stage.pName  = "main";
+    cpAtrous.layout       = m_atrousPipelineLayout;
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &cpAtrous, nullptr, &m_atrousPipeline) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: atrous compute pipeline failed");
+    vkDestroyShaderModule(m_device, atrousMod, nullptr);
+
+    // ----- Composite: 3 storage-image bindings -----
+    VkDescriptorSetLayoutBinding compBindings[3]{};
+    for (int i = 0; i < 3; ++i) {
+        compBindings[i].binding         = (uint32_t)i;
+        compBindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        compBindings[i].descriptorCount = 1;
+        compBindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslComp{};
+    dslComp.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslComp.bindingCount = 3;
+    dslComp.pBindings    = compBindings;
+    if (vkCreateDescriptorSetLayout(m_device, &dslComp, nullptr, &m_compositeDescSetLayout) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: composite DSL failed");
+
+    VkPipelineLayoutCreateInfo plComp{};
+    plComp.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plComp.setLayoutCount         = 1;
+    plComp.pSetLayouts            = &m_compositeDescSetLayout;
+    if (vkCreatePipelineLayout(m_device, &plComp, nullptr, &m_compositePipelineLayout) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: composite pipelineLayout failed");
+
+    auto compSpv = LoadFile(compositeSpvPath);
+    VkShaderModule compMod = CreateShaderModuleFromSPV(m_device, compSpv);
+    VkComputePipelineCreateInfo cpComp{};
+    cpComp.sType        = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpComp.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpComp.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpComp.stage.module = compMod;
+    cpComp.stage.pName  = "main";
+    cpComp.layout       = m_compositePipelineLayout;
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &cpComp, nullptr, &m_compositePipeline) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: composite compute pipeline failed");
+    vkDestroyShaderModule(m_device, compMod, nullptr);
+
+    // ----- Descriptor pools + sets -----
+    VkDescriptorPoolSize atrousPoolSizes[2]{};
+    atrousPoolSizes[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atrousPoolSizes[0].descriptorCount = 9;        // 3 sets × 3 image bindings
+    atrousPoolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    atrousPoolSizes[1].descriptorCount = 6;        // 3 sets × 2 buffer bindings
+    VkDescriptorPoolCreateInfo atrousPoolCi{};
+    atrousPoolCi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    atrousPoolCi.maxSets       = 3;
+    atrousPoolCi.poolSizeCount = 2;
+    atrousPoolCi.pPoolSizes    = atrousPoolSizes;
+    if (vkCreateDescriptorPool(m_device, &atrousPoolCi, nullptr, &m_atrousDescPool) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: atrous pool failed");
+
+    VkDescriptorSetLayout atrousLayouts[3] = { m_atrousDescSetLayout, m_atrousDescSetLayout, m_atrousDescSetLayout };
+    VkDescriptorSetAllocateInfo atrousAlloc{};
+    atrousAlloc.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    atrousAlloc.descriptorPool     = m_atrousDescPool;
+    atrousAlloc.descriptorSetCount = 3;
+    atrousAlloc.pSetLayouts        = atrousLayouts;
+    VkDescriptorSet atrousSets[3];
+    if (vkAllocateDescriptorSets(m_device, &atrousAlloc, atrousSets) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: atrous set alloc failed");
+    m_atrousSet_HtoPing    = atrousSets[0];
+    m_atrousSet_PingToPong = atrousSets[1];
+    m_atrousSet_PongToPing = atrousSets[2];
+
+    auto writeAtrousSet = [&](VkDescriptorSet set, VkImageView inV, VkImageView outV) {
+        VkDescriptorImageInfo inInfo  { VK_NULL_HANDLE, inV,  VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo outInfo { VK_NULL_HANDLE, outV, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo albInfo { VK_NULL_HANDLE, m_albedoImageView, VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorBufferInfo resAInfo{ m_reservoirBuf,  0, VK_WHOLE_SIZE };
+        VkDescriptorBufferInfo resBInfo{ m_reservoirBuf2, 0, VK_WHOLE_SIZE };
+
+        VkWriteDescriptorSet w[5]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = set; w[0].dstBinding = 0;
+        w[0].descriptorCount = 1; w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[0].pImageInfo = &inInfo;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = set; w[1].dstBinding = 1;
+        w[1].descriptorCount = 1; w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &outInfo;
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = set; w[2].dstBinding = 2;
+        w[2].descriptorCount = 1; w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &resAInfo;
+        w[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[3].dstSet = set; w[3].dstBinding = 3;
+        w[3].descriptorCount = 1; w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &resBInfo;
+        w[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[4].dstSet = set; w[4].dstBinding = 4;
+        w[4].descriptorCount = 1; w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[4].pImageInfo = &albInfo;
+        vkUpdateDescriptorSets(m_device, 5, w, 0, nullptr);
+    };
+    writeAtrousSet(m_atrousSet_HtoPing,    m_historyImageView, m_atrousPingView);
+    writeAtrousSet(m_atrousSet_PingToPong, m_atrousPingView,   m_atrousPongView);
+    writeAtrousSet(m_atrousSet_PongToPing, m_atrousPongView,   m_atrousPingView);
+
+    // Composite pool + set
+    VkDescriptorPoolSize compPoolSize{};
+    compPoolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    compPoolSize.descriptorCount = 3;
+    VkDescriptorPoolCreateInfo compPoolCi{};
+    compPoolCi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    compPoolCi.maxSets       = 1;
+    compPoolCi.poolSizeCount = 1;
+    compPoolCi.pPoolSizes    = &compPoolSize;
+    if (vkCreateDescriptorPool(m_device, &compPoolCi, nullptr, &m_compositeDescPool) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: composite pool failed");
+
+    VkDescriptorSetAllocateInfo compAlloc{};
+    compAlloc.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    compAlloc.descriptorPool     = m_compositeDescPool;
+    compAlloc.descriptorSetCount = 1;
+    compAlloc.pSetLayouts        = &m_compositeDescSetLayout;
+    if (vkAllocateDescriptorSets(m_device, &compAlloc, &m_compositeSet) != VK_SUCCESS)
+        ERROR_AND_DIE("VulkanRTPath::CreateDenoisePipelines: composite set alloc failed");
+
+    // Composite reads from PING (final atrous output after 3 odd passes).
+    VkDescriptorImageInfo cFiltInfo  { VK_NULL_HANDLE, m_atrousPingView,  VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo cAlbInfo   { VK_NULL_HANDLE, m_albedoImageView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo cOutInfo   { VK_NULL_HANDLE, m_outputImageView, VK_IMAGE_LAYOUT_GENERAL };
+    VkWriteDescriptorSet cw[3]{};
+    cw[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[0].dstSet = m_compositeSet; cw[0].dstBinding = 0;
+    cw[0].descriptorCount = 1; cw[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[0].pImageInfo = &cFiltInfo;
+    cw[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[1].dstSet = m_compositeSet; cw[1].dstBinding = 1;
+    cw[1].descriptorCount = 1; cw[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[1].pImageInfo = &cAlbInfo;
+    cw[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; cw[2].dstSet = m_compositeSet; cw[2].dstBinding = 2;
+    cw[2].descriptorCount = 1; cw[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; cw[2].pImageInfo = &cOutInfo;
+    vkUpdateDescriptorSets(m_device, 3, cw, 0, nullptr);
+}
+
+void VulkanRTPath::RunDenoise(VkCommandBuffer cmd, uint32_t width, uint32_t height, uint32_t frameId)
+{
+    const uint32_t gx = (width  + 7) / 8;
+    const uint32_t gy = (height + 7) / 8;
+
+    auto computeBarrier = [&]() {
+        VkMemoryBarrier b{};
+        b.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &b, 0, nullptr, 0, nullptr);
+    };
+
+    // RT writes to history → barrier before compute reads.
+    computeBarrier();
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_atrousPipeline);
+
+    auto dispatchAtrous = [&](VkDescriptorSet set, int stride) {
+        AtrousPushConstants pc{ stride, frameId };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                m_atrousPipelineLayout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, m_atrousPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        computeBarrier();
+    };
+    // Five-pass A-Trous (strides 1/2/4/8/16, ~31-pixel reach). Descriptor
+    // sets cycle PING↔PONG; final result lands in PING after odd-number
+    // passes (5 here), which is what the composite shader binding reads.
+    dispatchAtrous(m_atrousSet_HtoPing,    1);   // history → ping
+    dispatchAtrous(m_atrousSet_PingToPong, 2);   // ping → pong
+    dispatchAtrous(m_atrousSet_PongToPing, 4);   // pong → ping
+    dispatchAtrous(m_atrousSet_PingToPong, 8);   // ping → pong
+    dispatchAtrous(m_atrousSet_PongToPing, 16);  // pong → ping
+
+    // Composite: ping × albedo + Reinhard → outImage
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_compositePipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            m_compositePipelineLayout, 0, 1, &m_compositeSet, 0, nullptr);
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    // Compute write → blit read on outImage.
+    VkMemoryBarrier toBlit{};
+    toBlit.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    toBlit.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toBlit.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &toBlit, 0, nullptr, 0, nullptr);
+}
+
 void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
                                    uint32_t swapW, uint32_t swapH,
                                    VkImageLayout finalLayout)
@@ -1288,14 +1547,22 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (m_albedoImageView)  { vkDestroyImageView(m_device, m_albedoImageView, nullptr);  m_albedoImageView  = VK_NULL_HANDLE; }
     if (m_albedoImage)      { vkDestroyImage(m_device, m_albedoImage, nullptr);          m_albedoImage      = VK_NULL_HANDLE; }
     if (m_albedoImageMem)   { vkFreeMemory(m_device, m_albedoImageMem, nullptr);         m_albedoImageMem   = VK_NULL_HANDLE; }
+    if (m_atrousPingView)   { vkDestroyImageView(m_device, m_atrousPingView, nullptr);   m_atrousPingView   = VK_NULL_HANDLE; }
+    if (m_atrousPing)       { vkDestroyImage(m_device, m_atrousPing, nullptr);           m_atrousPing       = VK_NULL_HANDLE; }
+    if (m_atrousPingMem)    { vkFreeMemory(m_device, m_atrousPingMem, nullptr);          m_atrousPingMem    = VK_NULL_HANDLE; }
+    if (m_atrousPongView)   { vkDestroyImageView(m_device, m_atrousPongView, nullptr);   m_atrousPongView   = VK_NULL_HANDLE; }
+    if (m_atrousPong)       { vkDestroyImage(m_device, m_atrousPong, nullptr);           m_atrousPong       = VK_NULL_HANDLE; }
+    if (m_atrousPongMem)    { vkFreeMemory(m_device, m_atrousPongMem, nullptr);          m_atrousPongMem    = VK_NULL_HANDLE; }
     allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_historyImage, m_historyImageMem, m_historyImageView, "history");
     allocStorageImage(VK_FORMAT_R8G8B8A8_UNORM,      m_albedoImage,  m_albedoImageMem,  m_albedoImageView,  "albedo");
+    allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_atrousPing,   m_atrousPingMem,   m_atrousPingView,   "atrous ping");
+    allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_atrousPong,   m_atrousPongMem,   m_atrousPongView,   "atrous pong");
 
-    // UNDEFINED → GENERAL transitions for output, history, and albedo.
+    // UNDEFINED → GENERAL transitions for output / history / albedo / atrous.
     {
         VkCommandBuffer initCmd = BeginOneShotCmd();
-        VkImageMemoryBarrier bs[3]{};
-        for (int i = 0; i < 3; ++i) {
+        VkImageMemoryBarrier bs[5]{};
+        for (int i = 0; i < 5; ++i) {
             bs[i].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             bs[i].oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
             bs[i].newLayout        = VK_IMAGE_LAYOUT_GENERAL;
@@ -1308,10 +1575,12 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         bs[0].image = m_outputImage;
         bs[1].image = m_historyImage;
         bs[2].image = m_albedoImage;
+        bs[3].image = m_atrousPing;
+        bs[4].image = m_atrousPong;
         vkCmdPipelineBarrier(initCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                             0, 0, nullptr, 0, nullptr, 3, bs);
+                             VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 5, bs);
         EndAndSubmitOneShotCmd(initCmd);
     }
 
@@ -1351,6 +1620,12 @@ void VulkanRTPath::DestroyOutputImage()
     if (m_albedoImageView)  vkDestroyImageView(m_device, m_albedoImageView, nullptr);
     if (m_albedoImage)      vkDestroyImage(m_device, m_albedoImage, nullptr);
     if (m_albedoImageMem)   vkFreeMemory(m_device, m_albedoImageMem, nullptr);
+    if (m_atrousPingView)   vkDestroyImageView(m_device, m_atrousPingView, nullptr);
+    if (m_atrousPing)       vkDestroyImage(m_device, m_atrousPing, nullptr);
+    if (m_atrousPingMem)    vkFreeMemory(m_device, m_atrousPingMem, nullptr);
+    if (m_atrousPongView)   vkDestroyImageView(m_device, m_atrousPongView, nullptr);
+    if (m_atrousPong)       vkDestroyImage(m_device, m_atrousPong, nullptr);
+    if (m_atrousPongMem)    vkFreeMemory(m_device, m_atrousPongMem, nullptr);
     m_outputImageView  = VK_NULL_HANDLE;
     m_outputImage      = VK_NULL_HANDLE;
     m_outputImageMem   = VK_NULL_HANDLE;
@@ -1360,6 +1635,12 @@ void VulkanRTPath::DestroyOutputImage()
     m_albedoImageView  = VK_NULL_HANDLE;
     m_albedoImage      = VK_NULL_HANDLE;
     m_albedoImageMem   = VK_NULL_HANDLE;
+    m_atrousPingView   = VK_NULL_HANDLE;
+    m_atrousPing       = VK_NULL_HANDLE;
+    m_atrousPingMem    = VK_NULL_HANDLE;
+    m_atrousPongView   = VK_NULL_HANDLE;
+    m_atrousPong       = VK_NULL_HANDLE;
+    m_atrousPongMem    = VK_NULL_HANDLE;
 }
 
 uint32_t VulkanRTPath::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props)
