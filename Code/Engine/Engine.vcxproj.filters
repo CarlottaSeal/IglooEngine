@@ -216,7 +216,7 @@
     <ClCompile Include="Math\Capsule2D.cpp">
       <Filter>Math</Filter>
     </ClCompile>
-    <ClCompile Include="Math\BSPTree2D.cpp">
+    <ClCompile Include="Math\KDTree2D.cpp">
       <Filter>Math</Filter>
     </ClCompile>
     <ClCompile Include="Math\BVHTree2D.cpp">
@@ -641,7 +641,7 @@
     <ClInclude Include="Math\Capsule2D.h">
       <Filter>Math</Filter>
     </ClInclude>
-    <ClInclude Include="Math\BSPTree2D.hpp">
+    <ClInclude Include="Math\KDTree2D.hpp">
       <Filter>Math</Filter>
     </ClInclude>
     <ClInclude Include="Math\BVHTree2D.hpp">

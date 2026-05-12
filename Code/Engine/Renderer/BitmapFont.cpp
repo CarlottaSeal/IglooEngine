@@ -22,6 +22,13 @@ BitmapFont::BitmapFont(char const* fontFilePathNameWithNoExtension, Texture& fon
 	}
 }
 
+void BitmapFont::ComputeProportionalWidths()
+{
+	std::string imagePath = m_fontFilePathNameWithNoExtension + ".png";
+	ComputeGlyphWidthsFromImage(imagePath.c_str());
+	m_isProportional = true;
+}
+
 void BitmapFont::ComputeGlyphWidthsFromImage(char const* imageFilePath)
 {
 	Image image(imageFilePath);

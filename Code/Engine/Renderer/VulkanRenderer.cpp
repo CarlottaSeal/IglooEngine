@@ -3581,13 +3581,13 @@ VkSurfaceFormatKHR VulkanRenderer::ChooseSwapSurfaceFormat(const std::vector<VkS
 
 VkPresentModeKHR VulkanRenderer::ChooseSwapPresentMode(const std::vector<VkPresentModeKHR>& availablePresentModes)
 {
-    for (const auto& availablePresentMode : availablePresentModes)
-    {
-        if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR)
-        {
-            return availablePresentMode;
-        }
-    }
+    // Prefer IMMEDIATE so benchmarking sees true GPU-bound FPS rather than
+    // a VSync ceiling at the monitor refresh rate. Fall back through MAILBOX
+    // (low-latency triple buffer) to FIFO (always supported).
+    for (const auto& m : availablePresentModes)
+        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) return m;
+    for (const auto& m : availablePresentModes)
+        if (m == VK_PRESENT_MODE_MAILBOX_KHR)   return m;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 

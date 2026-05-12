@@ -36,6 +36,7 @@ public:
 		int maxGlyphsToDraw = 99999999);
 	float GetTextWidth(float cellHeight, std::string const& text, float cellAspect = 1.f);
 	bool IsProportional() const { return m_isProportional; }
+	void ComputeProportionalWidths();
 
 protected:
 	float GetGlyphAspect(int glyphUnicode) const;

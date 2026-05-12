@@ -113,6 +113,8 @@ public:
 
     VkImage     GetOutputImage() const { return m_outputImage; }
     VkImageView GetOutputImageView() const { return m_outputImageView; }
+    VkImage     GetDepthImage()     const { return m_depthImage; }
+    VkImageView GetDepthImageView() const { return m_depthImageView; }
 
 private:
     VulkanRenderer* m_renderer = nullptr;
@@ -158,6 +160,13 @@ private:
     VkImage        m_matIdImage      = VK_NULL_HANDLE;
     VkImageView    m_matIdImageView  = VK_NULL_HANDLE;
     VkDeviceMemory m_matIdImageMem   = VK_NULL_HANDLE;
+
+    // RT depth output (D32_SFLOAT, storage + depth-stencil-attachment).
+    // raygen writes clip-space depth so a downstream forward pass can
+    // depth-test debug primitives against the RT scene.
+    VkImage        m_depthImage      = VK_NULL_HANDLE;
+    VkImageView    m_depthImageView  = VK_NULL_HANDLE;
+    VkDeviceMemory m_depthImageMem   = VK_NULL_HANDLE;
 
     // Compute pipelines + descriptor machinery for the denoise chain.
     VkPipelineLayout      m_atrousPipelineLayout    = VK_NULL_HANDLE;

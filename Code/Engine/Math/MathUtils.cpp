@@ -2116,4 +2116,114 @@ Vec3 DiminishingAdd(const Vec3& a, const Vec3& b)
 	);
 }
 
+//-----------------------------------------------------------------------------
+// Signed Distance Fields - 2D primitive shapes
+// Convention: positive outside, zero on edge, negative inside.
+// Magnitude is the distance to the nearest point on the boundary.
+//-----------------------------------------------------------------------------
+
+float GetDistanceSDF_Disc2D(Vec2 const& p, Vec2 const& center, float radius)
+{
+	float dx = p.x - center.x;
+	float dy = p.y - center.y;
+	return sqrtf(dx * dx + dy * dy) - radius;
+}
+
+float GetDistanceSDF_AABB2D(Vec2 const& p, AABB2 const& box)
+{
+	Vec2 center = box.GetCenter();
+	Vec2 half(box.GetWidth() * 0.5f, box.GetHeight() * 0.5f);
+	return GetDistanceSDF_AABB2D(p, center, half);
+}
+
+float GetDistanceSDF_AABB2D(Vec2 const& p, Vec2 const& center, Vec2 const& halfDims)
+{
+	float dx = fabsf(p.x - center.x) - halfDims.x;
+	float dy = fabsf(p.y - center.y) - halfDims.y;
+	float ox = fmaxf(dx, 0.f);
+	float oy = fmaxf(dy, 0.f);
+	float outside = sqrtf(ox * ox + oy * oy);
+	float inside  = fminf(fmaxf(dx, dy), 0.f);
+	return outside + inside;
+}
+
+float GetDistanceSDF_OBB2D(Vec2 const& p, Vec2 const& center, Vec2 const& iBasis, Vec2 const& halfDims)
+{
+	Vec2 d(p.x - center.x, p.y - center.y);
+	float lx = d.x * iBasis.x + d.y * iBasis.y;
+	float ly = -d.x * iBasis.y + d.y * iBasis.x;
+	return GetDistanceSDF_AABB2D(Vec2(lx, ly), Vec2(0.f, 0.f), halfDims);
+}
+
+float GetDistanceSDF_OBB2D(Vec2 const& p, Vec2 const& center, Vec2 const& halfDims, float rotationDegrees)
+{
+	float c = CosDegrees(rotationDegrees);
+	float s = SinDegrees(rotationDegrees);
+	return GetDistanceSDF_OBB2D(p, center, Vec2(c, s), halfDims);
+}
+
+float GetDistanceSDF_LineSegment2D(Vec2 const& p, Vec2 const& a, Vec2 const& b, float thickness)
+{
+	Vec2 pa(p.x - a.x, p.y - a.y);
+	Vec2 ba(b.x - a.x, b.y - a.y);
+	float lenSq = ba.x * ba.x + ba.y * ba.y;
+	float t = (lenSq > 0.f) ? GetClampedZeroToOne((pa.x * ba.x + pa.y * ba.y) / lenSq) : 0.f;
+	float dx = pa.x - ba.x * t;
+	float dy = pa.y - ba.y * t;
+	return sqrtf(dx * dx + dy * dy) - thickness;
+}
+
+float GetDistanceSDF_Capsule2D(Vec2 const& p, Vec2 const& boneStart, Vec2 const& boneEnd, float radius)
+{
+	return GetDistanceSDF_LineSegment2D(p, boneStart, boneEnd, radius);
+}
+
+float GetDistanceSDF_Plane2D(Vec2 const& p, Vec2 const& unitNormal, float distFromOrigin)
+{
+	return DotProduct2D(p, unitNormal) - distFromOrigin;
+}
+
+float GetDistanceSDF_HexagonRegular2D(Vec2 const& p, Vec2 const& center, float radius)
+{
+	// Flat-top regular hexagon, radius = apothem (inscribed circle radius).
+	// Inigo Quilez form, https://iquilezles.org/articles/distfunctions2d/
+	const float kx = -0.8660254038f; // -sqrt(3)/2
+	const float ky =  0.5f;
+	const float kz =  0.5773502692f; // 1/sqrt(3)
+	float qx = fabsf(p.x - center.x);
+	float qy = fabsf(p.y - center.y);
+	float dot = fminf(kx * qx + ky * qy, 0.f) * 2.f;
+	qx -= dot * kx;
+	qy -= dot * ky;
+	qx -= GetClamped(qx, -kz * radius, kz * radius);
+	qy -= radius;
+	float len = sqrtf(qx * qx + qy * qy);
+	return (qy < 0.f) ? -len : len;
+}
+
+//-----------------------------------------------------------------------------
+// SDF combine ops
+//-----------------------------------------------------------------------------
+
+float SDFUnion(float a, float b)        { return fminf(a, b); }
+float SDFIntersection(float a, float b) { return fmaxf(a, b); }
+float SDFSubtract(float a, float b)     { return fmaxf(a, -b); }
+
+float SDFSmoothUnion(float a, float b, float k)
+{
+	if (k <= 0.f) return fminf(a, b);
+	float h = fmaxf(k - fabsf(a - b), 0.f) / k;
+	return fminf(a, b) - h * h * h * k * (1.f / 6.f);
+}
+
+float SDFSmoothIntersection(float a, float b, float k)
+{
+	return -SDFSmoothUnion(-a, -b, k);
+}
+
+float SDFSmoothSubtract(float a, float b, float k)
+{
+	return SDFSmoothIntersection(a, -b, k);
+}
+
 

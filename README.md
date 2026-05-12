@@ -182,7 +182,7 @@ A 64×64 `R32_UINT` **tile→card-index LUT** (16 KB in the default 64-pixel-til
 | Bounds | `AABB2`, `AABB3`, `OBB3`, `Sphere`, `Frustum` (6 planes), `Plane3` |
 | 2D Primitives | `Disc2D`, `Capsule2D` |
 | Curves | `LinearCurve1D`, `PiecewiseCurve1D`, Cubic Hermite spline |
-| Spatial | `BSPTree2D`, `BVHTree2D`, CPU `BVH` + `GPUBVHNode` |
+| Spatial | `KDTree2D`, `BVHTree2D`, CPU `BVH` + `GPUBVHNode` |
 | Utility | `MathUtils`, `RandomNumberGenerator` |
 
 ---

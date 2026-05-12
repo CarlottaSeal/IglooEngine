@@ -66,6 +66,7 @@ void VulkanDeferredPath::Shutdown()
     if (m_queryPool)               vkDestroyQueryPool(m_device, m_queryPool, nullptr);
     if (m_overlayRenderPass)       vkDestroyRenderPass(m_device, m_overlayRenderPass, nullptr);
     if (m_forwardRenderPass)       vkDestroyRenderPass(m_device, m_forwardRenderPass, nullptr);
+    if (m_rtDebugRenderPass)       vkDestroyRenderPass(m_device, m_rtDebugRenderPass, nullptr);
     if (m_deferredRenderPass)      vkDestroyRenderPass(m_device, m_deferredRenderPass, nullptr);
 
     *this = VulkanDeferredPath{};
@@ -225,6 +226,76 @@ void VulkanDeferredPath::CreateRenderPass()
         orpci.dependencyCount = 2; orpci.pDependencies = overlayDeps;
         if (vkCreateRenderPass(m_device, &orpci, nullptr, &m_overlayRenderPass) != VK_SUCCESS)
             ERROR_AND_DIE("VulkanDeferredPath: failed to create overlay render pass");
+    }
+
+    // RT-debug render pass: LOAD_OP_LOAD on both swap (preserves RT blit)
+    // and depth (preserves the clip-space depth raygen/closesthit/miss
+    // wrote). Render-pass-compatible with VulkanRenderer's standard
+    // pipelines (same color/depth formats and sample count), so debug
+    // primitives flow through the renderer's auto-pipeline path.
+    {
+        VkAttachmentDescription rtAtts[2]{};
+        rtAtts[0].format         = m_renderer->m_swapChainImageFormat;
+        rtAtts[0].samples        = VK_SAMPLE_COUNT_1_BIT;
+        rtAtts[0].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+        rtAtts[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+        rtAtts[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        rtAtts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        rtAtts[0].initialLayout  = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        rtAtts[0].finalLayout    = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        // Depth attachment is required for VulkanRenderer's standard pipelines
+        // (render-pass compatibility), but D32 storage write from RT didn't
+        // round-trip on this driver. Clear-to-far instead — debug primitives
+        // pass LEQUAL against 1.0 and always render on top of the RT scene.
+        rtAtts[1].format         = VK_FORMAT_D32_SFLOAT;
+        rtAtts[1].samples        = VK_SAMPLE_COUNT_1_BIT;
+        rtAtts[1].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        rtAtts[1].storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        rtAtts[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        rtAtts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        rtAtts[1].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+        rtAtts[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference rtColor = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkAttachmentReference rtDepth = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+
+        VkSubpassDescription rtSub{};
+        rtSub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        rtSub.colorAttachmentCount    = 1;
+        rtSub.pColorAttachments       = &rtColor;
+        rtSub.pDepthStencilAttachment = &rtDepth;
+
+        VkSubpassDependency rtDeps[2]{};
+        rtDeps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+        rtDeps[0].dstSubpass    = 0;
+        // Wait for the prior color blit AND the RT depth write (raygen/CHIT)
+        // before we read color or test against depth.
+        rtDeps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+        rtDeps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        rtDeps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                | VK_ACCESS_SHADER_WRITE_BIT;
+        rtDeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        rtDeps[1].srcSubpass    = 0;
+        rtDeps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+        rtDeps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        rtDeps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        rtDeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        rtDeps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        VkRenderPassCreateInfo rci{};
+        rci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rci.attachmentCount = 2; rci.pAttachments = rtAtts;
+        rci.subpassCount    = 1; rci.pSubpasses   = &rtSub;
+        rci.dependencyCount = 2; rci.pDependencies = rtDeps;
+        if (vkCreateRenderPass(m_device, &rci, nullptr, &m_rtDebugRenderPass) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanDeferredPath: failed to create RT-debug render pass");
     }
 
     {
@@ -498,6 +569,9 @@ void VulkanDeferredPath::CreatePerSwapResources()
         if (vkCreateFramebuffer(m_device, &ofb, nullptr, &s.overlayFramebuffer) != VK_SUCCESS)
             ERROR_AND_DIE("VulkanDeferredPath: overlay vkCreateFramebuffer failed");
 
+        // RT-debug framebuffer reuses fwdDepthView (forward path's depth buffer is
+        // unused in RT mode). Created below after fwdDepthView is allocated.
+
         // Non-transient: the forward pass stands alone, no subpass depth-readback to elide.
         {
             VkImageCreateInfo ic{};
@@ -550,6 +624,13 @@ void VulkanDeferredPath::CreatePerSwapResources()
         if (vkCreateFramebuffer(m_device, &ffb, nullptr, &s.forwardFramebuffer) != VK_SUCCESS)
             ERROR_AND_DIE("VulkanDeferredPath: forward vkCreateFramebuffer failed");
 
+        // RT-debug framebuffer: same attachments as forward (swap color +
+        // fwdDepth view), different render pass with LOAD on color.
+        VkFramebufferCreateInfo rfb = ffb;
+        rfb.renderPass = m_rtDebugRenderPass;
+        if (vkCreateFramebuffer(m_device, &rfb, nullptr, &s.rtDebugFramebuffer) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanDeferredPath: RT-debug vkCreateFramebuffer failed");
+
         VkDescriptorSetAllocateInfo a{};
         a.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         a.descriptorPool     = m_renderer->m_descriptorPool;
@@ -598,6 +679,7 @@ void VulkanDeferredPath::DestroyPerSwapResources()
     {
         if (s.overlayFramebuffer) vkDestroyFramebuffer(m_device, s.overlayFramebuffer, nullptr);
         if (s.forwardFramebuffer) vkDestroyFramebuffer(m_device, s.forwardFramebuffer, nullptr);
+        if (s.rtDebugFramebuffer) vkDestroyFramebuffer(m_device, s.rtDebugFramebuffer, nullptr);
         if (s.fwdDepthView)  vkDestroyImageView(m_device, s.fwdDepthView, nullptr);
         if (s.fwdDepthImage) vkDestroyImage(m_device, s.fwdDepthImage, nullptr);
         if (s.fwdDepthMem)   vkFreeMemory(m_device, s.fwdDepthMem, nullptr);
@@ -1335,6 +1417,71 @@ void VulkanDeferredPath::EndForwardOverlay(VkCommandBuffer cmd)
     m_renderer->SetPipelineOverride(VK_NULL_HANDLE, VK_NULL_HANDLE);
     vkCmdEndRenderPass(cmd);
     m_renderer->m_isRenderPassActive = false;
+}
+
+void VulkanDeferredPath::BeginRTDebug(VkCommandBuffer cmd, uint32_t swapImageIdx)
+{
+    if (swapImageIdx >= m_perSwap.size())
+        ERROR_AND_DIE("VulkanDeferredPath::BeginRTDebug: swap index out of range");
+
+    PerSwap& s = m_perSwap[swapImageIdx];
+
+    // Depth is LOAD_OP_CLEAR each frame — no barrier needed; UNDEFINED
+    // initial layout discards prior contents.
+
+    VkClearValue clears[2]{};
+    clears[0].color = { {0.0f, 0.0f, 0.0f, 1.0f} };  // unused (LOAD)
+    clears[1].depthStencil = { 1.0f, 0 };            // unused (LOAD)
+
+    VkRenderPassBeginInfo rp{};
+    rp.sType            = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rp.renderPass       = m_rtDebugRenderPass;
+    rp.framebuffer      = s.rtDebugFramebuffer;
+    rp.renderArea       = { {0, 0}, { m_width, m_height } };
+    rp.clearValueCount  = 2;
+    rp.pClearValues     = clears;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+    m_renderer->m_isRenderPassActive = true;
+}
+
+void VulkanDeferredPath::EndRTDebug(VkCommandBuffer cmd)
+{
+    vkCmdEndRenderPass(cmd);
+    m_renderer->m_isRenderPassActive = false;
+
+    // Pass leaves depth in GENERAL (matches initial), so no transition needed.
+}
+
+void VulkanDeferredPath::SetRTDebugDepth(VkImage depthImage, VkImageView depthView)
+{
+    m_rtDebugDepthImage = depthImage;
+
+    // Recreate the per-swap rt-debug framebuffer with the RT path's
+    // depth view. Initially we used fwdDepthView (placeholder); RT path's
+    // depth view doesn't exist until RT path Init runs after deferred Init.
+    for (auto& s : m_perSwap)
+    {
+        if (s.rtDebugFramebuffer) {
+            vkDestroyFramebuffer(m_device, s.rtDebugFramebuffer, nullptr);
+            s.rtDebugFramebuffer = VK_NULL_HANDLE;
+        }
+        VkImageView views[2] = { (VkImageView)nullptr, depthView };
+        // Find this swap's color view by index.
+        size_t idx = (size_t)(&s - m_perSwap.data());
+        views[0] = m_renderer->m_swapChainImageViews[idx];
+
+        VkFramebufferCreateInfo fb{};
+        fb.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fb.renderPass      = m_rtDebugRenderPass;
+        fb.attachmentCount = 2;
+        fb.pAttachments    = views;
+        fb.width           = m_width;
+        fb.height          = m_height;
+        fb.layers          = 1;
+        if (vkCreateFramebuffer(m_device, &fb, nullptr, &s.rtDebugFramebuffer) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanDeferredPath::SetRTDebugDepth: framebuffer create failed");
+    }
 }
 
 bool VulkanDeferredPath::TryGetLastFrameTimings(double& outGBufferMs, double& outLightingMs)

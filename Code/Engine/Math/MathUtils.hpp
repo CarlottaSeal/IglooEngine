@@ -206,6 +206,25 @@ float Hesitate3(float t);
 float Hesitate5(float t);
 float CustomFunkyEasing(float t);
 
+//Signed Distance Fields (2D primitives)
+float GetDistanceSDF_Disc2D(Vec2 const& p, Vec2 const& center, float radius);
+float GetDistanceSDF_AABB2D(Vec2 const& p, AABB2 const& box);
+float GetDistanceSDF_AABB2D(Vec2 const& p, Vec2 const& center, Vec2 const& halfDims);
+float GetDistanceSDF_OBB2D(Vec2 const& p, Vec2 const& center, Vec2 const& iBasis, Vec2 const& halfDims);
+float GetDistanceSDF_OBB2D(Vec2 const& p, Vec2 const& center, Vec2 const& halfDims, float rotationDegrees);
+float GetDistanceSDF_LineSegment2D(Vec2 const& p, Vec2 const& a, Vec2 const& b, float thickness);
+float GetDistanceSDF_Capsule2D(Vec2 const& p, Vec2 const& boneStart, Vec2 const& boneEnd, float radius);
+float GetDistanceSDF_Plane2D(Vec2 const& p, Vec2 const& unitNormal, float distFromOrigin);
+float GetDistanceSDF_HexagonRegular2D(Vec2 const& p, Vec2 const& center, float radius);
+
+//SDF combine operations (scalar -> scalar)
+float SDFUnion(float a, float b);
+float SDFIntersection(float a, float b);
+float SDFSubtract(float a, float b);
+float SDFSmoothUnion(float a, float b, float k);
+float SDFSmoothIntersection(float a, float b, float k);
+float SDFSmoothSubtract(float a, float b, float k);
+
 //Bounce
 bool BounceDiscOffFixedDisc2D(Vec2& aCenter, Vec2& bCenter, float aRadius, float bRadius, Vec2& bVel, float elasticity);
 bool BounceDiscOffEachOther(Vec2& aCenter, Vec2& bCenter, float aRadius, float bRadius, Vec2& aVel, Vec2& bVel, float elasticity);

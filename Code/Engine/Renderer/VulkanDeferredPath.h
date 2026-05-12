@@ -71,6 +71,18 @@ public:
     void BeginForwardOverlay(VkCommandBuffer cmd, uint32_t swapImageIdx);
     void EndForwardOverlay(VkCommandBuffer cmd);
 
+    // 3D forward pass for RT mode: LOAD_OP_LOAD on the swap image (preserves
+    // the RT result already blitted in) plus a depth attachment populated
+    // by RT (closesthit writes clip-space z) so DebugRenderWorld's
+    // USE_DEPTH path occludes correctly behind RT geometry.
+    void BeginRTDebug(VkCommandBuffer cmd, uint32_t swapImageIdx);
+    void EndRTDebug(VkCommandBuffer cmd);
+
+    // Wire the RT depth image (and its view) into the rt-debug framebuffer
+    // and the per-frame layout barriers. RT path doesn't exist at deferred
+    // Init time, so the caller invokes this after RT path is ready.
+    void SetRTDebugDepth(VkImage depthImage, VkImageView depthView);
+
     bool TryGetLastFrameTimings(double& outGBufferMs, double& outLightingMs);
     bool TryGetLastForwardMs(double& outForwardMs);
 
@@ -88,6 +100,8 @@ private:
     VkRenderPass    m_deferredRenderPass = VK_NULL_HANDLE;
     VkRenderPass    m_forwardRenderPass  = VK_NULL_HANDLE;
     VkRenderPass    m_overlayRenderPass  = VK_NULL_HANDLE;
+    VkRenderPass    m_rtDebugRenderPass  = VK_NULL_HANDLE;
+    VkImage         m_rtDebugDepthImage  = VK_NULL_HANDLE;
     uint32_t        m_width  = 0;
     uint32_t        m_height = 0;
 
@@ -108,6 +122,7 @@ private:
         VkFramebuffer   framebuffer        = VK_NULL_HANDLE;
         VkFramebuffer   forwardFramebuffer = VK_NULL_HANDLE;
         VkFramebuffer   overlayFramebuffer = VK_NULL_HANDLE;
+        VkFramebuffer   rtDebugFramebuffer = VK_NULL_HANDLE;
         VkDescriptorSet set1               = VK_NULL_HANDLE;
     };
     std::vector<PerSwap> m_perSwap;

@@ -400,7 +400,7 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     // 11: matNormalSlot, 12: lights, 13/14: reservoirs ping-pong,
     // 15: TAA history, 16: albedo G-buffer, 17: SVGF moments,
     // 18: per-pixel material id.
-    constexpr uint32_t kBindingCount = 19;
+    constexpr uint32_t kBindingCount = 20;
     VkDescriptorSetLayoutBinding bindings[kBindingCount]{};
     bindings[0].binding         = 0;
     bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -455,11 +455,13 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
                                  | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
                                  | VK_SHADER_STAGE_MISS_BIT_KHR;
 
-    // SVGF moments — raygen-only (read prev at reproj, write new).
+    // SVGF moments — closesthit accumulates M1/M2/historyLen, raygen reads
+    // the variance for atrous to consume.
     bindings[17].binding         = 17;
     bindings[17].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[17].descriptorCount = 1;
-    bindings[17].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    bindings[17].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR
+                                 | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 
     // matId G-buffer (closesthit writes id+1, miss writes 0, raygen reads
     // for reprojection-rejection on material boundaries).
@@ -468,6 +470,16 @@ void VulkanRTPath::CreateRTPipeline(const char* rgenSpvPath,
     bindings[18].descriptorCount = 1;
     bindings[18].stageFlags      = VK_SHADER_STAGE_RAYGEN_BIT_KHR
                                  | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                                 | VK_SHADER_STAGE_MISS_BIT_KHR;
+
+    // Depth output (D32_SFLOAT, written as r32f storage image).
+    // closesthit writes per-pixel clip-space depth from the hit position;
+    // miss writes 1.0 (far plane). Consumed as depth attachment by the
+    // RT-debug forward pass to occlude debug primitives behind RT scene.
+    bindings[19].binding         = 19;
+    bindings[19].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[19].descriptorCount = 1;
+    bindings[19].stageFlags      = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
                                  | VK_SHADER_STAGE_MISS_BIT_KHR;
 
     // Texture array slots may be unbound (Sponza has fewer than kMaxRTTextures);
@@ -734,14 +746,21 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
 
     if (!m_textureSampler)
     {
+        // Trilinear + anisotropy: tapestries / floors at oblique angles
+        // need per-direction filtering or you get severe minification
+        // moire that crawls across the screen as the camera rotates.
         VkSamplerCreateInfo sci{};
-        sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sci.magFilter    = VK_FILTER_LINEAR;
-        sci.minFilter    = VK_FILTER_LINEAR;
-        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sci.maxLod       = VK_LOD_CLAMP_NONE;
+        sci.sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter        = VK_FILTER_LINEAR;
+        sci.minFilter        = VK_FILTER_LINEAR;
+        sci.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        sci.addressModeU     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeW     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.anisotropyEnable = VK_TRUE;
+        sci.maxAnisotropy    = 16.0f;
+        sci.minLod           = 0.0f;
+        sci.maxLod           = VK_LOD_CLAMP_NONE;
         if (vkCreateSampler(m_device, &sci, nullptr, &m_textureSampler) != VK_SUCCESS)
             ERROR_AND_DIE("VulkanRTPath::SetTextures: vkCreateSampler failed");
     }
@@ -770,16 +789,26 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
         stbi_image_free(data);
 
         LoadedTexture lt;
+        // Mip chain: each level is half the previous, generated on the GPU
+        // via vkCmdBlitImage. Without this the sampler can only do bilinear
+        // on level 0, so any minified surface (oblique tapestries, floors)
+        // aliases hard.
+        const uint32_t maxDim   = (uint32_t)((w > h) ? w : h);
+        uint32_t       mipLevels = 1;
+        while ((maxDim >> (mipLevels - 1)) > 1) ++mipLevels;
+
         VkImageCreateInfo ic{};
         ic.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ic.imageType     = VK_IMAGE_TYPE_2D;
         ic.format        = VK_FORMAT_R8G8B8A8_SRGB;
         ic.extent        = { (uint32_t)w, (uint32_t)h, 1 };
-        ic.mipLevels     = 1;
+        ic.mipLevels     = mipLevels;
         ic.arrayLayers   = 1;
         ic.samples       = VK_SAMPLE_COUNT_1_BIT;
         ic.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ic.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ic.usage         = VK_IMAGE_USAGE_SAMPLED_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;     // for blit-down chain
         ic.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(m_device, &ic, nullptr, &lt.image) != VK_SUCCESS)
@@ -801,12 +830,14 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
         iv.viewType   = VK_IMAGE_VIEW_TYPE_2D;
         iv.format     = VK_FORMAT_R8G8B8A8_SRGB;
         iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        iv.subresourceRange.levelCount = 1;
+        iv.subresourceRange.levelCount = mipLevels;
         iv.subresourceRange.layerCount = 1;
         if (vkCreateImageView(m_device, &iv, nullptr, &lt.view) != VK_SUCCESS)
             ERROR_AND_DIE("VulkanRTPath::SetTextures: vkCreateImageView failed");
 
         VkCommandBuffer cmd = BeginOneShotCmd();
+
+        // Mip 0 = TRANSFER_DST for the staging copy.
         {
             VkImageMemoryBarrier b{};
             b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -815,7 +846,7 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
             b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             b.image            = lt.image;
-            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1 };
             b.srcAccessMask    = 0;
             b.dstAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
             vkCmdPipelineBarrier(cmd,
@@ -828,22 +859,69 @@ void VulkanRTPath::SetTextures(const std::vector<std::string>& texturePaths,
         region.imageExtent      = { (uint32_t)w, (uint32_t)h, 1 };
         vkCmdCopyBufferToImage(cmd, staging, lt.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        // Generate the chain by repeatedly blitting prev level into next.
+        int32_t mipW = w, mipH = h;
+        for (uint32_t i = 1; i < mipLevels; ++i)
+        {
+            // Source mip (i-1): TRANSFER_DST -> TRANSFER_SRC.
+            VkImageMemoryBarrier b{};
+            b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout        = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask    = VK_ACCESS_TRANSFER_READ_BIT;
+            b.image            = lt.image;
+            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1 };
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &b);
+
+            VkImageBlit blit{};
+            blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1 };
+            blit.srcOffsets[1]  = { mipW, mipH, 1 };
+            int32_t nextW = (mipW > 1) ? (mipW >> 1) : 1;
+            int32_t nextH = (mipH > 1) ? (mipH >> 1) : 1;
+            blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1 };
+            blit.dstOffsets[1]  = { nextW, nextH, 1 };
+            vkCmdBlitImage(cmd,
+                lt.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                lt.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blit, VK_FILTER_LINEAR);
+
+            // Source mip is done — fold it into SHADER_READ_ONLY for the
+            // final pass; subsequent iterations work on the next pair.
+            b.oldLayout      = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            b.newLayout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcAccessMask  = VK_ACCESS_TRANSFER_READ_BIT;
+            b.dstAccessMask  = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0, 0, nullptr, 0, nullptr, 1, &b);
+
+            mipW = nextW;
+            mipH = nextH;
+        }
+
+        // Last mip (mipLevels - 1) is still TRANSFER_DST; transition it.
         {
             VkImageMemoryBarrier b{};
             b.sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             b.oldLayout        = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             b.newLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image            = lt.image;
-            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
             b.srcAccessMask    = VK_ACCESS_TRANSFER_WRITE_BIT;
             b.dstAccessMask    = VK_ACCESS_SHADER_READ_BIT;
+            b.image            = lt.image;
+            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1, 0, 1 };
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             vkCmdPipelineBarrier(cmd,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                 VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
-                                 0, 0, nullptr, 0, nullptr, 1, &b);
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                0, 0, nullptr, 0, nullptr, 1, &b);
         }
+
         EndAndSubmitOneShotCmd(cmd);
 
         vkDestroyBuffer(m_device, staging, nullptr);
@@ -1011,8 +1089,11 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         VkDescriptorImageInfo matIdInfo{};
         matIdInfo.imageView     = m_matIdImageView;
         matIdInfo.imageLayout   = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo depthInfo{};
+        depthInfo.imageView     = m_depthImageView;
+        depthInfo.imageLayout   = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet extraWrites[12]{};
+        VkWriteDescriptorSet extraWrites[13]{};
         extraWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         extraWrites[0].dstSet          = m_descriptorSet;
         extraWrites[0].dstBinding      = 7;
@@ -1097,7 +1178,14 @@ void VulkanRTPath::UpdateDescriptors(const VulkanTLAS& tlas, const VulkanBLAS& g
         extraWrites[11].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         extraWrites[11].pImageInfo      = &matIdInfo;
 
-        vkUpdateDescriptorSets(m_device, 12, extraWrites, 0, nullptr);
+        extraWrites[12].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        extraWrites[12].dstSet          = m_descriptorSet;
+        extraWrites[12].dstBinding      = 19;
+        extraWrites[12].descriptorCount = 1;
+        extraWrites[12].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        extraWrites[12].pImageInfo      = &depthInfo;
+
+        vkUpdateDescriptorSets(m_device, 13, extraWrites, 0, nullptr);
     }
 }
 
@@ -1577,6 +1665,49 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
             ERROR_AND_DIE(Stringf("VulkanRTPath::CreateOutputImage: %s vkCreateImageView failed", what));
     };
 
+    // Depth output: D32_SFLOAT with both STORAGE (raygen writes via image2D
+    // bound as r32f) and DEPTH_STENCIL_ATTACHMENT (used by the RT-debug
+    // forward pass to occlude debug primitives behind the RT scene).
+    auto allocDepthImage = [&]()
+    {
+        VkImageCreateInfo ic{};
+        ic.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ic.imageType     = VK_IMAGE_TYPE_2D;
+        ic.format        = VK_FORMAT_D32_SFLOAT;
+        ic.extent        = { width, height, 1 };
+        ic.mipLevels     = 1;
+        ic.arrayLayers   = 1;
+        ic.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT
+                         | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        ic.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+        ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (vkCreateImage(m_device, &ic, nullptr, &m_depthImage) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: depth vkCreateImage failed");
+
+        VkMemoryRequirements memReq;
+        vkGetImageMemoryRequirements(m_device, m_depthImage, &memReq);
+        VkMemoryAllocateInfo alloc{};
+        alloc.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc.allocationSize  = memReq.size;
+        alloc.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (vkAllocateMemory(m_device, &alloc, nullptr, &m_depthImageMem) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: depth vkAllocateMemory failed");
+        vkBindImageMemory(m_device, m_depthImage, m_depthImageMem, 0);
+
+        VkImageViewCreateInfo iv{};
+        iv.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        iv.image      = m_depthImage;
+        iv.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+        iv.format     = VK_FORMAT_D32_SFLOAT;
+        iv.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        iv.subresourceRange.levelCount = 1;
+        iv.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(m_device, &iv, nullptr, &m_depthImageView) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanRTPath::CreateOutputImage: depth vkCreateImageView failed");
+    };
+
     if (m_historyImageView) { vkDestroyImageView(m_device, m_historyImageView, nullptr); m_historyImageView = VK_NULL_HANDLE; }
     if (m_historyImage)     { vkDestroyImage(m_device, m_historyImage, nullptr);         m_historyImage     = VK_NULL_HANDLE; }
     if (m_historyImageMem)  { vkFreeMemory(m_device, m_historyImageMem, nullptr);        m_historyImageMem  = VK_NULL_HANDLE; }
@@ -1595,18 +1726,24 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     if (m_matIdImageView)   { vkDestroyImageView(m_device, m_matIdImageView, nullptr);   m_matIdImageView   = VK_NULL_HANDLE; }
     if (m_matIdImage)       { vkDestroyImage(m_device, m_matIdImage, nullptr);           m_matIdImage       = VK_NULL_HANDLE; }
     if (m_matIdImageMem)    { vkFreeMemory(m_device, m_matIdImageMem, nullptr);          m_matIdImageMem    = VK_NULL_HANDLE; }
+    if (m_depthImageView) { vkDestroyImageView(m_device, m_depthImageView, nullptr); m_depthImageView = VK_NULL_HANDLE; }
+    if (m_depthImage)     { vkDestroyImage(m_device, m_depthImage, nullptr);         m_depthImage     = VK_NULL_HANDLE; }
+    if (m_depthImageMem)  { vkFreeMemory(m_device, m_depthImageMem, nullptr);        m_depthImageMem  = VK_NULL_HANDLE; }
+
     allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_historyImage, m_historyImageMem, m_historyImageView, "history");
     allocStorageImage(VK_FORMAT_R8G8B8A8_UNORM,      m_albedoImage,  m_albedoImageMem,  m_albedoImageView,  "albedo");
     allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_atrousPing,   m_atrousPingMem,   m_atrousPingView,   "atrous ping");
     allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_atrousPong,   m_atrousPongMem,   m_atrousPongView,   "atrous pong");
     allocStorageImage(VK_FORMAT_R16G16B16A16_SFLOAT, m_momentsImage, m_momentsImageMem, m_momentsImageView, "moments");
     allocStorageImage(VK_FORMAT_R32_UINT,            m_matIdImage,   m_matIdImageMem,   m_matIdImageView,   "matId");
+    allocDepthImage();
 
-    // UNDEFINED → GENERAL transitions for all storage images.
+    // UNDEFINED → GENERAL transitions for all storage images. Depth image
+    // uses DEPTH aspect; the rest are COLOR.
     {
         VkCommandBuffer initCmd = BeginOneShotCmd();
-        VkImageMemoryBarrier bs[7]{};
-        for (int i = 0; i < 7; ++i) {
+        VkImageMemoryBarrier bs[8]{};
+        for (int i = 0; i < 8; ++i) {
             bs[i].sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
             bs[i].oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED;
             bs[i].newLayout        = VK_IMAGE_LAYOUT_GENERAL;
@@ -1623,10 +1760,12 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         bs[4].image = m_atrousPong;
         bs[5].image = m_momentsImage;
         bs[6].image = m_matIdImage;
+        bs[7].image = m_depthImage;
+        bs[7].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         vkCmdPipelineBarrier(initCmd,
                              VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                              VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 0, nullptr, 0, nullptr, 7, bs);
+                             0, 0, nullptr, 0, nullptr, 8, bs);
         EndAndSubmitOneShotCmd(initCmd);
     }
 
@@ -1678,12 +1817,18 @@ void VulkanRTPath::DestroyOutputImage()
     if (m_matIdImageView)   vkDestroyImageView(m_device, m_matIdImageView, nullptr);
     if (m_matIdImage)       vkDestroyImage(m_device, m_matIdImage, nullptr);
     if (m_matIdImageMem)    vkFreeMemory(m_device, m_matIdImageMem, nullptr);
+    if (m_depthImageView)   vkDestroyImageView(m_device, m_depthImageView, nullptr);
+    if (m_depthImage)       vkDestroyImage(m_device, m_depthImage, nullptr);
+    if (m_depthImageMem)    vkFreeMemory(m_device, m_depthImageMem, nullptr);
     m_momentsImageView = VK_NULL_HANDLE;
     m_momentsImage     = VK_NULL_HANDLE;
     m_momentsImageMem  = VK_NULL_HANDLE;
     m_matIdImageView   = VK_NULL_HANDLE;
     m_matIdImage       = VK_NULL_HANDLE;
     m_matIdImageMem    = VK_NULL_HANDLE;
+    m_depthImageView   = VK_NULL_HANDLE;
+    m_depthImage       = VK_NULL_HANDLE;
+    m_depthImageMem    = VK_NULL_HANDLE;
     m_outputImageView  = VK_NULL_HANDLE;
     m_outputImage      = VK_NULL_HANDLE;
     m_outputImageMem   = VK_NULL_HANDLE;

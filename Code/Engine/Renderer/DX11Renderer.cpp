@@ -147,6 +147,15 @@ void DX11Renderer::ShutDown()
 	/*    HDC hdc = GetDC(static_cast<HWND>(m_windowHandle));
 		wglDeleteContext(wglGetCurrentContext());
 		ReleaseDC(static_cast<HWND>(m_windowHandle), hdc);  */
+
+	// Drop every AddRef the device context is holding via IA/VS/PS/OM/RS bindings,
+	// otherwise those bound shaders/states/views leak when the context is released.
+	if (m_deviceContext)
+	{
+		m_deviceContext->ClearState();
+		m_deviceContext->Flush();
+	}
+
 	ImGuiShutdown();
 
 	for (Shader* shader : m_loadedShaders)
@@ -175,12 +184,16 @@ void DX11Renderer::ShutDown()
 		delete bitmapFont;
 		bitmapFont = nullptr;
 	}
+	m_loadedFonts.clear();
 
 	delete m_immediateVBO;
 	m_immediateVBO = nullptr;
 
 	delete m_immediateVBOForVertex_PCUTBN;
 	m_immediateVBOForVertex_PCUTBN = nullptr;
+
+	delete m_immediateVBOForVertex_Font;
+	m_immediateVBOForVertex_Font = nullptr;
 
 	delete m_immediateIBO;
 	m_immediateIBO = nullptr;
@@ -208,20 +221,23 @@ void DX11Renderer::ShutDown()
 	delete m_perFrameCBO;
 	m_perFrameCBO = nullptr;
 
+	delete m_fontCBO;
+	m_fontCBO = nullptr;
+
 	//clear states and null their common pointers
-	for (ID3D11BlendState* blendState : m_blendStates)
+	for (ID3D11BlendState*& blendState : m_blendStates)
 	{
 		DX_SAFE_RELEASE(blendState);
 	}
-	for (ID3D11RasterizerState* rasterizerState : m_rasterizerStates)
+	for (ID3D11RasterizerState*& rasterizerState : m_rasterizerStates)
 	{
 		DX_SAFE_RELEASE(rasterizerState);
 	}
-	for (ID3D11SamplerState* samplerState : m_samplerStates)
+	for (ID3D11SamplerState*& samplerState : m_samplerStates)
 	{
 		DX_SAFE_RELEASE(samplerState);
 	}
-	for (ID3D11DepthStencilState* depthStencilState : m_depthStencilStates)
+	for (ID3D11DepthStencilState*& depthStencilState : m_depthStencilStates)
 	{
 		DX_SAFE_RELEASE(depthStencilState);
 	}

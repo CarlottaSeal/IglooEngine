@@ -180,6 +180,7 @@ public:
     VkCommandBuffer GetCurrentCommandBuffer() const;
     VkDescriptorPool GetDescriptorPool() const { return m_descriptorPool; }
     uint32_t GetCurrentSwapImageIndex() const { return m_imageIndex; }
+    VkImage  GetSwapImage(uint32_t i) const { return m_swapChainImages[i]; }
 
     // Accessors for parallel command-buffer recording — workers capture state on the
     // main thread and replay raw vkCmd* calls into per-thread secondaries.
