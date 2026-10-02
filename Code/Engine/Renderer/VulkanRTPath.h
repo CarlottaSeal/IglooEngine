@@ -30,7 +30,7 @@ struct VulkanTLAS
     uint32_t                    instanceCount = 0;
 };
 
-struct VulkanSBT
+struct VulkanSBT  // Shader Binding Table
 {
     VkBuffer        buffer = VK_NULL_HANDLE;
     VkDeviceMemory  memory = VK_NULL_HANDLE;

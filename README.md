@@ -23,7 +23,7 @@ Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI)
 - **DirectX 12 Renderer** — Deferred GBuffer pipeline, instanced indexed drawing, a dedicated compute queue (currently synchronous, used for one-time SDF baking), descriptor heap management, 128 MB ring buffers for vertex/index data
 - **Real-Time Global Illumination** — Surface cache atlas, screen-space probe system, surface radiosity, voxel irradiance volume, software distance-field sphere tracing (per-mesh fields are baked at load time on the GPU via BVH-accelerated point-triangle distance queries — **unsigned**, no inside/outside test; runtime tracing is texture-only, no BVH)
 - **Shadow System** — Directional PCF shadow maps (2048²) + omnidirectional point light cube shadow arrays (512² × 6 faces, up to 4 lights)
-- **Math Library** — Vec2/3/4, Mat44, AABB2/3, OBB3, Sphere, Frustum, Plane, Capsule, Euler angles, Hermite/Bezier splines, BSP tree, BVH
+- **Math Library** — Vec2/3/4, Mat44, AABB2/3, OBB3, Sphere, Frustum, Plane, Capsule, Euler angles, Hermite/Bezier splines, BVH, and two 2D spatial trees
 - **UI Framework** — Hierarchical element system: Button, Checkbox, Slider, ProgressBar, Text, Sprite, Panel, Canvas, DialogueSystem
 - **Job System** — Worker + I/O thread types, thread-safe pending/executing/completed queues
 - **Save System** — Binary, XML, JSON, CSV, and text formats; RLE compression; slot-based quick save/load
@@ -32,6 +32,52 @@ Built as the foundation for [LuminaGI](https://github.com/CarlottaSeal/LuminaGI)
 - **Mesh Loading** — OBJ and glTF/GLB via cgltf; BVH construction and per-mesh SDF generation at load time
 - **Particle System** — Configurable emitters with presets (fire, smoke, sparks, explosion)
 - **Dev Tools** — DevConsole, DebugRenderSystem, ImGui + ImPlot integration, 17 GI visualization modes
+
+---
+
+## Design
+
+### Layering
+
+Five layers bottom to top, with dependencies pointing one way only. An upper layer may use a lower one; a lower layer never knows the upper exists.
+
+| Layer | Contents |
+|-------|----------|
+| Platform | Win32 window, input, FMOD wrapper, `Clock` |
+| Core | Math, `EventSystem`, `Delegate`, `NamedProperties`, file utilities, binary serialization. Touches no graphics API |
+| Renderer | Backend facade, DX12 / DX11 / Vulkan implementations, GI passes |
+| Scene | `SceneObject`, `MeshObject`, `LightObject`, SDF composition |
+| Game | Lives in the consuming project, not in this repo |
+
+Engine code never includes a game header. Engine types stay generic (`Renderer`, `InputSystem`, `AudioSystem`, `Clock`), while game types own the rules and content (`Game`, `Map`, `Entity`).
+
+Two places break the rule, both knowingly. `g_theJobSystem` and `g_vulkanMemoryPool` are still globals, so dependency injection here is a convention rather than something the compiler enforces. And `GetSubRenderer()` returns the concrete backend type, which leaks the backend to whoever calls it.
+
+### Subsystem lifecycle
+
+Every subsystem takes a `Config` struct and exposes `Startup`, `BeginFrame`, `EndFrame`, `Shutdown`. The constructor only stores its config and the real work happens in `Startup`, so initialisation order is explicit and owned by the app instead of being left to static initialisation order. Dependencies arrive through the config: the window's config carries an `InputSystem*`, the renderer's carries the window. That keeps the dependency graph explicit and acyclic.
+
+### Data-driven content
+
+| Pattern | Role |
+|---------|------|
+| Definition | Shared immutable data loaded once from file: `TileDefinition`, `EntityDefinition`, `MapDefinition` |
+| Construct | A live mutable instance pointing at its definition: `Tile`, `Entity`, `Map` |
+| Blackboard | `NamedStrings` and `NamedProperties`, read once from `GameConfig.xml`, keyed by hashed case-insensitive string |
+| Factory | Maps a definition name or enum to the right subclass, so callers never need to know the subclass set |
+| CreateOrGet | Resource cache. `CreateOrGetTexture(path)` returns the cached object, or loads, caches and returns |
+
+The trade is that errors move from compile time to load time, so validation and readable failure messages carry more weight than they otherwise would.
+
+### Toolchain-style boundaries
+
+Stages are separated by data formats rather than by function calls, so each stage can run alone, be inspected alone, and be replaced alone. A model enters as an XML definition instead of a pile of `LoadModel` arguments. Geometry crosses the boundary as a fixed `Vertex_PCUTBN` layout. The bake boundary is a surface cache produced at load time and read-only at runtime.
+
+The payoff is that the same frame can be rendered twice, once by this real-time renderer and once by an offline CUDA path tracer, then diffed. The cost is that serialisation and format conventions are work in themselves, and changing a format means changing both ends.
+
+### Asset import convention
+
+OBJ says nothing about handedness or scale. The format never states whether +Y or +Z is up, or whether 1.0 means a centimetre or a metre. Models therefore load from an XML definition rather than a raw path, and that XML carries `unitsPerMeter` plus three axis strings. `StaticMesh.cpp` converts units with `MakeUniformScale3D(1 / unitsPerMeter)` and builds a coordinate remap from the axis strings, keeping both the axis-transformed and the untransformed matrices and bounds.
 
 ---
 
@@ -181,7 +227,9 @@ A 64×64 `R32_UINT` **tile→card-index LUT** (16 KB in the default 64-pixel-til
 | Bounds | `AABB2`, `AABB3`, `OBB3`, `Sphere`, `Frustum` (6 planes), `Plane3` |
 | 2D Primitives | `Disc2D`, `Capsule2D` |
 | Curves | `LinearCurve1D`, `PiecewiseCurve1D`, Cubic Hermite spline |
-| Spatial | `KDTree2D`, `BVHTree2D`, CPU `BVH` + `GPUBVHNode` |
+| Spatial | `KDTree2D`, `BSPTree2D`, `BVHTree2D`, CPU `BVH` and `GPUBVHNode` |
+
+`BSPTree2D` and `KDTree2D` are the same algorithm under two names. Both split on the longest axis of the node bounds, at the median of the shapes' bounding-disc centres, so both are axis-aligned KD trees. A real BSP would allow arbitrary, usually edge-aligned, splitting planes.
 | Utility | `MathUtils`, `RandomNumberGenerator` |
 
 ---
