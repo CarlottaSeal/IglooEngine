@@ -32,6 +32,7 @@ void VulkanRTPath::Shutdown()
 {
     if (!m_device) return;
 
+    DestroyNeuralDenoiser();
     DestroyOutputImage();
 
     if (m_rtPipeline)     vkDestroyPipeline(m_device, m_rtPipeline, nullptr);
@@ -1503,6 +1504,7 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     }
 
     CreateDenoiseBuffers();
+    if (m_nnApply) CreateNeuralDenoiseBuffers();  // new size, new image views
 }
 
 void VulkanRTPath::CreateDenoiseBuffers()
@@ -1621,6 +1623,243 @@ void VulkanRTPath::EndDenoiseFrame(VkCommandBuffer cmd, bool uploadWritten)
 
     s.hasData = true;
     ++m_denoiseFrame;
+}
+
+// Weight offsets in vec4s, matching export_kpcn.py's gpu_weights().
+static constexpr int kNNInW   = 0;                    // [9][6][32]
+static constexpr int kNNInB   = kNNInW + 9 * 6 * 8;   // 32
+static constexpr int kNNMidW0 = kNNInB + 8;           // [9][32][32] + 32 bias, x3
+static constexpr int kNNMidStride = 9 * 32 * 8 + 8;
+static constexpr int kNNOutW  = kNNMidW0 + 3 * kNNMidStride;  // [32][28]
+static constexpr int kNNOutB  = kNNOutW + 32 * 7;             // 28
+static constexpr int kNNTotal = kNNOutB + 7;
+
+struct NNPush { int32_t width, height, wOff, bOff; };
+
+void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv,
+                                        const char* convMidSpv, const char* applySpv)
+{
+    std::vector<char> weights = LoadFile(weightsPath);
+    GUARANTEE_OR_DIE(weights.size() == (size_t)kNNTotal * 16,
+                     Stringf("VulkanRTPath: %s has %zu bytes, expected %d", weightsPath, weights.size(), kNNTotal * 16));
+
+    VkDescriptorSetLayoutBinding b[6]{};
+    for (uint32_t i = 0; i < 6; ++i)
+    {
+        b[i].binding         = i;
+        b[i].descriptorType  = i < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo slci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    slci.bindingCount = 6;
+    slci.pBindings    = b;
+    vkCreateDescriptorSetLayout(m_device, &slci, nullptr, &m_nnSetLayout);
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(NNPush) };
+    VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &m_nnSetLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &pcr;
+    vkCreatePipelineLayout(m_device, &plci, nullptr, &m_nnPipelineLayout);
+
+    auto makePipeline = [&](const char* spvPath) {
+        VkShaderModule mod = CreateShaderModuleFromSPV(m_device, LoadFile(spvPath));
+        VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        ci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName  = "main";
+        ci.layout       = m_nnPipelineLayout;
+        VkPipeline p = VK_NULL_HANDLE;
+        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS)
+            ERROR_AND_DIE(Stringf("VulkanRTPath: compute pipeline for %s failed", spvPath));
+        vkDestroyShaderModule(m_device, mod, nullptr);
+        return p;
+    };
+    m_nnConvIn  = makePipeline(convInSpv);
+    m_nnConvMid = makePipeline(convMidSpv);
+    m_nnApply   = makePipeline(applySpv);
+
+    VkDescriptorPoolSize sizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 },
+                                      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 } };
+    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpci.maxSets       = 2;
+    dpci.poolSizeCount = 2;
+    dpci.pPoolSizes    = sizes;
+    vkCreateDescriptorPool(m_device, &dpci, nullptr, &m_nnDescPool);
+    VkDescriptorSetLayout layouts[2] = { m_nnSetLayout, m_nnSetLayout };
+    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    dsai.descriptorPool     = m_nnDescPool;
+    dsai.descriptorSetCount = 2;
+    dsai.pSetLayouts        = layouts;
+    vkAllocateDescriptorSets(m_device, &dsai, m_nnSet);
+
+    // Weights: staged through a CPU_TO_GPU pool buffer into GPU_ONLY.
+    auto makeBuffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VulkanMemoryUsage memUsage,
+                          VkBuffer& buf, VulkanAllocation& alloc) {
+        VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        ci.size        = size;
+        ci.usage       = usage;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(m_device, &ci, nullptr, &buf);
+        alloc = g_vulkanMemoryPool->AllocateBufferMemory(buf, memUsage);
+        vkBindBufferMemory(m_device, buf, alloc.memory, alloc.offset);
+    };
+    VkBuffer staging; VulkanAllocation stagingAlloc;
+    makeBuffer(weights.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VulkanMemoryUsage::CPU_TO_GPU, staging, stagingAlloc);
+    memcpy(stagingAlloc.mappedPtr, weights.data(), weights.size());
+    makeBuffer(weights.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+               VulkanMemoryUsage::GPU_ONLY, m_nnWeights, m_nnWeightsAlloc);
+    VkCommandBuffer cmd = BeginOneShotCmd();
+    VkBufferCopy region{ 0, 0, weights.size() };
+    vkCmdCopyBuffer(cmd, staging, m_nnWeights, 1, &region);
+    EndAndSubmitOneShotCmd(cmd);
+    vkDestroyBuffer(m_device, staging, nullptr);
+    g_vulkanMemoryPool->Free(stagingAlloc);
+
+    VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+    qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+    qpci.queryCount = 4;
+    vkCreateQueryPool(m_device, &qpci, nullptr, &m_nnQueries);
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(m_renderer->m_physicalDevice, &props);
+    m_timestampPeriodNs = props.limits.timestampPeriod;
+
+    CreateNeuralDenoiseBuffers();
+}
+
+void VulkanRTPath::CreateNeuralDenoiseBuffers()
+{
+    DestroyNeuralDenoiseBuffers();
+
+    const VkDeviceSize bytes = (VkDeviceSize)m_outputWidth * m_outputHeight * 64;  // 32 halves
+    for (int i = 0; i < 2; ++i)
+    {
+        VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        ci.size        = bytes;
+        ci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(m_device, &ci, nullptr, &m_nnAct[i]);
+        m_nnActAlloc[i] = g_vulkanMemoryPool->AllocateBufferMemory(m_nnAct[i], VulkanMemoryUsage::GPU_ONLY);
+        vkBindBufferMemory(m_device, m_nnAct[i], m_nnActAlloc[i].memory, m_nnActAlloc[i].offset);
+    }
+
+    for (int i = 0; i < 2; ++i)
+    {
+        VkDescriptorImageInfo img[3] = {
+            { VK_NULL_HANDLE, m_historyImageView, VK_IMAGE_LAYOUT_GENERAL },
+            { VK_NULL_HANDLE, m_albedoImageView,  VK_IMAGE_LAYOUT_GENERAL },
+            { VK_NULL_HANDLE, m_outputImageView,  VK_IMAGE_LAYOUT_GENERAL },
+        };
+        VkDescriptorBufferInfo buf[3] = {
+            { m_nnAct[i],     0, VK_WHOLE_SIZE },
+            { m_nnAct[1 - i], 0, VK_WHOLE_SIZE },
+            { m_nnWeights,    0, VK_WHOLE_SIZE },
+        };
+        VkWriteDescriptorSet w[6]{};
+        for (uint32_t b = 0; b < 6; ++b)
+        {
+            w[b].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[b].dstSet          = m_nnSet[i];
+            w[b].dstBinding      = b;
+            w[b].descriptorCount = 1;
+            w[b].descriptorType  = b < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            if (b < 3) w[b].pImageInfo  = &img[b];
+            else       w[b].pBufferInfo = &buf[b - 3];
+        }
+        vkUpdateDescriptorSets(m_device, 6, w, 0, nullptr);
+    }
+}
+
+void VulkanRTPath::DestroyNeuralDenoiseBuffers()
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        if (m_nnAct[i]) vkDestroyBuffer(m_device, m_nnAct[i], nullptr);
+        m_nnAct[i] = VK_NULL_HANDLE;
+        g_vulkanMemoryPool->Free(m_nnActAlloc[i]);
+    }
+}
+
+void VulkanRTPath::DestroyNeuralDenoiser()
+{
+    DestroyNeuralDenoiseBuffers();
+    if (m_nnWeights)        vkDestroyBuffer(m_device, m_nnWeights, nullptr);
+    g_vulkanMemoryPool->Free(m_nnWeightsAlloc);
+    if (m_nnQueries)        vkDestroyQueryPool(m_device, m_nnQueries, nullptr);
+    if (m_nnDescPool)       vkDestroyDescriptorPool(m_device, m_nnDescPool, nullptr);
+    if (m_nnConvIn)         vkDestroyPipeline(m_device, m_nnConvIn, nullptr);
+    if (m_nnConvMid)        vkDestroyPipeline(m_device, m_nnConvMid, nullptr);
+    if (m_nnApply)          vkDestroyPipeline(m_device, m_nnApply, nullptr);
+    if (m_nnPipelineLayout) vkDestroyPipelineLayout(m_device, m_nnPipelineLayout, nullptr);
+    if (m_nnSetLayout)      vkDestroyDescriptorSetLayout(m_device, m_nnSetLayout, nullptr);
+    m_nnWeights = VK_NULL_HANDLE;  m_nnQueries = VK_NULL_HANDLE;  m_nnDescPool = VK_NULL_HANDLE;
+    m_nnConvIn  = VK_NULL_HANDLE;  m_nnConvMid = VK_NULL_HANDLE;  m_nnApply    = VK_NULL_HANDLE;
+    m_nnPipelineLayout = VK_NULL_HANDLE;
+    m_nnSetLayout      = VK_NULL_HANDLE;
+}
+
+void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
+{
+    // This slot's timestamps are from two frames ago; its fence has been waited on.
+    const uint32_t q = (m_nnFrame % 2) * 2;
+    if (m_nnFrame >= 2)
+    {
+        uint64_t r[4];  // value, availability per query
+        VkResult res = vkGetQueryPoolResults(m_device, m_nnQueries, q, 2, sizeof(r), r, 2 * sizeof(uint64_t),
+                                             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (res == VK_SUCCESS && r[1] && r[3])
+        {
+            float ms = (float)((double)(r[2] - r[0]) * m_timestampPeriodNs * 1e-6);
+            m_nnGpuMs = m_nnGpuMs == 0.f ? ms : 0.95f * m_nnGpuMs + 0.05f * ms;
+        }
+    }
+    ++m_nnFrame;
+    vkCmdResetQueryPool(cmd, m_nnQueries, q, 2);
+
+    VkMemoryBarrier fromRT{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    fromRT.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    fromRT.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &fromRT, 0, nullptr, 0, nullptr);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, q);
+
+    const uint32_t gx = (m_outputWidth + 15) / 16, gy = (m_outputHeight + 7) / 8;
+    VkMemoryBarrier between{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    // conv_in writes act[0]; mids go 0->1, 1->0, 0->1; apply reads act[1].
+    auto pass = [&](VkPipeline pipe, int set, int wOff, int bOff, bool barrierAfter) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_nnPipelineLayout, 0, 1, &m_nnSet[set], 0, nullptr);
+        NNPush pc{ (int32_t)m_outputWidth, (int32_t)m_outputHeight, wOff, bOff };
+        vkCmdPushConstants(cmd, m_nnPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        if (barrierAfter)
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 1, &between, 0, nullptr, 0, nullptr);
+    };
+    pass(m_nnConvIn, 1, kNNInW, kNNInB, true);
+    for (int l = 0; l < 3; ++l)
+    {
+        int w = kNNMidW0 + l * kNNMidStride;
+        pass(m_nnConvMid, l % 2 == 0 ? 0 : 1, w, w + 9 * 32 * 8, true);
+    }
+    pass(m_nnApply, 1, kNNOutW, kNNOutB, false);
+
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, q + 1);
+
+    // outImage goes to BlitToSwapImage next; next frame's raygen rewrites
+    // history/outImage, which this frame's passes read.
+    VkMemoryBarrier toBlit{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toBlit.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toBlit.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 1, &toBlit, 0, nullptr, 0, nullptr);
 }
 
 void VulkanRTPath::DestroyOutputImage()

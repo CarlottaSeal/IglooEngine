@@ -119,6 +119,15 @@ public:
     DenoiseFrame BeginDenoiseFrame();
     void         EndDenoiseFrame(VkCommandBuffer cmd, bool uploadWritten);
 
+    // GPU KPCN: the network from ml/export_kpcn.py as compute passes that read
+    // historyImage/albedoImage and write the tonemapped result to outImage.
+    // Weights file = export_kpcn.py's .weights (flat float32, shader layout).
+    void  CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv,
+                               const char* convMidSpv, const char* applySpv);
+    bool  HasNeuralDenoiser() const { return m_nnApply != VK_NULL_HANDLE; }
+    void  RunNeuralDenoise(VkCommandBuffer cmd);   // after TraceRays, before BlitToSwapImage
+    float GetNeuralDenoiseMs() const { return m_nnGpuMs; }
+
     VkImage     GetOutputImage() const { return m_outputImage; }
     VkImageView GetOutputImageView() const { return m_outputImageView; }
     VkImage     GetDepthImage()     const { return m_depthImage; }
@@ -238,6 +247,29 @@ private:
     void           DestroyOutputImage();
     void           CreateDenoiseBuffers();
     void           DestroyDenoiseBuffers();
+
+    // GPU KPCN. Activations are fp16, 32 channels per pixel (4 x uvec4),
+    // ping-ponged between two GPU_ONLY pool buffers; m_nnSet[i] reads
+    // m_nnAct[i] and writes m_nnAct[1-i].
+    VkDescriptorSetLayout m_nnSetLayout      = VK_NULL_HANDLE;
+    VkPipelineLayout      m_nnPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            m_nnConvIn         = VK_NULL_HANDLE;
+    VkPipeline            m_nnConvMid        = VK_NULL_HANDLE;
+    VkPipeline            m_nnApply          = VK_NULL_HANDLE;
+    VkDescriptorPool      m_nnDescPool       = VK_NULL_HANDLE;
+    VkDescriptorSet       m_nnSet[2]         = {};
+    VkBuffer              m_nnAct[2]         = {};
+    VulkanAllocation      m_nnActAlloc[2];
+    VkBuffer              m_nnWeights        = VK_NULL_HANDLE;
+    VulkanAllocation      m_nnWeightsAlloc;
+    VkQueryPool           m_nnQueries        = VK_NULL_HANDLE;  // 2 timestamps per frame slot
+    uint32_t              m_nnFrame          = 0;
+    float                 m_nnGpuMs          = 0.f;
+    float                 m_timestampPeriodNs = 1.f;
+
+    void           CreateNeuralDenoiseBuffers();
+    void           DestroyNeuralDenoiseBuffers();
+    void           DestroyNeuralDenoiser();
     uint32_t       FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props);
     VkDeviceAddress GetBufferDeviceAddress(VkBuffer buffer);
     void           CreateAndAllocateBuffer(VkDeviceSize size,
