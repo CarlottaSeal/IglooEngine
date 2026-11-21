@@ -1322,7 +1322,8 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
     ic.arrayLayers   = 1;
     ic.samples       = VK_SAMPLE_COUNT_1_BIT;
     ic.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ic.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
     ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(m_device, &ic, nullptr, &m_outputImage) != VK_SUCCESS)
@@ -1360,7 +1361,7 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         ic.arrayLayers   = 1;
         ic.samples       = VK_SAMPLE_COUNT_1_BIT;
         ic.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT;
+        ic.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ic.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
         ic.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (vkCreateImage(m_device, &ic, nullptr, &img) != VK_SUCCESS)
@@ -1500,6 +1501,110 @@ void VulkanRTPath::CreateOutputImage(uint32_t width, uint32_t height)
         vkCmdFillBuffer(initCmd, m_reservoirBuf2, 0, reservoirSize, 0u);
         EndAndSubmitOneShotCmd(initCmd);
     }
+
+    CreateDenoiseBuffers();
+}
+
+void VulkanRTPath::CreateDenoiseBuffers()
+{
+    DestroyDenoiseBuffers();
+
+    const VkDeviceSize pixels   = (VkDeviceSize)m_outputWidth * m_outputHeight;
+    const VkDeviceSize readback = pixels * 8 + pixels * 4;  // RGBA16F light, then RGBA8 albedo
+    const VkDeviceSize upload   = pixels * 4;
+
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(m_renderer->m_physicalDevice, &memProps);
+    auto hasType = [&](VkMemoryPropertyFlags f) {
+        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
+            if ((memProps.memoryTypes[i].propertyFlags & f) == f) return true;
+        return false;
+    };
+    // Cached memory makes the CPU-side reads ~10x faster than write-combined.
+    VkMemoryPropertyFlags readbackProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (hasType(readbackProps | VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        readbackProps |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    for (DenoiseSlot& s : m_denoise)
+    {
+        CreateAndAllocateBuffer(readback, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readbackProps,
+                                s.readback, s.readbackMem);
+        CreateAndAllocateBuffer(upload, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                s.upload, s.uploadMem);
+        vkMapMemory(m_device, s.readbackMem, 0, VK_WHOLE_SIZE, 0, (void**)&s.readbackMapped);
+        vkMapMemory(m_device, s.uploadMem,   0, VK_WHOLE_SIZE, 0, (void**)&s.uploadMapped);
+        s.hasData = false;
+    }
+}
+
+void VulkanRTPath::DestroyDenoiseBuffers()
+{
+    for (DenoiseSlot& s : m_denoise)
+    {
+        if (s.readbackMem) { vkUnmapMemory(m_device, s.readbackMem); vkFreeMemory(m_device, s.readbackMem, nullptr); }
+        if (s.readback)    vkDestroyBuffer(m_device, s.readback, nullptr);
+        if (s.uploadMem)   { vkUnmapMemory(m_device, s.uploadMem); vkFreeMemory(m_device, s.uploadMem, nullptr); }
+        if (s.upload)      vkDestroyBuffer(m_device, s.upload, nullptr);
+        s = DenoiseSlot{};
+    }
+}
+
+VulkanRTPath::DenoiseFrame VulkanRTPath::BeginDenoiseFrame()
+{
+    DenoiseSlot& s = m_denoise[m_denoiseFrame % kDenoiseSlots];
+    const size_t pixels = (size_t)m_outputWidth * m_outputHeight;
+
+    DenoiseFrame f;
+    f.width  = m_outputWidth;
+    f.height = m_outputHeight;
+    f.upload = s.uploadMapped;
+    if (s.hasData)
+    {
+        f.light  = (const uint16_t*)s.readbackMapped;
+        f.albedo = s.readbackMapped + pixels * 8;
+    }
+    return f;
+}
+
+void VulkanRTPath::EndDenoiseFrame(VkCommandBuffer cmd, bool uploadWritten)
+{
+    DenoiseSlot& s = m_denoise[m_denoiseFrame % kDenoiseSlots];
+    const VkDeviceSize pixels = (VkDeviceSize)m_outputWidth * m_outputHeight;
+
+    VkMemoryBarrier toTransfer{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &toTransfer, 0, nullptr, 0, nullptr);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent      = { m_outputWidth, m_outputHeight, 1 };
+    vkCmdCopyImageToBuffer(cmd, m_historyImage, VK_IMAGE_LAYOUT_GENERAL, s.readback, 1, &region);
+    region.bufferOffset = pixels * 8;
+    vkCmdCopyImageToBuffer(cmd, m_albedoImage, VK_IMAGE_LAYOUT_GENERAL, s.readback, 1, &region);
+
+    if (uploadWritten)
+    {
+        region.bufferOffset = 0;
+        vkCmdCopyBufferToImage(cmd, s.upload, m_outputImage, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
+
+    // Host sees the readback after the fence; BlitToSwapImage's barrier only
+    // covers shader writes, so the upload copy needs its own; next frame's
+    // raygen must not overwrite history/albedo while they are being copied.
+    VkMemoryBarrier after{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
+                        | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT
+                         | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         0, 1, &after, 0, nullptr, 0, nullptr);
+
+    s.hasData = true;
+    ++m_denoiseFrame;
 }
 
 void VulkanRTPath::DestroyOutputImage()
@@ -1534,6 +1639,8 @@ void VulkanRTPath::DestroyOutputImage()
     m_albedoImageView  = VK_NULL_HANDLE;
     m_albedoImage      = VK_NULL_HANDLE;
     m_albedoImageMem   = VK_NULL_HANDLE;
+
+    DestroyDenoiseBuffers();
 }
 
 uint32_t VulkanRTPath::FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props)

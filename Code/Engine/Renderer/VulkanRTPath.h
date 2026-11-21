@@ -102,6 +102,22 @@ public:
     void BlitToSwapImage(VkCommandBuffer cmd, uint32_t swapW, uint32_t swapH,
                          VkImageLayout finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
+    // CPU denoise round trip. EndDenoiseFrame (after TraceRays) copies the
+    // noisy light and albedo into a host-visible slot; that slot comes back
+    // from BeginDenoiseFrame two frames later, after the renderer has waited
+    // on its fence. If the caller filled `upload` with RGBA8, pass
+    // uploadWritten=true and it replaces outImage before the blit.
+    struct DenoiseFrame
+    {
+        const uint16_t* light  = nullptr;  // RGBA16F, demodulated; null until the slot has data
+        const uint8_t*  albedo = nullptr;  // RGBA8, a=0 for sky
+        uint8_t*        upload = nullptr;  // RGBA8, width*height*4
+        uint32_t        width  = 0;
+        uint32_t        height = 0;
+    };
+    DenoiseFrame BeginDenoiseFrame();
+    void         EndDenoiseFrame(VkCommandBuffer cmd, bool uploadWritten);
+
     VkImage     GetOutputImage() const { return m_outputImage; }
     VkImageView GetOutputImageView() const { return m_outputImageView; }
     VkImage     GetDepthImage()     const { return m_depthImage; }
@@ -201,8 +217,24 @@ private:
 
     VkCommandPool m_oneShotPool = VK_NULL_HANDLE;
 
+    static constexpr uint32_t kDenoiseSlots = 2;  // matches MAX_FRAMES_IN_FLIGHT
+    struct DenoiseSlot
+    {
+        VkBuffer       readback       = VK_NULL_HANDLE;
+        VkDeviceMemory readbackMem    = VK_NULL_HANDLE;
+        uint8_t*       readbackMapped = nullptr;
+        VkBuffer       upload         = VK_NULL_HANDLE;
+        VkDeviceMemory uploadMem      = VK_NULL_HANDLE;
+        uint8_t*       uploadMapped   = nullptr;
+        bool           hasData        = false;
+    };
+    DenoiseSlot m_denoise[kDenoiseSlots];
+    uint32_t    m_denoiseFrame = 0;
+
     void           CreateOutputImage(uint32_t width, uint32_t height);
     void           DestroyOutputImage();
+    void           CreateDenoiseBuffers();
+    void           DestroyDenoiseBuffers();
     uint32_t       FindMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props);
     VkDeviceAddress GetBufferDeviceAddress(VkBuffer buffer);
     void           CreateAndAllocateBuffer(VkDeviceSize size,
