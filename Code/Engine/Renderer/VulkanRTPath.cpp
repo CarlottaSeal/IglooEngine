@@ -1667,6 +1667,27 @@ static constexpr int kNNTotal = kNNOutB + 7;
 
 struct NNPush { int32_t width, height, wOff, bOff; };
 
+static uint16_t FloatToHalf(float f)
+{
+    uint32_t x; memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  e    = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t m    = x & 0x7FFFFFu;
+    if (e >= 31) return (uint16_t)(sign | 0x7C00u);
+    if (e <= 0)
+    {
+        if (e < -10) return (uint16_t)sign;
+        m |= 0x800000u;
+        uint32_t shift = (uint32_t)(14 - e);
+        uint32_t h = m >> shift, rem = m & ((1u << shift) - 1), halfway = 1u << (shift - 1);
+        if (rem > halfway || (rem == halfway && (h & 1))) ++h;
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = ((uint32_t)e << 10) | (m >> 13), rem = m & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) ++h;  // carry into the exponent is fine
+    return (uint16_t)(sign | h);
+}
+
 // Bindings shared by all KPCN passes: 0-2 light/albedo/out images, 3-5 act in/out
 // and weights, 6 camera UBO, 7-8 ReSTIR reservoirs (hitWorld), 9 temporal history.
 static constexpr uint32_t kNNBindings = 10;
@@ -1678,11 +1699,24 @@ static VkDescriptorType NNBindingType(uint32_t b)
 }
 
 void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv, const char* convMidSpv,
-                                        const char* applySpv, const char* temporalSpv)
+                                        const char* convMidCMSpv, const char* applySpv, const char* temporalSpv)
 {
     std::vector<char> weights = LoadFile(weightsPath);
     GUARANTEE_OR_DIE(weights.size() == (size_t)kNNTotal * 16,
                      Stringf("VulkanRTPath: %s has %zu bytes, expected %d", weightsPath, weights.size(), kNNTotal * 16));
+
+    // fp16 copy of the three mid layers' [9][32][32] weights, appended to the same
+    // buffer for the cooperative-matrix conv (B operands must be fp16).
+    m_nnMid16Off = (int)(weights.size() / 2);
+    {
+        const float* src = reinterpret_cast<const float*>(weights.data());
+        std::vector<uint16_t> mid16(3 * 9 * 32 * 32);
+        for (int l = 0; l < 3; ++l)
+            for (int i = 0; i < 9 * 32 * 32; ++i)
+                mid16[l * 9 * 32 * 32 + i] = FloatToHalf(src[(kNNMidW0 + l * kNNMidStride) * 4 + i]);
+        const char* bytes = reinterpret_cast<const char*>(mid16.data());
+        weights.insert(weights.end(), bytes, bytes + mid16.size() * sizeof(uint16_t));
+    }
 
     VkDescriptorSetLayoutBinding b[kNNBindings]{};
     for (uint32_t i = 0; i < kNNBindings; ++i)
@@ -1721,6 +1755,7 @@ void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* con
     };
     m_nnConvIn  = makePipeline(convInSpv);
     m_nnConvMid = makePipeline(convMidSpv);
+    m_nnConvMidCM = makePipeline(convMidCMSpv);
     m_nnApply    = makePipeline(applySpv);
     m_nnTemporal = makePipeline(temporalSpv);
 
@@ -1851,6 +1886,8 @@ void VulkanRTPath::DestroyNeuralDenoiser()
     if (m_nnDescPool)       vkDestroyDescriptorPool(m_device, m_nnDescPool, nullptr);
     if (m_nnConvIn)         vkDestroyPipeline(m_device, m_nnConvIn, nullptr);
     if (m_nnConvMid)        vkDestroyPipeline(m_device, m_nnConvMid, nullptr);
+    if (m_nnConvMidCM)      vkDestroyPipeline(m_device, m_nnConvMidCM, nullptr);
+    m_nnConvMidCM = VK_NULL_HANDLE;
     if (m_nnApply)          vkDestroyPipeline(m_device, m_nnApply, nullptr);
     if (m_nnTemporal)       vkDestroyPipeline(m_device, m_nnTemporal, nullptr);
     m_nnTemporal = VK_NULL_HANDLE;
@@ -1915,7 +1952,11 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
     for (int l = 0; l < 3; ++l)
     {
         int w = kNNMidW0 + l * kNNMidStride;
-        pass(m_nnConvMid, l % 2 == 0 ? 0 : 1, w, w + 9 * 32 * 8, true, 32, 16);  // 2x2 px per invocation
+        int set = l % 2 == 0 ? 0 : 1;
+        if (m_nnUseCoopMat && m_outputWidth % 16 == 0)  // the CM shader stores whole 16-px strips
+            pass(m_nnConvMidCM, set, m_nnMid16Off + l * 9 * 32 * 32, w + 9 * 32 * 8, true, 32, 16);
+        else
+            pass(m_nnConvMid, set, w, w + 9 * 32 * 8, true, 32, 16);  // 2x2 px per invocation
     }
     pass(m_nnApply, 1, kNNOutW, kNNOutB, true);
 

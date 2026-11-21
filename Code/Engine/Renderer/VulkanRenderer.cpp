@@ -2750,12 +2750,29 @@ void VulkanRenderer::CreateLogicalDevice()
     rayQueryFeatures.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rayQueryFeatures.rayQuery = VK_TRUE;
 
+    // fp16 storage/arithmetic + cooperative matrix for the denoiser's tensor-core conv.
+    VkPhysicalDevice16BitStorageFeatures storage16Features{};
+    storage16Features.sType                    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    storage16Features.storageBuffer16BitAccess = VK_TRUE;
+
+    VkPhysicalDeviceShaderFloat16Int8Features float16Features{};
+    float16Features.sType         = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    float16Features.shaderFloat16 = VK_TRUE;
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatFeatures{};
+    coopMatFeatures.sType             = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    coopMatFeatures.cooperativeMatrix = VK_TRUE;
+
     // pNext chain: features2 -> descriptorIndexing -> BDA -> AS -> rtPipeline -> rayQuery
+    //              -> 16-bit storage -> float16 -> coopMat
     descriptorIndexingFeatures.pNext = &bdaFeatures;
     bdaFeatures.pNext                = &asFeatures;
     asFeatures.pNext                 = &rtPipelineFeatures;
     rtPipelineFeatures.pNext         = &rayQueryFeatures;
-    rayQueryFeatures.pNext           = nullptr;
+    rayQueryFeatures.pNext           = &storage16Features;
+    storage16Features.pNext          = &float16Features;
+    float16Features.pNext            = &coopMatFeatures;
+    coopMatFeatures.pNext            = nullptr;
 
     VkPhysicalDeviceFeatures2 deviceFeatures2{};
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;

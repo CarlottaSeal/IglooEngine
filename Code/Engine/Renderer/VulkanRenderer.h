@@ -450,6 +450,8 @@ private:
         VK_KHR_RAY_QUERY_EXTENSION_NAME,
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+        // Tensor-core matmul for the RT denoiser's conv layers.
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
     };
 
 #ifdef ENGINE_DEBUG_RENDER

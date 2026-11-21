@@ -123,8 +123,11 @@ public:
     // historyImage/albedoImage, then a temporal pass that reprojects last
     // frame's result and writes the tonemapped image to outImage.
     // Weights file = export_kpcn.py's .weights (flat float32, shader layout).
+    // convMidCMSpv: the mid layers on the tensor cores (VK_KHR_cooperative_matrix).
     void  CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv, const char* convMidSpv,
-                               const char* applySpv, const char* temporalSpv);
+                               const char* convMidCMSpv, const char* applySpv, const char* temporalSpv);
+    void  SetNeuralDenoiseCoopMat(bool on) { m_nnUseCoopMat = on; }
+    bool  GetNeuralDenoiseCoopMat() const  { return m_nnUseCoopMat; }
     bool  HasNeuralDenoiser() const { return m_nnApply != VK_NULL_HANDLE; }
     void  RunNeuralDenoise(VkCommandBuffer cmd);   // after TraceRays, before BlitToSwapImage
     float GetNeuralDenoiseMs() const { return m_nnGpuMs; }
@@ -259,6 +262,9 @@ private:
     VkPipelineLayout      m_nnPipelineLayout = VK_NULL_HANDLE;
     VkPipeline            m_nnConvIn         = VK_NULL_HANDLE;
     VkPipeline            m_nnConvMid        = VK_NULL_HANDLE;
+    VkPipeline            m_nnConvMidCM      = VK_NULL_HANDLE;
+    bool                  m_nnUseCoopMat     = true;
+    int                   m_nnMid16Off       = 0;  // fp16 mid weights, in halves into m_nnWeights
     VkPipeline            m_nnApply          = VK_NULL_HANDLE;
     VkPipeline            m_nnTemporal       = VK_NULL_HANDLE;
     VkBuffer              m_nnHistory        = VK_NULL_HANDLE;  // 2 x (rgb, eye distance) halves per pixel
