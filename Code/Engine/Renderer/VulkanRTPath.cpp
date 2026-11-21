@@ -1721,7 +1721,7 @@ void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* con
 
     VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-    qpci.queryCount = 4;
+    qpci.queryCount = 2 * kNNTimestamps;
     vkCreateQueryPool(m_device, &qpci, nullptr, &m_nnQueries);
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(m_renderer->m_physicalDevice, &props);
@@ -1804,20 +1804,26 @@ void VulkanRTPath::DestroyNeuralDenoiser()
 void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
 {
     // This slot's timestamps are from two frames ago; its fence has been waited on.
-    const uint32_t q = (m_nnFrame % 2) * 2;
+    const uint32_t q = (m_nnFrame % 2) * kNNTimestamps;
     if (m_nnFrame >= 2)
     {
-        uint64_t r[4];  // value, availability per query
-        VkResult res = vkGetQueryPoolResults(m_device, m_nnQueries, q, 2, sizeof(r), r, 2 * sizeof(uint64_t),
+        uint64_t r[kNNTimestamps * 2];  // value, availability per query
+        VkResult res = vkGetQueryPoolResults(m_device, m_nnQueries, q, kNNTimestamps, sizeof(r), r, 2 * sizeof(uint64_t),
                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-        if (res == VK_SUCCESS && r[1] && r[3])
+        bool ready = res == VK_SUCCESS;
+        for (uint32_t i = 0; i < kNNTimestamps; ++i) ready = ready && r[i * 2 + 1];
+        auto smooth = [](float& acc, float ms) { acc = acc == 0.f ? ms : 0.95f * acc + 0.05f * ms; };
+        if (ready)
         {
-            float ms = (float)((double)(r[2] - r[0]) * m_timestampPeriodNs * 1e-6);
-            m_nnGpuMs = m_nnGpuMs == 0.f ? ms : 0.95f * m_nnGpuMs + 0.05f * ms;
+            auto ms = [&](uint32_t a, uint32_t b) {
+                return (float)((double)(r[b * 2] - r[a * 2]) * m_timestampPeriodNs * 1e-6);
+            };
+            smooth(m_nnGpuMs, ms(0, kNNTimestamps - 1));
+            for (uint32_t i = 0; i < 5; ++i) smooth(m_nnPassMs[i], ms(i, i + 1));
         }
     }
     ++m_nnFrame;
-    vkCmdResetQueryPool(cmd, m_nnQueries, q, 2);
+    vkCmdResetQueryPool(cmd, m_nnQueries, q, kNNTimestamps);
 
     VkMemoryBarrier fromRT{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     fromRT.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1826,31 +1832,30 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
                          0, 1, &fromRT, 0, nullptr, 0, nullptr);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, q);
 
-    const uint32_t gx = (m_outputWidth + 15) / 16, gy = (m_outputHeight + 7) / 8;
     VkMemoryBarrier between{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
     // conv_in writes act[0]; mids go 0->1, 1->0, 0->1; apply reads act[1].
-    auto pass = [&](VkPipeline pipe, int set, int wOff, int bOff, bool barrierAfter) {
+    uint32_t stamp = q + 1;
+    auto pass = [&](VkPipeline pipe, int set, int wOff, int bOff, bool barrierAfter, uint32_t tileW = 16, uint32_t tileH = 8) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_nnPipelineLayout, 0, 1, &m_nnSet[set], 0, nullptr);
         NNPush pc{ (int32_t)m_outputWidth, (int32_t)m_outputHeight, wOff, bOff };
         vkCmdPushConstants(cmd, m_nnPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(cmd, gx, gy, 1);
+        vkCmdDispatch(cmd, (m_outputWidth + tileW - 1) / tileW, (m_outputHeight + tileH - 1) / tileH, 1);
         if (barrierAfter)
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &between, 0, nullptr, 0, nullptr);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, stamp++);
     };
     pass(m_nnConvIn, 1, kNNInW, kNNInB, true);
     for (int l = 0; l < 3; ++l)
     {
         int w = kNNMidW0 + l * kNNMidStride;
-        pass(m_nnConvMid, l % 2 == 0 ? 0 : 1, w, w + 9 * 32 * 8, true);
+        pass(m_nnConvMid, l % 2 == 0 ? 0 : 1, w, w + 9 * 32 * 8, true, 32, 16);  // 2x2 px per invocation
     }
     pass(m_nnApply, 1, kNNOutW, kNNOutB, false);
-
-    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, q + 1);
 
     // outImage goes to BlitToSwapImage next; next frame's raygen rewrites
     // history/outImage, which this frame's passes read.

@@ -127,6 +127,8 @@ public:
     bool  HasNeuralDenoiser() const { return m_nnApply != VK_NULL_HANDLE; }
     void  RunNeuralDenoise(VkCommandBuffer cmd);   // after TraceRays, before BlitToSwapImage
     float GetNeuralDenoiseMs() const { return m_nnGpuMs; }
+    // conv_in, mid1, mid2, mid3, apply; smoothed like the total.
+    const float* GetNeuralDenoisePassMs() const { return m_nnPassMs; }
 
     VkImage     GetOutputImage() const { return m_outputImage; }
     VkImageView GetOutputImageView() const { return m_outputImageView; }
@@ -262,9 +264,11 @@ private:
     VulkanAllocation      m_nnActAlloc[2];
     VkBuffer              m_nnWeights        = VK_NULL_HANDLE;
     VulkanAllocation      m_nnWeightsAlloc;
-    VkQueryPool           m_nnQueries        = VK_NULL_HANDLE;  // 2 timestamps per frame slot
+    static constexpr uint32_t kNNTimestamps = 6;                // before/between/after the 5 passes
+    VkQueryPool           m_nnQueries        = VK_NULL_HANDLE;  // kNNTimestamps per frame slot
     uint32_t              m_nnFrame          = 0;
     float                 m_nnGpuMs          = 0.f;
+    float                 m_nnPassMs[5]      = {};
     float                 m_timestampPeriodNs = 1.f;
 
     void           CreateNeuralDenoiseBuffers();
