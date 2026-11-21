@@ -1948,6 +1948,7 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
                                  0, 1, &between, 0, nullptr, 0, nullptr);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, m_nnQueries, stamp++);
     };
+    pass(m_nnConvIn, 1, kNNInW, kNNInB, true, 32, 16);  // 2x2 px per invocation
     for (int l = 0; l < 3; ++l)
     {
         int w = kNNMidW0 + l * kNNMidStride;
