@@ -1165,6 +1165,7 @@ void VulkanRTPath::UpdateCameraVectors(const float eye[3],
                                        uint32_t numLights)
 {
     if (!m_cameraUBOMapped) return;
+    m_frameId = frameId;
     union { uint32_t u; float f; } u2f0, u2f1;
     u2f0.u = frameId   | 0x40000000u;
     u2f1.u = numLights | 0x40000000u;
@@ -1636,23 +1637,33 @@ static constexpr int kNNTotal = kNNOutB + 7;
 
 struct NNPush { int32_t width, height, wOff, bOff; };
 
-void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv,
-                                        const char* convMidSpv, const char* applySpv)
+// Bindings shared by all KPCN passes: 0-2 light/albedo/out images, 3-5 act in/out
+// and weights, 6 camera UBO, 7-8 ReSTIR reservoirs (hitWorld), 9 temporal history.
+static constexpr uint32_t kNNBindings = 10;
+static VkDescriptorType NNBindingType(uint32_t b)
+{
+    if (b < 3)  return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (b == 6) return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+}
+
+void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv, const char* convMidSpv,
+                                        const char* applySpv, const char* temporalSpv)
 {
     std::vector<char> weights = LoadFile(weightsPath);
     GUARANTEE_OR_DIE(weights.size() == (size_t)kNNTotal * 16,
                      Stringf("VulkanRTPath: %s has %zu bytes, expected %d", weightsPath, weights.size(), kNNTotal * 16));
 
-    VkDescriptorSetLayoutBinding b[6]{};
-    for (uint32_t i = 0; i < 6; ++i)
+    VkDescriptorSetLayoutBinding b[kNNBindings]{};
+    for (uint32_t i = 0; i < kNNBindings; ++i)
     {
         b[i].binding         = i;
-        b[i].descriptorType  = i < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[i].descriptorType  = NNBindingType(i);
         b[i].descriptorCount = 1;
         b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo slci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    slci.bindingCount = 6;
+    slci.bindingCount = kNNBindings;
     slci.pBindings    = b;
     vkCreateDescriptorSetLayout(m_device, &slci, nullptr, &m_nnSetLayout);
 
@@ -1680,13 +1691,15 @@ void VulkanRTPath::CreateNeuralDenoiser(const char* weightsPath, const char* con
     };
     m_nnConvIn  = makePipeline(convInSpv);
     m_nnConvMid = makePipeline(convMidSpv);
-    m_nnApply   = makePipeline(applySpv);
+    m_nnApply    = makePipeline(applySpv);
+    m_nnTemporal = makePipeline(temporalSpv);
 
-    VkDescriptorPoolSize sizes[2] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 6 },
-                                      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 } };
+    VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  2 * 3 },
+                                      { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 * 6 },
+                                      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * 1 } };
     VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     dpci.maxSets       = 2;
-    dpci.poolSizeCount = 2;
+    dpci.poolSizeCount = 3;
     dpci.pPoolSizes    = sizes;
     vkCreateDescriptorPool(m_device, &dpci, nullptr, &m_nnDescPool);
     VkDescriptorSetLayout layouts[2] = { m_nnSetLayout, m_nnSetLayout };
@@ -1746,6 +1759,15 @@ void VulkanRTPath::CreateNeuralDenoiseBuffers()
         vkBindBufferMemory(m_device, m_nnAct[i], m_nnActAlloc[i].memory, m_nnActAlloc[i].offset);
     }
 
+    VkBufferCreateInfo hci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    hci.size        = (VkDeviceSize)m_outputWidth * m_outputHeight * 8 * 2;
+    hci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    hci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(m_device, &hci, nullptr, &m_nnHistory);
+    m_nnHistoryAlloc = g_vulkanMemoryPool->AllocateBufferMemory(m_nnHistory, VulkanMemoryUsage::GPU_ONLY);
+    vkBindBufferMemory(m_device, m_nnHistory, m_nnHistoryAlloc.memory, m_nnHistoryAlloc.offset);
+    m_nnHistValid = false;
+
     for (int i = 0; i < 2; ++i)
     {
         VkDescriptorImageInfo img[3] = {
@@ -1753,23 +1775,27 @@ void VulkanRTPath::CreateNeuralDenoiseBuffers()
             { VK_NULL_HANDLE, m_albedoImageView,  VK_IMAGE_LAYOUT_GENERAL },
             { VK_NULL_HANDLE, m_outputImageView,  VK_IMAGE_LAYOUT_GENERAL },
         };
-        VkDescriptorBufferInfo buf[3] = {
-            { m_nnAct[i],     0, VK_WHOLE_SIZE },
-            { m_nnAct[1 - i], 0, VK_WHOLE_SIZE },
-            { m_nnWeights,    0, VK_WHOLE_SIZE },
+        VkDescriptorBufferInfo buf[7] = {
+            { m_nnAct[i],       0, VK_WHOLE_SIZE },
+            { m_nnAct[1 - i],   0, VK_WHOLE_SIZE },
+            { m_nnWeights,      0, VK_WHOLE_SIZE },
+            { m_cameraUBO,      0, VK_WHOLE_SIZE },
+            { m_reservoirBuf,   0, VK_WHOLE_SIZE },
+            { m_reservoirBuf2,  0, VK_WHOLE_SIZE },
+            { m_nnHistory,      0, VK_WHOLE_SIZE },
         };
-        VkWriteDescriptorSet w[6]{};
-        for (uint32_t b = 0; b < 6; ++b)
+        VkWriteDescriptorSet w[kNNBindings]{};
+        for (uint32_t b = 0; b < kNNBindings; ++b)
         {
             w[b].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             w[b].dstSet          = m_nnSet[i];
             w[b].dstBinding      = b;
             w[b].descriptorCount = 1;
-            w[b].descriptorType  = b < 3 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[b].descriptorType  = NNBindingType(b);
             if (b < 3) w[b].pImageInfo  = &img[b];
             else       w[b].pBufferInfo = &buf[b - 3];
         }
-        vkUpdateDescriptorSets(m_device, 6, w, 0, nullptr);
+        vkUpdateDescriptorSets(m_device, kNNBindings, w, 0, nullptr);
     }
 }
 
@@ -1781,6 +1807,9 @@ void VulkanRTPath::DestroyNeuralDenoiseBuffers()
         m_nnAct[i] = VK_NULL_HANDLE;
         g_vulkanMemoryPool->Free(m_nnActAlloc[i]);
     }
+    if (m_nnHistory) vkDestroyBuffer(m_device, m_nnHistory, nullptr);
+    m_nnHistory = VK_NULL_HANDLE;
+    g_vulkanMemoryPool->Free(m_nnHistoryAlloc);
 }
 
 void VulkanRTPath::DestroyNeuralDenoiser()
@@ -1793,6 +1822,8 @@ void VulkanRTPath::DestroyNeuralDenoiser()
     if (m_nnConvIn)         vkDestroyPipeline(m_device, m_nnConvIn, nullptr);
     if (m_nnConvMid)        vkDestroyPipeline(m_device, m_nnConvMid, nullptr);
     if (m_nnApply)          vkDestroyPipeline(m_device, m_nnApply, nullptr);
+    if (m_nnTemporal)       vkDestroyPipeline(m_device, m_nnTemporal, nullptr);
+    m_nnTemporal = VK_NULL_HANDLE;
     if (m_nnPipelineLayout) vkDestroyPipelineLayout(m_device, m_nnPipelineLayout, nullptr);
     if (m_nnSetLayout)      vkDestroyDescriptorSetLayout(m_device, m_nnSetLayout, nullptr);
     m_nnWeights = VK_NULL_HANDLE;  m_nnQueries = VK_NULL_HANDLE;  m_nnDescPool = VK_NULL_HANDLE;
@@ -1819,7 +1850,7 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
                 return (float)((double)(r[b * 2] - r[a * 2]) * m_timestampPeriodNs * 1e-6);
             };
             smooth(m_nnGpuMs, ms(0, kNNTimestamps - 1));
-            for (uint32_t i = 0; i < 5; ++i) smooth(m_nnPassMs[i], ms(i, i + 1));
+            for (uint32_t i = 0; i < kNNPasses; ++i) smooth(m_nnPassMs[i], ms(i, i + 1));
         }
     }
     ++m_nnFrame;
@@ -1836,7 +1867,8 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
     between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
-    // conv_in writes act[0]; mids go 0->1, 1->0, 0->1; apply reads act[1].
+    // conv_in writes act[0]; mids go 0->1, 1->0, 0->1; apply reads act[1] and
+    // writes the denoised light into act[0], which temporal reads.
     uint32_t stamp = q + 1;
     auto pass = [&](VkPipeline pipe, int set, int wOff, int bOff, bool barrierAfter, uint32_t tileW = 16, uint32_t tileH = 8) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
@@ -1855,15 +1887,24 @@ void VulkanRTPath::RunNeuralDenoise(VkCommandBuffer cmd)
         int w = kNNMidW0 + l * kNNMidStride;
         pass(m_nnConvMid, l % 2 == 0 ? 0 : 1, w, w + 9 * 32 * 8, true, 32, 16);  // 2x2 px per invocation
     }
-    pass(m_nnApply, 1, kNNOutW, kNNOutB, false);
+    pass(m_nnApply, 1, kNNOutW, kNNOutB, true);
+
+    // A skipped frame (denoiser off, other render path) leaves stale history.
+    const bool reset = !m_nnHistValid || m_frameId != m_nnLastFrameId + 1;
+    pass(m_nnTemporal, 0, (int)m_nnHistRead, reset ? 1 : 0, false);
+    m_nnHistRead    = 1 - m_nnHistRead;
+    m_nnHistValid   = true;
+    m_nnLastFrameId = m_frameId;
 
     // outImage goes to BlitToSwapImage next; next frame's raygen rewrites
-    // history/outImage, which this frame's passes read.
+    // history/outImage, which this frame's passes read; next frame's temporal
+    // pass reads the history half written here.
     VkMemoryBarrier toBlit{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     toBlit.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    toBlit.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    toBlit.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                         | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &toBlit, 0, nullptr, 0, nullptr);
 }
 

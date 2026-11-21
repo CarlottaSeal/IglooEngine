@@ -120,14 +120,15 @@ public:
     void         EndDenoiseFrame(VkCommandBuffer cmd, bool uploadWritten);
 
     // GPU KPCN: the network from ml/export_kpcn.py as compute passes that read
-    // historyImage/albedoImage and write the tonemapped result to outImage.
+    // historyImage/albedoImage, then a temporal pass that reprojects last
+    // frame's result and writes the tonemapped image to outImage.
     // Weights file = export_kpcn.py's .weights (flat float32, shader layout).
-    void  CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv,
-                               const char* convMidSpv, const char* applySpv);
+    void  CreateNeuralDenoiser(const char* weightsPath, const char* convInSpv, const char* convMidSpv,
+                               const char* applySpv, const char* temporalSpv);
     bool  HasNeuralDenoiser() const { return m_nnApply != VK_NULL_HANDLE; }
     void  RunNeuralDenoise(VkCommandBuffer cmd);   // after TraceRays, before BlitToSwapImage
     float GetNeuralDenoiseMs() const { return m_nnGpuMs; }
-    // conv_in, mid1, mid2, mid3, apply; smoothed like the total.
+    // conv_in, mid1, mid2, mid3, apply, temporal; smoothed like the total.
     const float* GetNeuralDenoisePassMs() const { return m_nnPassMs; }
 
     VkImage     GetOutputImage() const { return m_outputImage; }
@@ -258,17 +259,25 @@ private:
     VkPipeline            m_nnConvIn         = VK_NULL_HANDLE;
     VkPipeline            m_nnConvMid        = VK_NULL_HANDLE;
     VkPipeline            m_nnApply          = VK_NULL_HANDLE;
+    VkPipeline            m_nnTemporal       = VK_NULL_HANDLE;
+    VkBuffer              m_nnHistory        = VK_NULL_HANDLE;  // 2 x (rgb, eye distance) halves per pixel
+    VulkanAllocation      m_nnHistoryAlloc;
+    uint32_t              m_nnHistRead       = 0;
+    uint32_t              m_nnLastFrameId    = 0;  // history is dropped if a frame was skipped
+    bool                  m_nnHistValid      = false;
+    uint32_t              m_frameId          = 0;  // from UpdateCameraVectors
     VkDescriptorPool      m_nnDescPool       = VK_NULL_HANDLE;
     VkDescriptorSet       m_nnSet[2]         = {};
     VkBuffer              m_nnAct[2]         = {};
     VulkanAllocation      m_nnActAlloc[2];
     VkBuffer              m_nnWeights        = VK_NULL_HANDLE;
     VulkanAllocation      m_nnWeightsAlloc;
-    static constexpr uint32_t kNNTimestamps = 6;                // before/between/after the 5 passes
+    static constexpr uint32_t kNNPasses     = 6;
+    static constexpr uint32_t kNNTimestamps = kNNPasses + 1;    // before/between/after the passes
     VkQueryPool           m_nnQueries        = VK_NULL_HANDLE;  // kNNTimestamps per frame slot
     uint32_t              m_nnFrame          = 0;
     float                 m_nnGpuMs          = 0.f;
-    float                 m_nnPassMs[5]      = {};
+    float                 m_nnPassMs[kNNPasses] = {};
     float                 m_timestampPeriodNs = 1.f;
 
     void           CreateNeuralDenoiseBuffers();
