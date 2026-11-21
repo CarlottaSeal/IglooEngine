@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 #include <vector>
 #include "Engine/Renderer/VulkanRenderer.h"
+#include "Engine/Renderer/VulkanMemoryPool.hpp"
 
 struct VulkanBLAS
 {
@@ -218,16 +219,18 @@ private:
     VkCommandPool m_oneShotPool = VK_NULL_HANDLE;
 
     static constexpr uint32_t kDenoiseSlots = 2;  // matches MAX_FRAMES_IN_FLIGHT
+    // Sub-allocated from g_vulkanMemoryPool: readback as GPU_TO_CPU (cached),
+    // upload as CPU_TO_GPU. Both stay mapped for the pool's lifetime.
     struct DenoiseSlot
     {
-        VkBuffer       readback       = VK_NULL_HANDLE;
-        VkDeviceMemory readbackMem    = VK_NULL_HANDLE;
-        uint8_t*       readbackMapped = nullptr;
-        VkBuffer       upload         = VK_NULL_HANDLE;
-        VkDeviceMemory uploadMem      = VK_NULL_HANDLE;
-        uint8_t*       uploadMapped   = nullptr;
-        bool           hasData        = false;
+        VkBuffer         readback = VK_NULL_HANDLE;
+        VulkanAllocation readbackAlloc;
+        VkBuffer         upload   = VK_NULL_HANDLE;
+        VulkanAllocation uploadAlloc;
+        bool             hasData  = false;
     };
+    bool         m_denoiseReadbackCoherent = true;
+    VkDeviceSize m_nonCoherentAtom = 1;
     DenoiseSlot m_denoise[kDenoiseSlots];
     uint32_t    m_denoiseFrame = 0;
 

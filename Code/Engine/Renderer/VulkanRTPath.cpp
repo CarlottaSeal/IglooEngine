@@ -1513,39 +1513,45 @@ void VulkanRTPath::CreateDenoiseBuffers()
     const VkDeviceSize readback = pixels * 8 + pixels * 4;  // RGBA16F light, then RGBA8 albedo
     const VkDeviceSize upload   = pixels * 4;
 
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(m_renderer->m_physicalDevice, &memProps);
-    auto hasType = [&](VkMemoryPropertyFlags f) {
-        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
-            if ((memProps.memoryTypes[i].propertyFlags & f) == f) return true;
-        return false;
+    auto makeBuffer = [&](VkDeviceSize size, VkBufferUsageFlags usage, VulkanMemoryUsage memUsage,
+                          VkBuffer& buf, VulkanAllocation& alloc)
+    {
+        VkBufferCreateInfo ci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        ci.size        = size;
+        ci.usage       = usage;
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(m_device, &ci, nullptr, &buf) != VK_SUCCESS)
+            ERROR_AND_DIE("VulkanRTPath::CreateDenoiseBuffers: vkCreateBuffer failed");
+        alloc = g_vulkanMemoryPool->AllocateBufferMemory(buf, memUsage);
+        vkBindBufferMemory(m_device, buf, alloc.memory, alloc.offset);
     };
-    // Cached memory makes the CPU-side reads ~10x faster than write-combined.
-    VkMemoryPropertyFlags readbackProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    if (hasType(readbackProps | VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
-        readbackProps |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
     for (DenoiseSlot& s : m_denoise)
     {
-        CreateAndAllocateBuffer(readback, VK_BUFFER_USAGE_TRANSFER_DST_BIT, readbackProps,
-                                s.readback, s.readbackMem);
-        CreateAndAllocateBuffer(upload, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                s.upload, s.uploadMem);
-        vkMapMemory(m_device, s.readbackMem, 0, VK_WHOLE_SIZE, 0, (void**)&s.readbackMapped);
-        vkMapMemory(m_device, s.uploadMem,   0, VK_WHOLE_SIZE, 0, (void**)&s.uploadMapped);
+        makeBuffer(readback, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VulkanMemoryUsage::GPU_TO_CPU, s.readback, s.readbackAlloc);
+        makeBuffer(upload,   VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VulkanMemoryUsage::CPU_TO_GPU, s.upload,   s.uploadAlloc);
         s.hasData = false;
     }
+
+    // GPU_TO_CPU only asks for HOST_CACHED; on a non-coherent type the CPU
+    // has to invalidate before reading (NVIDIA's cached type is coherent).
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(m_renderer->m_physicalDevice, &memProps);
+    m_denoiseReadbackCoherent = (memProps.memoryTypes[m_denoise[0].readbackAlloc.poolIndex].propertyFlags
+                                 & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    VkPhysicalDeviceProperties devProps;
+    vkGetPhysicalDeviceProperties(m_renderer->m_physicalDevice, &devProps);
+    m_nonCoherentAtom = devProps.limits.nonCoherentAtomSize;
 }
 
 void VulkanRTPath::DestroyDenoiseBuffers()
 {
     for (DenoiseSlot& s : m_denoise)
     {
-        if (s.readbackMem) { vkUnmapMemory(m_device, s.readbackMem); vkFreeMemory(m_device, s.readbackMem, nullptr); }
-        if (s.readback)    vkDestroyBuffer(m_device, s.readback, nullptr);
-        if (s.uploadMem)   { vkUnmapMemory(m_device, s.uploadMem); vkFreeMemory(m_device, s.uploadMem, nullptr); }
-        if (s.upload)      vkDestroyBuffer(m_device, s.upload, nullptr);
+        if (s.readback) vkDestroyBuffer(m_device, s.readback, nullptr);
+        if (s.upload)   vkDestroyBuffer(m_device, s.upload, nullptr);
+        g_vulkanMemoryPool->Free(s.readbackAlloc);
+        g_vulkanMemoryPool->Free(s.uploadAlloc);
         s = DenoiseSlot{};
     }
 }
@@ -1558,11 +1564,21 @@ VulkanRTPath::DenoiseFrame VulkanRTPath::BeginDenoiseFrame()
     DenoiseFrame f;
     f.width  = m_outputWidth;
     f.height = m_outputHeight;
-    f.upload = s.uploadMapped;
+    f.upload = (uint8_t*)s.uploadAlloc.mappedPtr;
     if (s.hasData)
     {
-        f.light  = (const uint16_t*)s.readbackMapped;
-        f.albedo = s.readbackMapped + pixels * 8;
+        if (!m_denoiseReadbackCoherent)
+        {
+            // Invalidate from the atom-aligned start to the end of the block.
+            VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            range.memory = s.readbackAlloc.memory;
+            range.offset = s.readbackAlloc.offset / m_nonCoherentAtom * m_nonCoherentAtom;
+            range.size   = VK_WHOLE_SIZE;
+            vkInvalidateMappedMemoryRanges(m_device, 1, &range);
+        }
+        const uint8_t* base = (const uint8_t*)s.readbackAlloc.mappedPtr;
+        f.light  = (const uint16_t*)base;
+        f.albedo = base + pixels * 8;
     }
     return f;
 }
