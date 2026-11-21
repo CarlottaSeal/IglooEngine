@@ -128,6 +128,7 @@ public:
     bool  HasNeuralDenoiser() const { return m_nnApply != VK_NULL_HANDLE; }
     void  RunNeuralDenoise(VkCommandBuffer cmd);   // after TraceRays, before BlitToSwapImage
     float GetNeuralDenoiseMs() const { return m_nnGpuMs; }
+    float GetTraceMs() const { return m_traceMs; }
     // conv_in, mid1, mid2, mid3, apply, temporal; smoothed like the total.
     const float* GetNeuralDenoisePassMs() const { return m_nnPassMs; }
 
@@ -279,6 +280,9 @@ private:
     float                 m_nnGpuMs          = 0.f;
     float                 m_nnPassMs[kNNPasses] = {};
     float                 m_timestampPeriodNs = 1.f;
+    VkQueryPool           m_rtQueries        = VK_NULL_HANDLE;  // start/end of TraceRays per frame slot
+    uint32_t              m_rtFrame          = 0;
+    float                 m_traceMs          = 0.f;
 
     void           CreateNeuralDenoiseBuffers();
     void           DestroyNeuralDenoiseBuffers();

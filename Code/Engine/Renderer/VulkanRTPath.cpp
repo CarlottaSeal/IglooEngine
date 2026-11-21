@@ -34,6 +34,8 @@ void VulkanRTPath::Shutdown()
 
     DestroyNeuralDenoiser();
     DestroyOutputImage();
+    if (m_rtQueries) vkDestroyQueryPool(m_device, m_rtQueries, nullptr);
+    m_rtQueries = VK_NULL_HANDLE;
 
     if (m_rtPipeline)     vkDestroyPipeline(m_device, m_rtPipeline, nullptr);
     if (m_pipelineLayout) vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
@@ -1226,6 +1228,33 @@ void VulkanRTPath::RecreateOutput(uint32_t width, uint32_t height)
 
 void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t height)
 {
+    if (!m_rtQueries)
+    {
+        VkQueryPoolCreateInfo qpci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qpci.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = 4;
+        vkCreateQueryPool(m_device, &qpci, nullptr, &m_rtQueries);
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(m_renderer->m_physicalDevice, &props);
+        m_timestampPeriodNs = props.limits.timestampPeriod;
+    }
+    // Same two-slot scheme as the denoiser: this slot was submitted two frames ago.
+    const uint32_t q = (m_rtFrame % 2) * 2;
+    if (m_rtFrame >= 2)
+    {
+        uint64_t r[4];
+        if (vkGetQueryPoolResults(m_device, m_rtQueries, q, 2, sizeof(r), r, 2 * sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) == VK_SUCCESS
+            && r[1] && r[3])
+        {
+            float ms = (float)((double)(r[2] - r[0]) * m_timestampPeriodNs * 1e-6);
+            m_traceMs = m_traceMs == 0.f ? ms : 0.95f * m_traceMs + 0.05f * ms;
+        }
+    }
+    ++m_rtFrame;
+    vkCmdResetQueryPool(cmd, m_rtQueries, q, 2);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_rtQueries, q);
+
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR,
                             m_pipelineLayout, 0, 1, &m_descriptorSet, 0, nullptr);
@@ -1236,6 +1265,7 @@ void VulkanRTPath::TraceRays(VkCommandBuffer cmd, uint32_t width, uint32_t heigh
                                    &m_sbt.hitRegion,
                                    &m_sbt.callableRegion,
                                    width, height, 1);
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, m_rtQueries, q + 1);
 }
 
 void VulkanRTPath::BlitToSwapImage(VkCommandBuffer cmd,
