@@ -267,7 +267,7 @@ private:
     int                   m_nnMid16Off       = 0;  // fp16 mid weights, in halves into m_nnWeights
     VkPipeline            m_nnApply          = VK_NULL_HANDLE;
     VkPipeline            m_nnTemporal       = VK_NULL_HANDLE;
-    VkBuffer              m_nnHistory        = VK_NULL_HANDLE;  // 2 x (rgb, eye distance) halves per pixel
+    VkBuffer              m_nnHistory        = VK_NULL_HANDLE;  // 2 x (rgb, eye distance, history length) halves per pixel
     VulkanAllocation      m_nnHistoryAlloc;
     uint32_t              m_nnHistRead       = 0;
     uint32_t              m_nnLastFrameId    = 0;  // history is dropped if a frame was skipped

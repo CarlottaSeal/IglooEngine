@@ -1825,7 +1825,7 @@ void VulkanRTPath::CreateNeuralDenoiseBuffers()
     }
 
     VkBufferCreateInfo hci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    hci.size        = (VkDeviceSize)m_outputWidth * m_outputHeight * 8 * 2;
+    hci.size        = (VkDeviceSize)m_outputWidth * m_outputHeight * 16 * 2;  // rgb, eye distance, history length (halves)
     hci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     hci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     vkCreateBuffer(m_device, &hci, nullptr, &m_nnHistory);
